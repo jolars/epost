@@ -6,14 +6,14 @@ use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::store::index::MessageRow;
 use crate::store::thread::ThreadedRow;
-use crate::ui::app::{App, Pane, ScanState};
+use crate::ui::app::{InboxScreen, Pane, ScanState};
 use crate::ui::style::pane_block;
 
-pub fn draw(f: &mut Frame, area: Rect, app: &App) {
-    let focused = app.focus == Pane::List;
+pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
+    let focused = inbox.focus == Pane::List;
     let block = pane_block("Messages", focused);
 
-    match &app.scan {
+    match &inbox.scan {
         ScanState::Scanning => {
             let widget = List::new(vec![ListItem::new(Line::from(Span::styled(
                 "Scanning maildir…",
@@ -61,7 +61,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
                 .highlight_style(highlight)
                 .highlight_symbol("▌ ");
             let mut state = ListState::default();
-            state.select(Some(app.selected.min(rows.len().saturating_sub(1))));
+            state.select(Some(inbox.selected.min(rows.len().saturating_sub(1))));
             f.render_stateful_widget(widget, area, &mut state);
         }
     }

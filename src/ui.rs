@@ -1,10 +1,14 @@
-pub mod accounts;
 pub mod app;
 pub mod browser;
 pub mod cmdline;
+pub mod compose;
+pub mod embed;
 pub mod folders;
 pub mod images;
 pub mod keys;
 pub mod list;
 pub mod reader;
 pub mod style;
+pub mod tabs;
+pub mod text_input;
+pub mod tty;

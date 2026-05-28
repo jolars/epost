@@ -7,6 +7,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::picker::Picker;
 
 use crate::config::Config;
+use crate::mail::compose::SendOutcome;
 use crate::mail::flags::{self, FlagOp};
 use crate::mail::html::{self, Block};
 use crate::mail::parse;
@@ -14,8 +15,10 @@ use crate::store::index::{Index, MessageRow};
 use crate::store::scan::{self, ScanResult};
 use crate::store::thread::ThreadedRow;
 use crate::store::watch::SelfWrites;
+use crate::ui::compose::{ComposeScreen, ComposeStatus};
 use crate::ui::images::{self, ImageKey, ResolvedImage};
-use crate::ui::{accounts, cmdline, folders, list, reader};
+use crate::ui::text_input::TextInput;
+use crate::ui::{cmdline, compose, folders, list, reader, tabs};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -37,7 +40,7 @@ pub enum Mode {
 #[derive(Debug, Clone)]
 pub struct ParsedBody {
     // Carried so a future invalidation pass can sanity-check the cache
-    // against the selected row; `last_parsed_msgid` on the App is what
+    // against the selected row; `last_parsed_msgid` on the inbox is what
     // currently drives re-parsing.
     #[allow(dead_code)]
     pub msgid: String,
@@ -54,32 +57,64 @@ pub enum ScanState {
     Failed(String),
 }
 
+/// Top-level UI state. Holds the modal layer, cmdline buffer, status row,
+/// and the list of screens (Step 1 has only the inbox; tabs land in Step 2).
+/// App also owns process-global resources screens consult — the image
+/// picker, the sqlite cache path, the self-writes registry — passed by
+/// reference into per-screen operations rather than duplicated per screen.
 pub struct App {
     pub mode: Mode,
+    pub cmdline: TextInput,
+    pub link_pick_buf: String,
+    /// Transient status / error displayed in the cmdline row. Cleared
+    /// when the user enters a new command or moves selection.
+    pub status_error: Option<String>,
+    pub quit: bool,
+    pub screens: Vec<Screen>,
+    /// Index into `screens` of the currently-displayed tab. Always 0 in
+    /// Step 1 (inbox is the only screen); Step 2 introduces tab switching.
+    #[allow(dead_code)]
+    pub active: usize,
+    /// Capability picker; `None` when `[images].protocol = "off"` or
+    /// stdio isn't a tty. When None the reader always renders the
+    /// `[image: alt]` placeholder.
+    pub picker: Option<Picker>,
+    /// Capped at max_height_cells from `[images]`. Surfaced to the reader
+    /// so layout caps reservation height the same way the decode does.
+    pub image_max_height_cells: u16,
+    /// SQLite cache path. Kept so flag flips can briefly re-open the
+    /// index and mirror the new `path` / `flags` without holding a
+    /// long-lived `Connection` on the UI thread.
+    pub cache_path: PathBuf,
+    /// Self-write registry the future Step 7 notify watcher will consult
+    /// to suppress its own rename events. Populated whenever a flag flip
+    /// renames a maildir file under us.
+    pub self_writes: SelfWrites,
+}
+
+/// A user-visible screen with its own tab in the strip and its own
+/// per-screen state.
+pub enum Screen {
+    Inbox(InboxScreen),
+    Compose(ComposeScreen),
+}
+
+/// Per-screen state for the maildir reader: pane visibility/focus, scan
+/// worker channel + parsed rows, current selection, parsed body cache,
+/// decoded inline images. Everything that used to live on `App` and
+/// described "the inbox view" lives here.
+pub struct InboxScreen {
     pub focus: Pane,
     pub sidebar_visible: bool,
     pub list_visible: bool,
     pub reader_visible: bool,
     pub reader_scroll: u16,
-    pub quit: bool,
     pub scan: ScanState,
     pub selected: usize,
     pub parsed: Option<ParsedBody>,
-    pub cmdline_buf: String,
-    pub link_pick_buf: String,
-    /// Transient status / error displayed in the cmdline row. Cleared
-    /// when the user enters a new command or moves selection.
-    pub status_error: Option<String>,
     /// Last-known msgid we tried to parse a body for, so a parse failure
     /// doesn't loop forever.
     last_parsed_msgid: Option<String>,
-    /// Capped at max_height_cells from `[images]`. Surfaced to the reader
-    /// so layout caps reservation height the same way the decode does.
-    pub image_max_height_cells: u16,
-    /// Capability picker; `None` when `[images].protocol = "off"` or
-    /// stdio isn't a tty. When None the reader always renders the
-    /// `[image: alt]` placeholder.
-    picker: Option<Picker>,
     /// Decoded images per message body, keyed by msgid so navigating
     /// back-and-forth between two threads doesn't re-decode each side.
     /// Pruned to {current, previous} on each msgid change.
@@ -90,22 +125,236 @@ pub struct App {
     /// reader Clears these next frame when the body changes so kitty /
     /// iTerm2 placements don't ghost across messages.
     pub last_image_rects: Vec<Rect>,
-    /// Set by `ensure_body_for_selection` when the body changed this
-    /// tick; reader consumes it to drive the Clear pass.
+    /// Set by `ensure_body` when the body changed this tick; reader
+    /// consumes it to drive the Clear pass.
     pub body_changed_this_tick: bool,
-    /// SQLite cache path. Kept so flag flips can briefly re-open the
-    /// index and mirror the new `path` / `flags` without holding a
-    /// long-lived `Connection` on the UI thread.
-    cache_path: PathBuf,
-    /// Self-write registry the future Step 7 notify watcher will consult
-    /// to suppress its own rename events. Populated whenever a flag flip
-    /// renames a maildir file under us.
-    pub self_writes: SelfWrites,
     scan_rx: Option<Receiver<ScanResult>>,
 }
 
 impl App {
     pub fn new(cfg: &Config, cache_path: PathBuf, picker: Option<Picker>) -> Self {
+        let inbox = InboxScreen::new(cfg, &cache_path);
+        Self {
+            mode: Mode::Normal,
+            cmdline: TextInput::new(),
+            link_pick_buf: String::new(),
+            status_error: None,
+            quit: false,
+            screens: vec![Screen::Inbox(inbox)],
+            active: 0,
+            picker,
+            image_max_height_cells: cfg.images.max_height_cells,
+            cache_path,
+            self_writes: SelfWrites::new(),
+        }
+    }
+
+    /// Borrow the inbox screen. The inbox is always pinned at index 0
+    /// (other tabs are compose tabs); the helper centralizes that
+    /// assumption so the rest of the UI doesn't open-code the match.
+    pub fn inbox(&self) -> &InboxScreen {
+        match &self.screens[0] {
+            Screen::Inbox(s) => s,
+            Screen::Compose(_) => unreachable!("inbox is pinned at index 0"),
+        }
+    }
+
+    pub fn inbox_mut(&mut self) -> &mut InboxScreen {
+        match &mut self.screens[0] {
+            Screen::Inbox(s) => s,
+            Screen::Compose(_) => unreachable!("inbox is pinned at index 0"),
+        }
+    }
+
+    /// Push a new compose tab, mark it active, return its index.
+    pub fn open_compose(&mut self, screen: ComposeScreen) -> usize {
+        self.screens.push(Screen::Compose(screen));
+        let idx = self.screens.len() - 1;
+        self.active = idx;
+        idx
+    }
+
+    /// Close the currently active tab unless it's the inbox (index 0).
+    /// Returns Ok(()) on close, Err(msg) when blocked.
+    pub fn close_active_tab(&mut self) -> Result<(), &'static str> {
+        if self.active == 0 {
+            return Err("cannot close the inbox tab");
+        }
+        let idx = self.active;
+        self.screens.remove(idx);
+        if self.active >= self.screens.len() {
+            self.active = self.screens.len() - 1;
+        }
+        Ok(())
+    }
+
+    /// Borrow the currently-active compose screen, if any.
+    pub fn active_compose_mut(&mut self) -> Option<&mut ComposeScreen> {
+        match self.screens.get_mut(self.active)? {
+            Screen::Compose(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// True if any compose tab currently has a live embedded editor
+    /// session. The main loop polls inputs more frequently in this
+    /// state so the editor feels responsive.
+    pub fn has_active_editor(&self) -> bool {
+        self.screens.iter().any(|s| match s {
+            Screen::Compose(c) => c.editor.is_some(),
+            _ => false,
+        })
+    }
+
+    /// Drain any pending send-worker result on each compose tab.
+    /// Transitions `ComposeStatus` and surfaces a one-shot message to
+    /// the cmdline status row. Mirrors the `poll_scan` pattern.
+    pub fn poll_compose_sends(&mut self) {
+        let Self {
+            screens,
+            status_error,
+            ..
+        } = self;
+        for screen in screens.iter_mut() {
+            let Screen::Compose(c) = screen else { continue };
+            let Some(rx) = c.send_rx.as_ref() else {
+                continue;
+            };
+            match rx.try_recv() {
+                Ok(Ok(SendOutcome::Sent)) => {
+                    c.status = ComposeStatus::Sent;
+                    c.send_rx = None;
+                    *status_error = Some("sent".into());
+                }
+                Ok(Ok(SendOutcome::SentNoCopy(msg))) => {
+                    c.status = ComposeStatus::Sent;
+                    c.send_rx = None;
+                    *status_error = Some(format!("sent (no Sent copy: {msg})"));
+                }
+                Ok(Err(e)) => {
+                    c.status = ComposeStatus::Failed(e.clone());
+                    c.send_rx = None;
+                    *status_error = Some(format!("send failed: {e}"));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    c.status = ComposeStatus::Failed("send worker died".into());
+                    c.send_rx = None;
+                    *status_error = Some("send: worker died".into());
+                }
+            }
+        }
+    }
+
+    /// Cmdline / status helpers that reach into the inbox screen — kept
+    /// on App so `cmdline::dispatch` doesn't have to know about screens.
+    pub fn inbox_parsed(&self) -> Option<&ParsedBody> {
+        self.inbox().parsed.as_ref()
+    }
+
+    pub fn poll_scan(&mut self) {
+        self.inbox_mut().poll_scan();
+    }
+
+    /// Tab navigation. With only the inbox screen in Step 1 / Step 2,
+    /// cycling is a no-op; the wiring is in place so Step 8's compose
+    /// tabs participate without further keymap changes.
+    pub fn next_tab(&mut self) {
+        if self.screens.len() > 1 {
+            self.active = (self.active + 1) % self.screens.len();
+        }
+    }
+
+    pub fn prev_tab(&mut self) {
+        let n = self.screens.len();
+        if n > 1 {
+            self.active = (self.active + n - 1) % n;
+        }
+    }
+
+    pub fn set_tab(&mut self, idx: usize) {
+        if idx < self.screens.len() {
+            self.active = idx;
+        }
+    }
+
+    /// Re-reads and parses the body for the currently-selected message
+    /// when it differs from the cached body. Splits self so the inbox
+    /// can borrow App-global resources (picker / cache path / self-writes
+    /// registry) and write into `status_error` simultaneously.
+    pub fn ensure_body_for_selection(&mut self) {
+        let Self {
+            screens,
+            picker,
+            image_max_height_cells,
+            cache_path,
+            self_writes,
+            status_error,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        inbox.ensure_body(
+            picker.as_ref(),
+            *image_max_height_cells,
+            cache_path,
+            self_writes,
+            status_error,
+        );
+    }
+
+    /// Toggle a maildir flag (`S` / `F` / `T`) on the selected row.
+    /// Drives the user-facing flag bindings: `m` → Seen, `*` → Flagged,
+    /// `d` → Trashed.
+    pub fn toggle_flag_selected(&mut self, flag: char) {
+        let Self {
+            screens,
+            cache_path,
+            self_writes,
+            status_error,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        inbox.toggle_flag(flag, cache_path, self_writes, status_error);
+    }
+
+    // --- Convenience pass-throughs so keys.rs doesn't reach into inbox
+    // for every keystroke. Step 1: all key dispatch is inbox-only. ---
+
+    pub fn cycle_focus(&mut self, forward: bool) {
+        self.inbox_mut().cycle_focus(forward);
+    }
+
+    pub fn focus_left(&mut self) {
+        self.inbox_mut().focus_left();
+    }
+
+    pub fn focus_right(&mut self) {
+        self.inbox_mut().focus_right();
+    }
+
+    pub fn focus_up(&mut self) {
+        self.inbox_mut().focus_up();
+    }
+
+    pub fn focus_down(&mut self) {
+        self.inbox_mut().focus_down();
+    }
+
+    pub fn select_next(&mut self) {
+        self.inbox_mut().select_next();
+    }
+
+    pub fn select_prev(&mut self) {
+        self.inbox_mut().select_prev();
+    }
+}
+
+impl InboxScreen {
+    pub fn new(cfg: &Config, cache_path: &Path) -> Self {
         let sidebar_visible = cfg.ui.sidebar;
         let list_visible = cfg.ui.list;
         let reader_visible = cfg.ui.reader;
@@ -119,7 +368,7 @@ impl App {
         let scan_rx = if accounts.is_empty() {
             None
         } else {
-            Some(scan::start_worker(accounts, cache_path.clone()))
+            Some(scan::start_worker(accounts, cache_path.to_path_buf()))
         };
         let scan = if scan_rx.is_some() {
             ScanState::Scanning
@@ -128,47 +377,42 @@ impl App {
         };
 
         Self {
-            mode: Mode::Normal,
             focus,
             sidebar_visible,
             list_visible,
             reader_visible,
             reader_scroll: 0,
-            quit: false,
             scan,
             selected: 0,
             parsed: None,
-            cmdline_buf: String::new(),
-            link_pick_buf: String::new(),
-            status_error: None,
             last_parsed_msgid: None,
-            image_max_height_cells: cfg.images.max_height_cells,
-            picker,
             image_cache: HashMap::new(),
             prev_parsed_msgid: None,
             last_image_rects: Vec::new(),
             body_changed_this_tick: false,
-            cache_path,
-            self_writes: SelfWrites::new(),
             scan_rx,
         }
     }
 
-    /// Read-only lookup the reader uses when laying out `Block::Image`.
-    /// Returns `None` for any image without a successfully decoded entry
-    /// (remote URLs, missing cid parts, decode failures, `protocol = off`).
     pub fn resolved_image(&self, key: &ImageKey) -> Option<&ResolvedImage> {
         let msgid = self.last_parsed_msgid.as_deref()?;
         self.image_cache.get(msgid)?.get(key)
     }
 
-    /// Re-reads and parses the body for the currently-selected message
-    /// when it differs from the cached body. Parse failures surface in
+    /// Re-read and re-parse the body for the currently-selected message
+    /// when it differs from the cached one. Parse failures surface in
     /// `status_error` and leave `parsed = None` without retrying.
     /// On success also decodes every reachable `cid:` / `data:` image
     /// into `self.image_cache[msgid]`; decode failures are listed in
     /// `status_error` but don't block the rest of the body.
-    pub fn ensure_body_for_selection(&mut self) {
+    pub fn ensure_body(
+        &mut self,
+        picker: Option<&Picker>,
+        max_height: u16,
+        cache_path: &Path,
+        self_writes: &SelfWrites,
+        status_error: &mut Option<String>,
+    ) {
         self.body_changed_this_tick = false;
         let Some(msgid) = self.selected_msgid() else {
             self.parsed = None;
@@ -189,7 +433,14 @@ impl App {
         match parse::read_body(&path) {
             Ok(body) => {
                 let blocks = body.html.as_deref().map(html::parse).unwrap_or_default();
-                self.decode_images(&msgid, &blocks, &body.cid_parts);
+                self.decode_images(
+                    &msgid,
+                    &blocks,
+                    &body.cid_parts,
+                    picker,
+                    max_height,
+                    status_error,
+                );
                 self.parsed = Some(ParsedBody {
                     msgid: msgid.clone(),
                     blocks,
@@ -198,22 +449,27 @@ impl App {
                     cid_parts: body.cid_parts,
                 });
                 self.evict_image_cache(old_msgid.as_deref(), &msgid);
-                self.try_mark_seen(&msgid);
+                self.try_mark_seen(&msgid, cache_path, self_writes, status_error);
             }
             Err(e) => {
                 self.parsed = None;
-                self.status_error = Some(format!("parse failed: {e:#}"));
+                *status_error = Some(format!("parse failed: {e:#}"));
                 self.evict_image_cache(old_msgid.as_deref(), &msgid);
             }
         }
     }
 
     /// Add the `S` (Seen) flag to the selected row if it isn't already
-    /// set. Used by `ensure_body_for_selection` on a successful body
-    /// parse, so opening a message once is enough to mark it read.
-    /// Errors are surfaced via `status_error`; the rescan reconciles
-    /// on the next sync.
-    fn try_mark_seen(&mut self, msgid: &str) {
+    /// set. Used by `ensure_body` on a successful body parse, so opening
+    /// a message once is enough to mark it read. Errors are surfaced via
+    /// `status_error`; the rescan reconciles on the next sync.
+    fn try_mark_seen(
+        &mut self,
+        msgid: &str,
+        cache_path: &Path,
+        self_writes: &SelfWrites,
+        status_error: &mut Option<String>,
+    ) {
         let Some(row) = self.find_row(msgid) else {
             return;
         };
@@ -223,20 +479,23 @@ impl App {
         let path = row.path.clone();
         match flags::set_flag(&path, 'S', FlagOp::Add) {
             Ok((new_path, new_flags)) => {
-                self.self_writes.record(&path);
-                self.self_writes.record(&new_path);
-                self.apply_flag_change(msgid, &new_path, &new_flags);
+                self_writes.record(&path);
+                self_writes.record(&new_path);
+                self.apply_flag_change(msgid, &new_path, &new_flags, cache_path, status_error);
             }
             Err(e) => {
-                self.status_error = Some(format!("mark read: {e}"));
+                *status_error = Some(format!("mark read: {e}"));
             }
         }
     }
 
-    /// Toggle a maildir flag (`S` / `F` / `T`) on the selected row.
-    /// Drives the user-facing flag bindings: `m` → Seen, `*` → Flagged,
-    /// `d` → Trashed.
-    pub fn toggle_flag_selected(&mut self, flag: char) {
+    pub fn toggle_flag(
+        &mut self,
+        flag: char,
+        cache_path: &Path,
+        self_writes: &SelfWrites,
+        status_error: &mut Option<String>,
+    ) {
         let Some(msgid) = self.selected_msgid() else {
             return;
         };
@@ -246,12 +505,12 @@ impl App {
         let path = row.path.clone();
         match flags::set_flag(&path, flag, FlagOp::Toggle) {
             Ok((new_path, new_flags)) => {
-                self.self_writes.record(&path);
-                self.self_writes.record(&new_path);
-                self.apply_flag_change(&msgid, &new_path, &new_flags);
+                self_writes.record(&path);
+                self_writes.record(&new_path);
+                self.apply_flag_change(&msgid, &new_path, &new_flags, cache_path, status_error);
             }
             Err(e) => {
-                self.status_error = Some(format!("toggle {flag}: {e}"));
+                *status_error = Some(format!("toggle {flag}: {e}"));
             }
         }
     }
@@ -267,7 +526,14 @@ impl App {
     /// rename, then mirror the change into the SQLite index. Maildir is
     /// truth (DESIGN invariant 3), so if the index update fails we leave
     /// the in-memory row patched and let the next rescan reconcile.
-    fn apply_flag_change(&mut self, msgid: &str, new_path: &Path, new_flags: &str) {
+    fn apply_flag_change(
+        &mut self,
+        msgid: &str,
+        new_path: &Path,
+        new_flags: &str,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) {
         let row_snapshot = {
             let ScanState::Ready(rows) = &mut self.scan else {
                 return;
@@ -279,26 +545,21 @@ impl App {
             t.row.flags = new_flags.to_string();
             t.row.clone()
         };
-        if let Err(e) = self.mirror_to_index(&row_snapshot) {
-            self.status_error = Some(format!("index mirror failed: {e:#}"));
+        if let Err(e) = mirror_to_index(cache_path, &row_snapshot) {
+            *status_error = Some(format!("index mirror failed: {e:#}"));
         }
     }
 
-    fn mirror_to_index(&self, row: &MessageRow) -> anyhow::Result<()> {
-        let mut idx = Index::open(&self.cache_path)?;
-        idx.upsert(row)?;
-        Ok(())
-    }
-
-    /// Walks blocks, decodes resolvable images into the cache, and
-    /// records failures so they can be surfaced in `status_error`.
     fn decode_images(
         &mut self,
         msgid: &str,
         blocks: &[Block],
         cid_parts: &HashMap<String, Vec<u8>>,
+        picker: Option<&Picker>,
+        max_height: u16,
+        status_error: &mut Option<String>,
     ) {
-        let Some(picker) = self.picker.as_ref() else {
+        let Some(picker) = picker else {
             self.image_cache.remove(msgid);
             return;
         };
@@ -317,7 +578,7 @@ impl App {
                         failed.push(format!("cid:{cid} (missing part)"));
                         continue;
                     };
-                    match images::decode(picker, bytes, self.image_max_height_cells) {
+                    match images::decode(picker, bytes, max_height) {
                         Ok(img) => {
                             entries.insert(key, img);
                         }
@@ -333,7 +594,7 @@ impl App {
                         failed.push("data:… (unsupported)".to_string());
                         continue;
                     };
-                    match images::decode(picker, &bytes, self.image_max_height_cells) {
+                    match images::decode(picker, &bytes, max_height) {
                         Ok(img) => {
                             entries.insert(key, img);
                         }
@@ -348,7 +609,7 @@ impl App {
             self.image_cache.insert(msgid.to_string(), entries);
         }
         if !failed.is_empty() {
-            self.status_error = Some(format!("image decode failed: {}", failed.join(", ")));
+            *status_error = Some(format!("image decode failed: {}", failed.join(", ")));
         }
     }
 
@@ -360,7 +621,7 @@ impl App {
             .retain(|k, _| keep.contains(&Some(k.as_str())));
     }
 
-    fn selected_row(&self) -> Option<&ThreadedRow> {
+    pub fn selected_row(&self) -> Option<&ThreadedRow> {
         match &self.scan {
             ScanState::Ready(rows) if !rows.is_empty() => {
                 let i = self.selected.min(rows.len() - 1);
@@ -428,8 +689,7 @@ impl App {
     /// Spatial focus moves driven by `Ctrl-h/j/k/l`. The layout is fixed
     /// (Folders left of List-stacked-over-Reader), so each direction has
     /// at most one valid target; if the target is hidden the move is a
-    /// no-op. Keeping these as methods alongside `cycle_focus` so any
-    /// future pane-visibility changes stay in one place.
+    /// no-op.
     pub fn focus_left(&mut self) {
         if matches!(self.focus, Pane::List | Pane::Reader) && self.sidebar_visible {
             self.focus = Pane::Folders;
@@ -481,9 +741,15 @@ impl App {
     }
 }
 
+fn mirror_to_index(cache_path: &Path, row: &MessageRow) -> anyhow::Result<()> {
+    let mut idx = Index::open(cache_path)?;
+    idx.upsert(row)?;
+    Ok(())
+}
+
 /// Single image reference reached from a Block-IR walk. Used by
-/// `App::decode_images` to enumerate every renderable image in a parsed
-/// body without exposing the walk to the rest of the app.
+/// `InboxScreen::decode_images` to enumerate every renderable image in a
+/// parsed body without exposing the walk to the rest of the app.
 enum ImageRef {
     Cid(String),
     Data(String),
@@ -544,115 +810,37 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let body = outer[1];
     let bottom = outer[2];
 
-    let (sidebar_area, right_area) = split_body(body, app.sidebar_visible);
-    let (list_area, reader_area) = split_right(right_area, app.list_visible, app.reader_visible);
+    tabs::draw(f, top, app);
 
-    accounts::draw(f, top, app);
-    if let Some(rect) = sidebar_area {
-        folders::draw(f, rect, app);
-    }
-    if let Some(rect) = list_area {
-        list::draw(f, rect, app);
-    }
-    if let Some(rect) = reader_area {
-        reader::draw(f, rect, &mut *app);
+    // Split App so the per-screen draws can borrow the active screen
+    // mutably while cmdline::draw later sees the global cmdline /
+    // status / mode fields.
+    let App {
+        screens,
+        active,
+        mode,
+        link_pick_buf,
+        ..
+    } = app;
+    match screens.get_mut(*active) {
+        Some(Screen::Inbox(inbox)) => {
+            let (sidebar_area, right_area) = split_body(body, inbox.sidebar_visible);
+            let (list_area, reader_area) =
+                split_right(right_area, inbox.list_visible, inbox.reader_visible);
+            if let Some(rect) = sidebar_area {
+                folders::draw(f, rect, inbox);
+            }
+            if let Some(rect) = list_area {
+                list::draw(f, rect, inbox);
+            }
+            if let Some(rect) = reader_area {
+                reader::draw(f, rect, inbox, *mode, link_pick_buf);
+            }
+        }
+        Some(Screen::Compose(c)) => compose::draw(f, body, c),
+        None => {}
     }
     cmdline::draw(f, bottom, app);
-}
-
-#[cfg(test)]
-mod focus_nav_tests {
-    use std::path::PathBuf;
-
-    use super::*;
-
-    fn app_with_panes(sidebar: bool, list: bool, reader: bool) -> App {
-        let mut cfg = Config::default();
-        cfg.ui.sidebar = sidebar;
-        cfg.ui.list = list;
-        cfg.ui.reader = reader;
-        App::new(&cfg, PathBuf::from("/tmp/epost-test.sqlite"), None)
-    }
-
-    #[test]
-    fn focus_left_moves_from_list_to_folders() {
-        let mut app = app_with_panes(true, true, true);
-        app.focus = Pane::List;
-        app.focus_left();
-        assert_eq!(app.focus, Pane::Folders);
-    }
-
-    #[test]
-    fn focus_left_from_reader_lands_on_folders() {
-        let mut app = app_with_panes(true, true, true);
-        app.focus = Pane::Reader;
-        app.focus_left();
-        assert_eq!(app.focus, Pane::Folders);
-    }
-
-    #[test]
-    fn focus_left_noop_when_sidebar_hidden() {
-        let mut app = app_with_panes(false, true, true);
-        app.focus = Pane::List;
-        app.focus_left();
-        assert_eq!(app.focus, Pane::List);
-    }
-
-    #[test]
-    fn focus_right_from_folders_prefers_list() {
-        let mut app = app_with_panes(true, true, true);
-        app.focus = Pane::Folders;
-        app.focus_right();
-        assert_eq!(app.focus, Pane::List);
-    }
-
-    #[test]
-    fn focus_right_from_folders_falls_back_to_reader() {
-        let mut app = app_with_panes(true, false, true);
-        app.focus = Pane::Folders;
-        app.focus_right();
-        assert_eq!(app.focus, Pane::Reader);
-    }
-
-    #[test]
-    fn focus_right_noop_when_right_column_hidden() {
-        let mut app = app_with_panes(true, false, false);
-        app.focus = Pane::Folders;
-        app.focus_right();
-        assert_eq!(app.focus, Pane::Folders);
-    }
-
-    #[test]
-    fn focus_down_moves_list_to_reader() {
-        let mut app = app_with_panes(true, true, true);
-        app.focus = Pane::List;
-        app.focus_down();
-        assert_eq!(app.focus, Pane::Reader);
-    }
-
-    #[test]
-    fn focus_down_noop_when_reader_hidden() {
-        let mut app = app_with_panes(true, true, false);
-        app.focus = Pane::List;
-        app.focus_down();
-        assert_eq!(app.focus, Pane::List);
-    }
-
-    #[test]
-    fn focus_up_moves_reader_to_list() {
-        let mut app = app_with_panes(true, true, true);
-        app.focus = Pane::Reader;
-        app.focus_up();
-        assert_eq!(app.focus, Pane::List);
-    }
-
-    #[test]
-    fn focus_up_noop_when_list_hidden() {
-        let mut app = app_with_panes(true, false, true);
-        app.focus = Pane::Reader;
-        app.focus_up();
-        assert_eq!(app.focus, Pane::Reader);
-    }
 }
 
 fn split_body(body: Rect, sidebar: bool) -> (Option<Rect>, Rect) {
@@ -673,6 +861,101 @@ fn split_right(right: Rect, list: bool, reader: bool) -> (Option<Rect>, Option<R
         (true, false) => (Some(right), None),
         (false, true) => (None, Some(right)),
         (false, false) => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod focus_nav_tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn inbox_with_panes(sidebar: bool, list: bool, reader: bool) -> InboxScreen {
+        let mut cfg = Config::default();
+        cfg.ui.sidebar = sidebar;
+        cfg.ui.list = list;
+        cfg.ui.reader = reader;
+        InboxScreen::new(&cfg, Path::new("/tmp/epost-test.sqlite"))
+    }
+
+    #[test]
+    fn focus_left_moves_from_list_to_folders() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.focus = Pane::List;
+        inbox.focus_left();
+        assert_eq!(inbox.focus, Pane::Folders);
+    }
+
+    #[test]
+    fn focus_left_from_reader_lands_on_folders() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.focus = Pane::Reader;
+        inbox.focus_left();
+        assert_eq!(inbox.focus, Pane::Folders);
+    }
+
+    #[test]
+    fn focus_left_noop_when_sidebar_hidden() {
+        let mut inbox = inbox_with_panes(false, true, true);
+        inbox.focus = Pane::List;
+        inbox.focus_left();
+        assert_eq!(inbox.focus, Pane::List);
+    }
+
+    #[test]
+    fn focus_right_from_folders_prefers_list() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.focus = Pane::Folders;
+        inbox.focus_right();
+        assert_eq!(inbox.focus, Pane::List);
+    }
+
+    #[test]
+    fn focus_right_from_folders_falls_back_to_reader() {
+        let mut inbox = inbox_with_panes(true, false, true);
+        inbox.focus = Pane::Folders;
+        inbox.focus_right();
+        assert_eq!(inbox.focus, Pane::Reader);
+    }
+
+    #[test]
+    fn focus_right_noop_when_right_column_hidden() {
+        let mut inbox = inbox_with_panes(true, false, false);
+        inbox.focus = Pane::Folders;
+        inbox.focus_right();
+        assert_eq!(inbox.focus, Pane::Folders);
+    }
+
+    #[test]
+    fn focus_down_moves_list_to_reader() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.focus = Pane::List;
+        inbox.focus_down();
+        assert_eq!(inbox.focus, Pane::Reader);
+    }
+
+    #[test]
+    fn focus_down_noop_when_reader_hidden() {
+        let mut inbox = inbox_with_panes(true, true, false);
+        inbox.focus = Pane::List;
+        inbox.focus_down();
+        assert_eq!(inbox.focus, Pane::List);
+    }
+
+    #[test]
+    fn focus_up_moves_reader_to_list() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.focus = Pane::Reader;
+        inbox.focus_up();
+        assert_eq!(inbox.focus, Pane::List);
+    }
+
+    #[test]
+    fn focus_up_noop_when_list_hidden() {
+        let mut inbox = inbox_with_panes(true, false, true);
+        inbox.focus = Pane::Reader;
+        inbox.focus_up();
+        assert_eq!(inbox.focus, Pane::Reader);
     }
 }
 
@@ -725,7 +1008,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             app.poll_scan();
-            if matches!(app.scan, ScanState::Ready(_) | ScanState::Failed(_)) {
+            if matches!(app.inbox().scan, ScanState::Ready(_) | ScanState::Failed(_)) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -742,11 +1025,11 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
 
         let mut app = App::new(&cfg, cache, None);
         drain_scan(&mut app);
-        assert!(matches!(app.scan, ScanState::Ready(_)));
+        assert!(matches!(app.inbox().scan, ScanState::Ready(_)));
 
         app.ensure_body_for_selection();
 
-        let row = app.threaded().first().expect("row").row.clone();
+        let row = app.inbox().threaded().first().expect("row").row.clone();
         assert!(
             row.flags.contains('S'),
             "expected S flag after auto-mark, got {:?}",
@@ -801,12 +1084,12 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let mut app = App::new(&cfg, cache, None);
         drain_scan(&mut app);
 
-        let start = app.threaded().first().expect("row").row.clone();
+        let start = app.inbox().threaded().first().expect("row").row.clone();
         assert!(start.flags.contains('S'), "fixture must start Seen");
 
         app.toggle_flag_selected('S');
 
-        let after = app.threaded().first().expect("row").row.clone();
+        let after = app.inbox().threaded().first().expect("row").row.clone();
         assert!(
             !after.flags.contains('S'),
             "toggle must clear S, got {:?}",
@@ -835,7 +1118,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
 
         app.toggle_flag_selected('F');
 
-        let after = app.threaded().first().expect("row").row.clone();
+        let after = app.inbox().threaded().first().expect("row").row.clone();
         assert!(
             after.flags.contains('F'),
             "expected F flag after toggle, got {:?}",
@@ -864,7 +1147,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         drain_scan(&mut app);
 
         app.toggle_flag_selected('T');
-        let after = app.threaded().first().expect("row").row.clone();
+        let after = app.inbox().threaded().first().expect("row").row.clone();
         assert!(
             after.flags.contains('T'),
             "expected T, got {:?}",
@@ -872,7 +1155,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         );
 
         app.toggle_flag_selected('T');
-        let after = app.threaded().first().expect("row").row.clone();
+        let after = app.inbox().threaded().first().expect("row").row.clone();
         assert!(
             !after.flags.contains('T'),
             "expected T cleared, got {:?}",

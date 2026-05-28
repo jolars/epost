@@ -6,7 +6,7 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 
 use crate::mail::html::{Block, Inline, InlineStyle};
-use crate::ui::app::{App, Mode, Pane, ParsedBody, ScanState};
+use crate::ui::app::{InboxScreen, Mode, Pane, ParsedBody, ScanState};
 use crate::ui::images::ImageKey;
 use crate::ui::style::pane_block;
 
@@ -52,17 +52,17 @@ pub struct ImageSlot {
     pub height: u16,
 }
 
-pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let focused = app.focus == Pane::Reader;
-    let subject = app
+pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link_pick_buf: &str) {
+    let focused = inbox.focus == Pane::Reader;
+    let subject = inbox
         .parsed
         .as_ref()
-        .and_then(|_| selected_subject(app))
+        .and_then(|_| selected_subject(inbox))
         .unwrap_or_default();
     let title = if subject.is_empty() {
-        format!("Reader [{}]", app.reader_scroll)
+        format!("Reader [{}]", inbox.reader_scroll)
     } else {
-        format!("Reader [{}] — {subject}", app.reader_scroll)
+        format!("Reader [{}] — {subject}", inbox.reader_scroll)
     };
     let block = pane_block(&title, focused);
 
@@ -71,34 +71,34 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     // Body changed since last frame — clear any rects we drew images
     // into so kitty / iTerm2 placements from the previous message don't
     // ghost over the new content.
-    if app.body_changed_this_tick {
-        for rect in std::mem::take(&mut app.last_image_rects) {
+    if inbox.body_changed_this_tick {
+        for rect in std::mem::take(&mut inbox.last_image_rects) {
             f.render_widget(Clear, rect);
         }
-        app.body_changed_this_tick = false;
+        inbox.body_changed_this_tick = false;
     }
 
     let mut laid: Option<LaidOutBody> = None;
     let header_lines: Vec<Line<'static>>;
 
-    let lines: Vec<Line<'static>> = match &app.scan {
+    let lines: Vec<Line<'static>> = match &inbox.scan {
         ScanState::Scanning => vec![dim_line("(scanning maildir…)")],
         ScanState::Failed(err) => vec![Line::from(Span::styled(
             format!("scan failed: {err}"),
             Style::default().fg(Color::Red),
         ))],
         ScanState::Ready(rows) if rows.is_empty() => vec![dim_line("(nothing to read)")],
-        ScanState::Ready(_) => match &app.parsed {
+        ScanState::Ready(_) => match &inbox.parsed {
             Some(parsed) => {
-                let mut out = render_headers(app);
+                let mut out = render_headers(inbox);
                 out.push(Line::raw(""));
-                let pick = if app.mode == Mode::LinkPick {
-                    Some(app.link_pick_buf.as_str())
+                let pick = if mode == Mode::LinkPick {
+                    Some(link_pick_buf)
                 } else {
                     None
                 };
                 let mut body = layout_with_images(&parsed.blocks, inner_width, pick, |k| {
-                    app.resolved_image(k)
+                    inbox.resolved_image(k)
                 });
                 // Translate per-body image-slot indices into absolute
                 // line indices by offsetting by the header rows.
@@ -122,13 +122,13 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                 laid = Some(body);
                 combined
             }
-            None => render_headers(app),
+            None => render_headers(inbox),
         },
     };
 
     let widget = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .scroll((app.reader_scroll, 0))
+        .scroll((inbox.reader_scroll, 0))
         .block(block);
     f.render_widget(widget, area);
 
@@ -142,10 +142,10 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         height: area.height.saturating_sub(2),
     };
     if let Some(laid) = laid {
-        let scroll = app.reader_scroll as i32;
+        let scroll = inbox.reader_scroll as i32;
         let mut drawn: Vec<Rect> = Vec::new();
         for slot in &laid.images {
-            let Some(resolved) = app.resolved_image(&slot.key) else {
+            let Some(resolved) = inbox.resolved_image(&slot.key) else {
                 continue;
             };
             let abs_y = slot.line as i32 - scroll;
@@ -177,28 +177,28 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             f.render_widget(widget, rect);
             drawn.push(rect);
         }
-        app.last_image_rects = drawn;
+        inbox.last_image_rects = drawn;
     }
 }
 
-fn selected_subject(app: &App) -> Option<String> {
-    match &app.scan {
+fn selected_subject(inbox: &InboxScreen) -> Option<String> {
+    match &inbox.scan {
         ScanState::Ready(rows) if !rows.is_empty() => {
-            let i = app.selected.min(rows.len() - 1);
+            let i = inbox.selected.min(rows.len() - 1);
             rows[i].row.subject.clone()
         }
         _ => None,
     }
 }
 
-fn render_headers(app: &App) -> Vec<Line<'static>> {
-    let ScanState::Ready(rows) = &app.scan else {
+fn render_headers(inbox: &InboxScreen) -> Vec<Line<'static>> {
+    let ScanState::Ready(rows) = &inbox.scan else {
         return Vec::new();
     };
     if rows.is_empty() {
         return Vec::new();
     }
-    let row = &rows[app.selected.min(rows.len() - 1)].row;
+    let row = &rows[inbox.selected.min(rows.len() - 1)].row;
     let mut out = Vec::with_capacity(6);
     out.push(header_line(
         "From",
@@ -797,7 +797,7 @@ fn dim_line(s: &str) -> Line<'static> {
 }
 
 #[allow(dead_code)] // surfaced via ParsedBody when step 4 lands
-fn _force_use(_app: &App, _mode: Mode, _parsed: &ParsedBody) {}
+fn _force_use(_inbox: &InboxScreen, _mode: Mode, _parsed: &ParsedBody) {}
 
 #[cfg(test)]
 mod tests {

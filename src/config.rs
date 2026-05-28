@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub images: Images,
     #[serde(default)]
+    pub compose: Compose,
+    #[serde(default)]
     pub accounts: HashMap<String, Account>,
     #[serde(default)]
     pub keys: HashMap<String, HashMap<String, String>>,
@@ -129,6 +131,45 @@ pub enum ImagesProtocol {
 
 fn default_max_height_cells() -> u16 {
     24
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compose {
+    /// Editor command for the compose body. May contain whitespace-
+    /// separated arguments (e.g. `"vim -c 'set ft=mail'"`); quoting is
+    /// not parsed in v1. If unset, falls back to `$VISUAL` / `$EDITOR` /
+    /// `vi` at spawn time.
+    #[serde(default)]
+    pub editor: Option<String>,
+}
+
+/// Resolve the editor argv at spawn time. Done late (not at parse) so
+/// `$EDITOR` set after launch is honored on subsequent edits.
+pub fn resolve_editor(c: &Compose) -> Vec<String> {
+    let raw = c
+        .editor
+        .clone()
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "vi".into());
+    raw.split_whitespace().map(String::from).collect()
+}
+
+/// Pick the SMTP command for a given account: account-local override
+/// first, then top-level `[smtp].command`, else error.
+pub fn smtp_command_for<'a>(cfg: &'a Config, account: &str) -> Result<&'a [String], String> {
+    let acc = cfg
+        .accounts
+        .get(account)
+        .ok_or_else(|| format!("unknown account: {account}"))?;
+    if let Some(s) = acc.smtp.as_ref().filter(|s| !s.command.is_empty()) {
+        return Ok(&s.command);
+    }
+    if !cfg.smtp.command.is_empty() {
+        return Ok(&cfg.smtp.command);
+    }
+    Err("smtp.command not configured".into())
 }
 
 #[derive(Debug, Deserialize)]

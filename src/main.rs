@@ -7,9 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -20,8 +18,14 @@ mod ui;
 
 use crate::config::Config;
 use crate::ui::app::App;
+use crate::ui::embed::EditorSession;
+use crate::ui::tty;
 
 const POLL_TIMEOUT: Duration = Duration::from_millis(250);
+/// Shorter poll while a compose tab is hosting an embedded `$EDITOR`
+/// session — drives the redraw cadence so typed characters appear
+/// promptly in the parsed terminal grid.
+const EDITOR_POLL_TIMEOUT: Duration = Duration::from_millis(30);
 
 #[derive(Parser)]
 #[command(name = "epost", about = "Linux maildir email reader/composer")]
@@ -53,7 +57,7 @@ fn main() -> ExitCode {
 
     install_panic_hook();
 
-    let mut terminal = match enter_tui() {
+    let mut terminal = match tty::enter() {
         Ok(t) => t,
         Err(e) => {
             eprintln!("epost: failed to enter raw mode: {e:#}");
@@ -67,7 +71,7 @@ fn main() -> ExitCode {
     let (picker, picker_warning) = ui::images::build_picker(&cfg.images);
 
     let result = run(&mut terminal, &cfg, cache_path, picker, picker_warning);
-    let restore = leave_tui();
+    let restore = tty::leave();
 
     if let Err(e) = result {
         eprintln!("epost: {e:#}");
@@ -93,13 +97,27 @@ fn run(
     }
     while !app.quit {
         app.poll_scan();
+        app.poll_compose_sends();
         app.ensure_body_for_selection();
+
+        // Editor lifecycle handled around the draw so each frame
+        // shows the freshest state: exits surface the saved body the
+        // same frame; new sessions spawn against the previously-
+        // recorded body rect so no transitional empty-pty frame ever
+        // hits the screen.
+        finalize_finished_editors(&mut app);
+        spawn_pending_editors(&mut app, &cfg.compose);
 
         terminal
             .draw(|f| ui::app::draw(f, &mut app))
             .context("drawing frame")?;
 
-        if event::poll(POLL_TIMEOUT).context("polling input")?
+        let timeout = if app.has_active_editor() {
+            EDITOR_POLL_TIMEOUT
+        } else {
+            POLL_TIMEOUT
+        };
+        if event::poll(timeout).context("polling input")?
             && let Event::Key(k) = event::read().context("reading input")?
             && k.kind == KeyEventKind::Press
         {
@@ -109,18 +127,49 @@ fn run(
     Ok(())
 }
 
-fn enter_tui() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode().context("enabling raw mode")?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen).context("entering alternate screen")?;
-    Terminal::new(CrosstermBackend::new(out)).context("constructing terminal")
+fn finalize_finished_editors(app: &mut App) {
+    let mut to_finalize: Vec<usize> = Vec::new();
+    for (i, screen) in app.screens.iter_mut().enumerate() {
+        if let ui::app::Screen::Compose(c) = screen
+            && let Some(ed) = c.editor.as_mut()
+            && ed.is_done()
+        {
+            to_finalize.push(i);
+        }
+    }
+    for i in to_finalize {
+        if let Some(ui::app::Screen::Compose(c)) = app.screens.get_mut(i) {
+            c.editor = None;
+            c.reload_body_preview();
+        }
+    }
 }
 
-fn leave_tui() -> Result<()> {
-    let mut out = io::stdout();
-    execute!(out, LeaveAlternateScreen).context("leaving alternate screen")?;
-    disable_raw_mode().context("disabling raw mode")?;
-    Ok(())
+fn spawn_pending_editors(app: &mut App, cfg: &config::Compose) {
+    let argv = config::resolve_editor(cfg);
+    // Iterate by index so we can borrow status_error mutably alongside.
+    let mut to_error: Option<String> = None;
+    for screen in app.screens.iter_mut() {
+        let ui::app::Screen::Compose(c) = screen else {
+            continue;
+        };
+        if !c.editor_pending || c.editor.is_some() {
+            continue;
+        }
+        c.editor_pending = false;
+        let (rows, cols) = c.last_body_inner.unwrap_or((24, 80));
+        match EditorSession::start(&c.body_path(), &argv, rows, cols) {
+            Ok(session) => {
+                c.editor = Some(session);
+            }
+            Err(e) => {
+                to_error = Some(format!("editor: {e:#}"));
+            }
+        }
+    }
+    if let Some(msg) = to_error {
+        app.status_error = Some(msg);
+    }
 }
 
 fn install_panic_hook() {

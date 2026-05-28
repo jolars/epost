@@ -9,6 +9,11 @@ pub struct Headers {
     pub msgid: String,
     pub date: i64,
     pub from: Option<String>,
+    /// `Reply-To:`, when present. Reply targeting prefers this over
+    /// `From:` (mailing lists / no-reply senders).
+    pub reply_to: Option<String>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
     pub subject: Option<String>,
     pub in_reply: Option<String>,
     pub refs: Vec<String>,
@@ -88,17 +93,10 @@ pub fn parse_headers(bytes: &[u8]) -> Option<Headers> {
         .filter(|t| *t > 0)
         .unwrap_or(0);
 
-    let from = msg.from().and_then(|addrs| {
-        let a = addrs.first()?;
-        let name = a.name().map(|s| s.to_string());
-        let addr = a.address().map(|s| s.to_string());
-        match (name, addr) {
-            (Some(n), Some(a)) => Some(format!("{n} <{a}>")),
-            (None, Some(a)) => Some(a),
-            (Some(n), None) => Some(n),
-            (None, None) => None,
-        }
-    });
+    let from = msg.from().and_then(|addrs| format_addr(addrs.first()?));
+    let reply_to = msg.reply_to().and_then(|addrs| format_addr(addrs.first()?));
+    let to = collect_addrs(msg.to());
+    let cc = collect_addrs(msg.cc());
 
     let subject = msg.subject().map(|s| s.to_string());
 
@@ -117,10 +115,31 @@ pub fn parse_headers(bytes: &[u8]) -> Option<Headers> {
         msgid,
         date,
         from,
+        reply_to,
+        to,
+        cc,
         subject,
         in_reply,
         refs,
     })
+}
+
+fn format_addr(a: &mail_parser::Addr) -> Option<String> {
+    let name = a.name().map(|s| s.to_string());
+    let addr = a.address().map(|s| s.to_string());
+    match (name, addr) {
+        (Some(n), Some(a)) => Some(format!("{n} <{a}>")),
+        (None, Some(a)) => Some(a),
+        (Some(n), None) => Some(n),
+        (None, None) => None,
+    }
+}
+
+fn collect_addrs(field: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+    let Some(addrs) = field else {
+        return Vec::new();
+    };
+    addrs.iter().filter_map(format_addr).collect()
 }
 
 #[cfg(test)]
@@ -175,6 +194,54 @@ body\r\n";
     fn rfc_2047_subject_decodes_to_utf8() {
         let h = parse_headers(UTF8).unwrap();
         assert_eq!(h.subject.as_deref(), Some("日本語の件名テスト"));
+    }
+
+    const MULTI_RECIPIENT: &[u8] = b"\
+Message-ID: <r@example.com>\r\n\
+From: sender@example.com\r\n\
+To: First <first@example.com>, second@example.com\r\n\
+Cc: Third <third@example.com>\r\n\
+Subject: many\r\n\
+Date: Tue, 26 May 2026 09:00:00 +0000\r\n\
+\r\n\
+body\r\n";
+
+    #[test]
+    fn parses_multi_recipient_to_and_cc() {
+        let h = parse_headers(MULTI_RECIPIENT).unwrap();
+        assert_eq!(
+            h.to,
+            vec![
+                "First <first@example.com>".to_string(),
+                "second@example.com".to_string(),
+            ]
+        );
+        assert_eq!(h.cc, vec!["Third <third@example.com>".to_string()]);
+    }
+
+    const WITH_REPLY_TO: &[u8] = b"\
+Message-ID: <rt@example.com>\r\n\
+From: List Bot <bot@list.example.com>\r\n\
+Reply-To: List <list@list.example.com>\r\n\
+To: subscriber@example.com\r\n\
+Subject: announce\r\n\
+Date: Tue, 26 May 2026 09:00:00 +0000\r\n\
+\r\n\
+body\r\n";
+
+    #[test]
+    fn captures_reply_to_when_present() {
+        let h = parse_headers(WITH_REPLY_TO).unwrap();
+        assert_eq!(h.reply_to.as_deref(), Some("List <list@list.example.com>"));
+        assert_eq!(h.from.as_deref(), Some("List Bot <bot@list.example.com>"));
+    }
+
+    #[test]
+    fn reply_to_absent_when_unset() {
+        let h = parse_headers(PLAIN).unwrap();
+        assert!(h.reply_to.is_none());
+        assert!(h.to.is_empty());
+        assert!(h.cc.is_empty());
     }
 
     const MULTIPART_WITH_CID: &[u8] = b"\
