@@ -12,51 +12,83 @@ pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
 
     match app.mode {
         Mode::Normal => normal(app, k),
-        Mode::Reader => reader(app, cfg, k),
         Mode::Command => command(app, cfg, k),
         Mode::LinkPick => link_pick(app, cfg, k),
     }
 }
 
 fn normal(app: &mut App, k: KeyEvent) {
-    match k.code {
-        KeyCode::Char('q') => app.quit = true,
-        KeyCode::Tab => app.cycle_focus(true),
-        KeyCode::BackTab => app.cycle_focus(false),
-        KeyCode::Char('j') if app.focus == Pane::List => app.select_next(),
-        KeyCode::Char('k') if app.focus == Pane::List => app.select_prev(),
-        KeyCode::Char('m') if app.focus == Pane::List => app.toggle_flag_selected('S'),
-        KeyCode::Char('*') if app.focus == Pane::List => app.toggle_flag_selected('F'),
-        KeyCode::Char('d') if app.focus == Pane::List => app.toggle_flag_selected('T'),
-        KeyCode::Char('l') | KeyCode::Enter if app.focus == Pane::Reader && app.reader_visible => {
-            app.mode = Mode::Reader;
+    // Ctrl-h/j/k/l: vim-window-style spatial pane navigation. Match
+    // before the plain-letter arms so e.g. Ctrl-j doesn't also fire
+    // `select_next`. Any other Ctrl-letter is swallowed here so it can't
+    // accidentally trigger a Normal binding either.
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        match k.code {
+            KeyCode::Char('h') => app.focus_left(),
+            KeyCode::Char('j') => app.focus_down(),
+            KeyCode::Char('k') => app.focus_up(),
+            KeyCode::Char('l') => app.focus_right(),
+            _ => {}
         }
-        KeyCode::Char(':') => enter_command(app),
+        return;
+    }
+
+    // Universal keys (work in any focus).
+    match k.code {
+        KeyCode::Char('q') => {
+            app.quit = true;
+            return;
+        }
+        KeyCode::Tab => {
+            app.cycle_focus(true);
+            return;
+        }
+        KeyCode::BackTab => {
+            app.cycle_focus(false);
+            return;
+        }
+        KeyCode::Char(':') => {
+            enter_command(app);
+            return;
+        }
         _ => {}
     }
-}
 
-fn reader(app: &mut App, _cfg: &Config, k: KeyEvent) {
-    match k.code {
-        KeyCode::Char('j') => app.reader_scroll = app.reader_scroll.saturating_add(1),
-        KeyCode::Char('k') => app.reader_scroll = app.reader_scroll.saturating_sub(1),
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-            app.focus = if app.list_visible {
-                Pane::List
-            } else if app.sidebar_visible {
-                Pane::Folders
-            } else {
-                Pane::Reader
-            };
-        }
-        KeyCode::Char('q') => app.quit = true,
-        KeyCode::Char('f') => {
-            app.link_pick_buf.clear();
-            app.mode = Mode::LinkPick;
-        }
-        KeyCode::Char(':') => enter_command(app),
-        _ => {}
+    // Focus-routed keys: `j`/`k` are the obvious case — list nav when List
+    // has focus, reader scroll when Reader does. `f` only makes sense in
+    // the reader (link picker over the rendered body). The flag toggles
+    // (`m`/`*`/`d`) only apply to a selected row, so they're List-only.
+    match app.focus {
+        Pane::List => match k.code {
+            KeyCode::Char('j') => app.select_next(),
+            KeyCode::Char('k') => app.select_prev(),
+            KeyCode::Char('m') => app.toggle_flag_selected('S'),
+            KeyCode::Char('*') => app.toggle_flag_selected('F'),
+            KeyCode::Char('d') => app.toggle_flag_selected('T'),
+            KeyCode::Char('l') | KeyCode::Enter if app.reader_visible => {
+                app.focus = Pane::Reader;
+            }
+            _ => {}
+        },
+        Pane::Reader => match k.code {
+            KeyCode::Char('j') => app.reader_scroll = app.reader_scroll.saturating_add(1),
+            KeyCode::Char('k') => app.reader_scroll = app.reader_scroll.saturating_sub(1),
+            KeyCode::Char('f') => {
+                app.link_pick_buf.clear();
+                app.mode = Mode::LinkPick;
+            }
+            KeyCode::Esc => {
+                app.focus = if app.list_visible {
+                    Pane::List
+                } else if app.sidebar_visible {
+                    Pane::Folders
+                } else {
+                    Pane::Reader
+                };
+            }
+            _ => {}
+        },
+        Pane::Folders => {}
     }
 }
 
@@ -81,7 +113,7 @@ fn link_pick(app: &mut App, cfg: &Config, k: KeyEvent) {
     match k.code {
         KeyCode::Esc => {
             app.link_pick_buf.clear();
-            app.mode = Mode::Reader;
+            app.mode = Mode::Normal;
         }
         KeyCode::Backspace => {
             app.link_pick_buf.pop();
@@ -91,7 +123,7 @@ fn link_pick(app: &mut App, cfg: &Config, k: KeyEvent) {
         }
         KeyCode::Enter => {
             let buf = std::mem::take(&mut app.link_pick_buf);
-            app.mode = Mode::Reader;
+            app.mode = Mode::Normal;
             follow_link(app, cfg, &buf);
         }
         _ => {}

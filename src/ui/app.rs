@@ -24,10 +24,12 @@ pub enum Pane {
     Reader,
 }
 
+/// Modal layer. `Normal` is the ambient navigation mode — keys are routed
+/// by pane focus (List vs Reader), not by a separate Reader sub-mode.
+/// `Command` and `LinkPick` exist because they capture text/digit input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    Reader,
     Command,
     LinkPick,
 }
@@ -400,11 +402,6 @@ impl App {
 
     pub fn cycle_focus(&mut self, forward: bool) {
         let ring = [Pane::Folders, Pane::List, Pane::Reader];
-        let visible = |p: Pane| match p {
-            Pane::Folders => self.sidebar_visible,
-            Pane::List => self.list_visible,
-            Pane::Reader => self.reader_visible,
-        };
         let n = ring.len();
         let start = ring.iter().position(|p| *p == self.focus).unwrap_or(0);
         for step in 1..=n {
@@ -413,10 +410,52 @@ impl App {
             } else {
                 (start + n - step) % n
             };
-            if visible(ring[i]) {
+            if self.pane_visible(ring[i]) {
                 self.focus = ring[i];
                 return;
             }
+        }
+    }
+
+    fn pane_visible(&self, p: Pane) -> bool {
+        match p {
+            Pane::Folders => self.sidebar_visible,
+            Pane::List => self.list_visible,
+            Pane::Reader => self.reader_visible,
+        }
+    }
+
+    /// Spatial focus moves driven by `Ctrl-h/j/k/l`. The layout is fixed
+    /// (Folders left of List-stacked-over-Reader), so each direction has
+    /// at most one valid target; if the target is hidden the move is a
+    /// no-op. Keeping these as methods alongside `cycle_focus` so any
+    /// future pane-visibility changes stay in one place.
+    pub fn focus_left(&mut self) {
+        if matches!(self.focus, Pane::List | Pane::Reader) && self.sidebar_visible {
+            self.focus = Pane::Folders;
+        }
+    }
+
+    pub fn focus_right(&mut self) {
+        // From the folder sidebar, prefer List, fall back to Reader.
+        if self.focus == Pane::Folders {
+            if self.list_visible {
+                self.focus = Pane::List;
+            } else if self.reader_visible {
+                self.focus = Pane::Reader;
+            }
+        }
+    }
+
+    pub fn focus_down(&mut self) {
+        if self.focus == Pane::List && self.reader_visible {
+            self.focus = Pane::Reader;
+        }
+    }
+
+    pub fn focus_up(&mut self) {
+        if self.focus == Pane::Reader && self.list_visible {
+            self.focus = Pane::List;
         }
     }
 
@@ -519,6 +558,101 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         reader::draw(f, rect, &mut *app);
     }
     cmdline::draw(f, bottom, app);
+}
+
+#[cfg(test)]
+mod focus_nav_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn app_with_panes(sidebar: bool, list: bool, reader: bool) -> App {
+        let mut cfg = Config::default();
+        cfg.ui.sidebar = sidebar;
+        cfg.ui.list = list;
+        cfg.ui.reader = reader;
+        App::new(&cfg, PathBuf::from("/tmp/epost-test.sqlite"), None)
+    }
+
+    #[test]
+    fn focus_left_moves_from_list_to_folders() {
+        let mut app = app_with_panes(true, true, true);
+        app.focus = Pane::List;
+        app.focus_left();
+        assert_eq!(app.focus, Pane::Folders);
+    }
+
+    #[test]
+    fn focus_left_from_reader_lands_on_folders() {
+        let mut app = app_with_panes(true, true, true);
+        app.focus = Pane::Reader;
+        app.focus_left();
+        assert_eq!(app.focus, Pane::Folders);
+    }
+
+    #[test]
+    fn focus_left_noop_when_sidebar_hidden() {
+        let mut app = app_with_panes(false, true, true);
+        app.focus = Pane::List;
+        app.focus_left();
+        assert_eq!(app.focus, Pane::List);
+    }
+
+    #[test]
+    fn focus_right_from_folders_prefers_list() {
+        let mut app = app_with_panes(true, true, true);
+        app.focus = Pane::Folders;
+        app.focus_right();
+        assert_eq!(app.focus, Pane::List);
+    }
+
+    #[test]
+    fn focus_right_from_folders_falls_back_to_reader() {
+        let mut app = app_with_panes(true, false, true);
+        app.focus = Pane::Folders;
+        app.focus_right();
+        assert_eq!(app.focus, Pane::Reader);
+    }
+
+    #[test]
+    fn focus_right_noop_when_right_column_hidden() {
+        let mut app = app_with_panes(true, false, false);
+        app.focus = Pane::Folders;
+        app.focus_right();
+        assert_eq!(app.focus, Pane::Folders);
+    }
+
+    #[test]
+    fn focus_down_moves_list_to_reader() {
+        let mut app = app_with_panes(true, true, true);
+        app.focus = Pane::List;
+        app.focus_down();
+        assert_eq!(app.focus, Pane::Reader);
+    }
+
+    #[test]
+    fn focus_down_noop_when_reader_hidden() {
+        let mut app = app_with_panes(true, true, false);
+        app.focus = Pane::List;
+        app.focus_down();
+        assert_eq!(app.focus, Pane::List);
+    }
+
+    #[test]
+    fn focus_up_moves_reader_to_list() {
+        let mut app = app_with_panes(true, true, true);
+        app.focus = Pane::Reader;
+        app.focus_up();
+        assert_eq!(app.focus, Pane::List);
+    }
+
+    #[test]
+    fn focus_up_noop_when_list_hidden() {
+        let mut app = app_with_panes(true, false, true);
+        app.focus = Pane::Reader;
+        app.focus_up();
+        assert_eq!(app.focus, Pane::Reader);
+    }
 }
 
 fn split_body(body: Rect, sidebar: bool) -> (Option<Rect>, Rect) {

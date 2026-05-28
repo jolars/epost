@@ -25,7 +25,6 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
 fn mode_tag(mode: Mode) -> &'static str {
     match mode {
         Mode::Normal => " NORMAL  ",
-        Mode::Reader => " READER  ",
         Mode::Command => " COMMAND ",
         Mode::LinkPick => " LINKPICK",
     }
