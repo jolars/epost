@@ -2,19 +2,37 @@
 
 ## What we are building
 
-A GUI email client, Linux-only, written in Rust.
+A **TUI** email client, Linux-only, written in Rust. It lives in the terminal,
+treats HTML mail as a first-class citizen (not "pipe to w3m and good luck
+finding the links"), and falls back to the system browser for the small set of
+messages where a cell-grid rendering would lose important information.
 
-- **UI shell:** `egui`/`eframe` on the **wgpu** backend --- immediate-mode,
-  fully keyboard-driven, vim-style modal input.
-- **Window layout:** four-region panel structure --- top account bar, left
-  folder sidebar, message list above the reader on the right. Side/top panels
-  are toggleable; the reader fills the remaining width below the list. See
-  *Window layout* below.
-- **HTML body:** rendered by **Blitz** (`blitz-dom` + `blitz-html` +
-  `blitz-paint`) into a wgpu texture that egui composites as an `Image` in the
-  body-pane rect. Blitz uses Stylo (Servo's CSS engine) for real CSS, runs
-  in-process, has **no JS engine at all**, and is *not* a native child widget
-  --- so there is no overlay, no separate window, and no focus-stealing problem.
+- **UI shell:** `ratatui` on the `crossterm` backend. Our process owns no
+  graphics pipeline of its own --- we write cells (and image-protocol
+  payloads) to the terminal, which handles the actual pixel pushing.
+  Modern terminals (kitty, ghostty, WezTerm, Alacritty, foot) GPU-composite
+  those cells and can upload kitty-graphics image data straight to GPU
+  textures; that acceleration is real, it's just owned by the terminal, not
+  us. Fully keyboard-driven, vim-style modal input.
+- **Window layout:** four-region pane structure --- top account/status bar,
+  left folder sidebar, message list above the reader on the right, bottom
+  status/cmdline. Side/list/reader panes are toggleable. See *Window layout*
+  below.
+- **HTML body:** parsed with `html5ever`, walked into a Block-IR
+  (paragraphs, headings, lists, tables, blockquotes, inline runs, links,
+  images), and rendered into a ratatui cell buffer + a numbered **link
+  table** + a list of **inline image draws**. The rendering is
+  *approximate-fidelity by design* --- CSS layout collapses to a cell grid,
+  fonts are whatever the terminal uses, but no important information is
+  silently lost: links surface in a Vimium-style picker (`f`), inline images
+  render via the terminal's image protocol, and an `:open` /
+  `<leader>o` escape hatch pipes the message HTML to `xdg-open` (or any
+  configured command) for the messages where the cell rendering isn't good
+  enough.
+- **Inline images:** `ratatui-image` handles capability detection and
+  emission (kitty graphics protocol, iTerm2 inline images, sixel,
+  half-block fallback). `cid:` parts come from the parsed MIME tree;
+  remote (`http(s)://`) images are never fetched.
 - **Storage:** real maildirs on disk are the source of truth. A SQLite index
   (via `rusqlite`) is a **disposable cache** for the unified inbox, search, and
   threading. It can be deleted and rebuilt by rescanning at any time.
@@ -33,58 +51,60 @@ A GUI email client, Linux-only, written in Rust.
 
 ## Hard requirements / invariants
 
-1. **Single render pipeline.** Blitz paints into a wgpu texture sized to the
-   body-pane rect; egui samples that texture as an `Image`. There is no native
-   child widget, no overlay compositing, no separate focus target. Keyboard
-   input is owned by the egui/GTK window unconditionally; vim keys (`j k gg G /
-   :   Enter Esc\`) are interpreted at the egui layer.
+1. **Single TUI render pipeline.** ratatui owns the terminal back-buffer
+   end-to-end. The HTML body is rendered into a cell buffer with optional
+   inline-image draws sequenced into the same frame. There is no overlay
+   compositing, no separate focus target, no embedded child widget. Keyboard
+   input is read by `crossterm` and routed by our modal keymap.
 2. **Everything keys on `Message-ID`, never on file path.** `mbsync` rewrites
    maildir paths and the `:2,<flags>` info suffix on every sync, so paths go
    stale constantly. The index upserts by `msgid` and updates `path`/`flags` on
    rescan.
 3. **The SQLite index is a cache.** Maildir is truth. A corrupt or deleted index
    is never a data-loss event --- full rescan on startup is the backstop.
-4. **Remote content blocked by default.** Implement Blitz's `NetProvider` trait.
-   Deny any request whose scheme is `http`/`https` until a per-message "load
-   images" flag is set; when the flag flips, drop and re-resolve the document so
-   the loads retry. Resolve `cid:` URLs against in-memory MIME parts from the
-   parsed message. Allow `data:`. Deny everything else (including `file:`). This
-   is privacy + tracking-pixel defense, and Blitz hands you every sub-resource
-   fetch through one trait method.
-5. **No JavaScript, ever.** Blitz has no JS engine --- we depend on this as a
-   structural property, not a flag to turn off. Email content never executes
-   code.
+4. **Remote content is never fetched.** The HTML walker only resolves `cid:`
+   parts against the current message's MIME tree and `data:` URIs inline.
+   `http(s)://` images render as a `[remote image: alt]` placeholder; we do
+   not provide a "load images" toggle. The escape hatch for messages where
+   you really want the rendered remote content is `:open` --- the entire
+   message HTML (with `cid:` references rewritten to disk-backed temp files)
+   is handed to the system browser via the configured command.
+5. **No HTML engine that can execute code.** `html5ever` is a parser. The Block-IR
+   walker emits styled cells and image draws --- nothing runs scripts, fetches
+   stylesheets, evaluates expressions, or follows `<meta http-equiv="refresh">`.
+   This is structural, not a flag to turn off.
 6. **When we change a flag ourselves** (e.g. mark read → add `S` to the info
    suffix), we rename the file per the maildir spec, then update the row
    directly. Debounce the file watcher so we don't rescan on our own writes.
 7. **Configuration is declarative and read-only.** A single TOML file is the
-   source of truth for accounts, panel defaults, keybinds, and renderer
-   settings. **The app never writes it.** Runtime `:set ...` commands are
-   strictly ephemeral --- session-only --- because the workflow we're designing
-   for is a NixOS / Home Manager module that generates the config
-   declaratively, and a config-as-output app cannot be config-driven. `:reload`
-   re-reads the file. Parsing is strict: unknown keys fail the load with a
-   pointing error rather than being silently ignored.
-8. **UI never blocks.** Maildir scans, compose sends, search, and large-batch
-   threading run on worker threads; the UI thread polls `mpsc` channels each
-   frame and calls `Context::request_repaint()` when there's something to
-   show. We use `std::thread` + channels, **not** `async`/`await` --- the
-   workload is a small number of long-running jobs, not many concurrent I/O
-   operations, so threads are simpler and incur no runtime cost.
+   source of truth for accounts, pane defaults, keybinds, browser-fallback
+   command, and image-protocol overrides. **The app never writes it.** Runtime
+   `:set ...` commands are strictly ephemeral --- session-only --- because the
+   workflow we're designing for is a NixOS / Home Manager module that generates
+   the config declaratively, and a config-as-output app cannot be
+   config-driven. `:reload` re-reads the file. Parsing is strict: unknown keys
+   fail the load with a pointing error rather than being silently ignored.
+8. **UI never blocks.** Maildir scans, compose sends, search, large-batch
+   threading, and the browser-fallback spawn all run on worker threads; the
+   UI thread polls `mpsc` channels each tick. We use `std::thread` + channels,
+   **not** `async`/`await` --- the workload is a small number of long-running
+   jobs, not many concurrent I/O operations, so threads are simpler and
+   incur no runtime cost.
 
 ## Crates
 
-- `eframe` + `egui` (**wgpu backend**, not glow) --- UI shell. We need wgpu so
-  we can share the `wgpu::Device`/`Queue` with Blitz's renderer.
-- `blitz-dom`, `blitz-html`, `blitz-paint` --- HTML/CSS rendering core
-- `blitz-traits` --- `NetProvider` / `NavigationProvider` traits
-- `anyrender_vello_hybrid` (or `anyrender_vello`) --- Blitz's wgpu backend via
-  Vello
-- **Do not** depend on `blitz-shell`. It pulls in winit/AccessKit/Muda and
-  assumes it owns the window; we want the core crates only.
+- `ratatui` --- TUI widgets and layout
+- `crossterm` --- terminal backend (raw mode, events, alt-screen, resize)
+- `ratatui-image` --- inline image rendering with capability detection
+  (kitty graphics, iTerm2, sixel, half-block fallback). It picks the right
+  protocol at startup from `$TERM` + env probing; we expose an override in
+  config for users who want to pin a specific protocol.
+- `image` --- decode `cid:` PNG/JPEG/GIF parts ahead of feeding them to
+  ratatui-image
+- `html5ever` + `markup5ever_rcdom` --- HTML parsing into a DOM we can walk
 - `rusqlite` (bundled feature) --- index
 - `mail-parser` --- MIME parsing (headers, multipart, text/plain + text/html
-  alternatives)
+  alternatives, embedded parts for `cid:` resolution)
 - `mail-builder` --- building outgoing MIME
 - `maildirpp` (or `maildir`) --- maildir cur/new/tmp + info flags; prefer the
   maildir++ subfolder convention since we have multiple folders per account
@@ -92,29 +112,21 @@ A GUI email client, Linux-only, written in Rust.
 - `anyhow` + `thiserror` --- errors
 - `serde` + `toml` --- config (strict-parsed)
 - `directories` --- XDG path resolution (`$XDG_CONFIG_HOME`, `$XDG_CACHE_HOME`)
+- `clap` --- CLI (`--config <path>`)
 
-> Note to agent: Blitz is at `0.3.0-alpha.4` as of project start (May 2026),
-> with 0.3 beta targeted June 2026. Pin an exact version --- APIs churn between
-> alphas. Hosted docs are thin; read source first. Start in
-> `packages/blitz-dom/src/config.rs` (`DocumentConfig`),
-> `packages/blitz-dom/src/document.rs` (lifecycle), and
-> `packages/blitz-traits/src/net.rs` (`NetProvider` trait). Useful example
-> references in the Blitz repo: `examples/wgpu_texture/` (device/queue sharing
-> pattern --- note it's the *inverse* of what we want, but the sharing pattern
-> is the same) and `examples/screenshot.rs` (headless render-to-pixels, closest
-> to our path). No upstream example currently does
-> "render-into-host-owned-wgpu-texture-and-composite" --- expect to be the first
-> to wire that, and to file upstream bugs on real-world HTML-email table
-> layouts.
+Explicitly **not** depended on (ripped out during the GUI → TUI pivot):
+`eframe`, `egui`, `egui-wgpu`, `wgpu`, `vello`, `anyrender`,
+`anyrender_vello`, `blitz-dom`, `blitz-html`, `blitz-paint`, `blitz-traits`.
+The pre-alpha pin warning that used to live here is gone with them.
 
 ## Module layout
 
 ```
 src/
-  main.rs          // eframe bootstrap, event loop
-  config.rs        // accounts -> maildir paths, keybinds, msmtp cmd (TOML)
+  main.rs          // crossterm raw-mode setup, event loop, terminal restore
+  config.rs        // accounts -> maildir paths, keybinds, msmtp cmd,
+                   // browser-fallback cmd, image-protocol override (TOML)
   store/
-    mod.rs
     scan.rs        // walk maildirs, parse headers, upsert by msgid
     index.rs       // rusqlite schema + queries (unified inbox, thread fetch)
     thread.rs      // jwz threading over references / in-reply-to
@@ -123,16 +135,21 @@ src/
     parse.rs       // mail-parser wrappers: headers, body alternatives, cid parts
     flags.rs       // maildir info flags <-> internal state, spec-correct renames
     compose.rs     // build MIME via mail-builder, pipe to `msmtp -t` stdin
-    net.rs         // NetProvider impl: cid: resolver, http(s) gating, data: passthrough
+    html.rs        // html5ever parse + walk into Block-IR
+                   // (BlockIR = tree of Paragraph/Heading/List/Table/
+                   //  Quote/InlineRun/Link/Image nodes)
   ui/
-    app.rs         // top-level state: panel layout/focus/visibility, mode, selection
-    keys.rs        // modal keymap: Normal / Command / Search / Insert
-    accounts.rs    // top panel: account selector / global status
+    app.rs         // top-level state: pane layout/focus/visibility, mode, selection
+    keys.rs        // modal keymap: Normal / Command / Search / Insert / Reader
+    accounts.rs    // top bar: account selector / sync state / global status
     folders.rs     // left sidebar: folder tree
     list.rs        // message/thread list pane
-    reader.rs      // body pane: plaintext view OR Blitz-rendered HTML
-    body.rs        // Blitz document lifecycle, render-to-texture, viewport/scroll
-    cmdline.rs     // ":" command parser, "/" search
+    reader.rs      // Block-IR -> cells; link picker; inline image draws;
+                   // scroll; :open browser fallback
+    images.rs      // thin wrapper over ratatui-image for cid:/data: parts
+    browser.rs     // xdg-open fallback: write cid-rewritten HTML to tempdir,
+                   // spawn user-configured command on a worker thread
+    cmdline.rs     // ":" command parser, "/" search, status line
 ```
 
 ## Configuration
@@ -159,9 +176,9 @@ produce the same experience.
 # ~/.config/epost/config.toml
 
 [ui]
-sidebar = true       # folder panel visible at startup
+sidebar = true       # folder pane visible at startup
 list    = true       # message list visible
-reader  = true       # reader (Blitz) visible
+reader  = true       # reader visible
 
 [smtp]
 command = ["msmtp", "-t"]   # default; per-account overrides take precedence
@@ -170,14 +187,22 @@ command = ["msmtp", "-t"]   # default; per-account overrides take precedence
 # Optional. If set, `:sync` (and any keybind that invokes it) runs this
 # command on a worker thread. If omitted, `:sync` is a no-op --- assume
 # the user drives mbsync externally (systemd-user timer, goimapnotify, ...).
-# No in-app interval: we deliberately do not schedule sync ourselves, to
-# avoid fighting an external scheduler.
 # command = ["mbsync", "-a"]
 # command = ["systemctl", "--user", "start", "mbsync.service"]
 
 [reader]
-default_view = "html"  # "html" | "plain"
-load_images  = false   # remote-content default for new messages
+prefer = "html"               # "html" | "plain"
+# Browser fallback for ":open". Receives the rewritten HTML file path as
+# the final argument. Override to e.g. firefox / qutebrowser / lynx.
+browser = ["xdg-open"]
+
+[images]
+# Auto-detect by default. Override with one of:
+#   "kitty" | "iterm" | "sixel" | "halfblocks" | "off"
+# "off" disables inline images entirely; everything renders as
+# `[image: alt]` placeholders.
+protocol = "auto"
+max_height_cells = 24   # cap image height; preserves aspect ratio
 
 # Accounts: named tables. The name ("personal", "work") is a stable id used
 # in the UI and in keybindings that reference an account.
@@ -198,21 +223,25 @@ smtp.command  = ["msmtp", "-t", "-a", "work"]    # per-account override
 # only specify what you want to change. To unbind a default, set "".
 
 [keys.normal]
-"<Tab>"   = "panel-next"
+"<Tab>"   = "pane-next"
 "j"       = "select-next"
 "k"       = "select-prev"
 "<Enter>" = "focus-reader"
-"i"       = "toggle-images"
 
 [keys.reader]
-"j"     = "scroll-down 80"
-"k"     = "scroll-up 80"
-"<Esc>" = "panel-focus list"
+"j"        = "scroll-down 1"
+"k"        = "scroll-up 1"
+"<C-d>"    = "scroll-down 10"
+"<C-u>"    = "scroll-up 10"
+"f"        = "link-pick"          # Vimium-style: numbers each link, type to follow
+"<Enter>"  = "link-follow"        # follow the currently-hovered link
+"o"        = "open-browser"       # pipe message to [reader].browser
+"<Esc>"    = "pane-focus list"
 ```
 
-Schema lives in `src/config.rs` as plain `serde::Deserialize` structs; defaults
-via `#[serde(default)]` + `Default` impls per struct. `~` expansion on path
-fields is applied at parse time.
+Schema lives in `src/config.rs` as plain `serde::Deserialize` structs with
+`#[serde(deny_unknown_fields)]`; defaults via `#[serde(default)]` + `Default`
+impls per struct. `~` expansion on path fields is applied at parse time.
 
 ## Index schema (minimal)
 
@@ -239,133 +268,172 @@ CREATE INDEX IF NOT EXISTS idx_account ON msg(account);
 
 ## Window layout
 
-Built on egui's panel system (`TopBottomPanel` + `SidePanel` + `CentralPanel`).
-Four regions:
+ratatui composes regions with its `Layout` constraint system. Four primary
+regions plus a single-row status/cmdline at the bottom:
 
 ```
-+---------+-------------------+
-| Account bar (full width)    |
-+---------+-------------------+
-|         |   Message list    |
-|         |                   |
-| Folders +-------------------+
-|         |                   |
-|         |   Reader (Blitz)  |
-|         |                   |
-+---------+-------------------+
++--------------------------------------------------+
+| account · folder · sync state          mode/keys |   top bar (1 row)
++---------+----------------------------------------+
+|         | message list                           |
+|         |                                        |
+| folders +----------------------------------------+
+| (tree)  | reader  (html cells + inline images)   |
+|         |                                        |
+|         |                                        |
++---------+----------------------------------------+
+| :command / search / status                       |   cmdline (1 row)
++--------------------------------------------------+
 ```
 
-- **Account bar (top):** `TopBottomPanel::top`. Configured accounts,
-  unified-inbox toggle, global status (sync state, unread totals). Thin. Always
-  visible in v1.
-- **Folder sidebar (left):** `SidePanel::left`. Folder tree under the
-  currently-selected account (or "all" for the unified inbox view). Resizable
-  and toggleable.
-- **Message list (center, top half):** the list pane, full width of the central
-  region. Threaded view; current selection drives the reader. Toggleable (hiding
-  it gives the reader full height --- "zen reading").
-- **Reader (center, bottom half):** the Blitz-rendered body pane. The body-pane
-  rect we hand to Blitz for layout is *exactly* this region. The list/reader
-  split is a resizable horizontal divider inside the central panel; the reader
-  is toggleable too (hiding it gives the list full height).
+- **Top bar:** current account, current folder, sync indicator, current mode
+  (`NORMAL` / `READER` / `COMMAND` / etc.). Always visible.
+- **Folder sidebar:** the folder tree under the currently-selected account
+  (or "all" for the unified inbox view). Resizable, toggleable.
+- **Message list:** threaded view; current selection drives the reader.
+  Toggleable.
+- **Reader:** Block-IR rendered into cells; inline images draw on top via
+  ratatui-image's stateful protocol (kitty/iTerm/sixel/halfblocks). Toggleable
+  --- hiding the list expands the reader vertically.
+- **Cmdline / status:** single row. `:` enters Command mode, `/` enters Search.
+  Otherwise displays transient status (sync result, error from compose,
+  "loading inline image", etc.).
 
-### Panel focus
+### Pane focus
 
-Normal mode tracks which panel "has" navigation focus: `Folders`, `List`, or
-`Reader`. `j`/`k` navigate within the focused panel:
+Normal mode tracks which pane "has" navigation focus: `Folders`, `List`, or
+`Reader`. `j`/`k` navigate within the focused pane:
 
 - `Folders` focused → move folder selection.
 - `List` focused → move message/thread selection.
-- `Reader` focused → enter reader sub-mode (`j`/`k` translate to Blitz viewport
-  scroll-offset deltas; `Esc` returns focus to the list).
+- `Reader` focused → enter reader sub-mode (`l`/`Enter` to enter); `j`/`k`
+  scroll the rendered cells; `Esc` returns focus to the list. `f` enters the
+  link picker (Vimium-style): every link gets a number, type the number to
+  follow.
 
-Panel-switch keys move focus between panels --- planned: `Tab` / `Shift-Tab` for
-ring rotation, plus vim-window-style `Ctrl-w h/j/k/l` for direct moves. egui
-still owns all keyboard input unconditionally; panel "focus" is an app-level
-concept that just decides where to route the keystroke.
+Pane-switch keys: `Tab`/`Shift-Tab` for ring rotation, plus vim-window-style
+`Ctrl-w h/j/k/l` for direct moves. Hidden panes reclaim their space; the next
+reader render picks up the new pane size.
 
-### Visibility
+## The HTML rendering model
 
-Each toggleable panel is bound to both a `:` command (e.g. `:set sidebar`,
-`:set list`, `:set reader`) and a keybind (TBD --- candidates: leader-chord like
-`<leader>tf` for "toggle folders", or vim-fold-style `zS`/`zL`/`zR`). Hidden
-panels reclaim their space; the reader rect expands accordingly and the next
-Blitz repaint picks up the new viewport size.
+Email HTML is rendered to terminal cells. The fidelity goal is **readable, not
+faithful**: layout collapses to one column at the pane's width, fonts are
+whatever the terminal uses, link/image markers are explicit (not silently
+hidden), but the structural intent of the message --- paragraphs, headings,
+lists, tables, blockquotes, emphasis, links, images --- is preserved.
 
-## The Blitz rendering model (the riskiest piece --- build this first)
+### Pipeline
 
-Blitz is **in-process** and **not** a separate widget. It parses HTML into a
-`HtmlDocument`, resolves style/layout, and paints via `anyrender` into a Vello
-scene; we render that scene into a wgpu texture we allocate from eframe's wgpu
-device, and feed the texture to egui as an `Image`.
+1. **Parse.** `mail-parser` gives us the message's `text/html` part (or
+   `text/plain` if no HTML alternative exists) plus a list of MIME parts
+   keyed by `Content-ID` for `cid:` resolution.
+2. **HTML to Block-IR.** `mail/html.rs` parses the HTML with `html5ever` and
+   walks the DOM into a Block-IR:
 
-- **Construction:**
-  `HtmlDocument::from_html(&html, DocumentConfig {   net_provider: Some(Arc::new(MailNetProvider { ... })),   style_threading: StyleThreading::Sequential, ..Default::default() })`.
-  Sequential style threading is required if multiple documents may resolve
-  concurrently from different threads --- relevant once we render preview
-  snippets in the list pane.
-- **Render path:** each frame the body pane is visible, set the document's
-  viewport to the body-pane rect's size, call `doc.resolve()`, paint via
-  `blitz-paint` into a `VelloScene`, render the scene into a wgpu texture we own
-  (`anyrender_vello_hybrid` sharing eframe's `wgpu::Device`/`Queue`), and feed
-  the texture to egui as an `Image` placed at the body-pane rect.
-- **Scrolling:** reader sub-mode (`l`/`Enter` to enter, `Esc` to exit)
-  translates `j`/`k` into viewport scroll-offset deltas; we re-resolve/re-paint.
-  No `evaluate_script`, no focus juggling, no separate focusable widget exists.
-- **Composition:** egui owns the framebuffer end-to-end; Blitz output is just
-  another textured rect inside it. The body-pane rect is whatever egui says it
-  is each frame --- no `set_bounds` chasing.
+   ```rust
+   pub enum Block {
+       Paragraph(Vec<Inline>),
+       Heading { level: u8, text: Vec<Inline> },
+       List { ordered: bool, items: Vec<Vec<Block>> },
+       Quote(Vec<Block>),
+       Table { rows: Vec<Vec<Vec<Inline>>> },
+       Pre(String),
+       HRule,
+       Image { cid: Option<String>, src: Option<String>, alt: String },
+   }
+   pub enum Inline {
+       Text { content: String, style: Style },    // bold/italic/underline/code
+       Link { href: String, runs: Vec<Inline> },
+       LineBreak,
+   }
+   ```
 
-### Image gating
+   Unknown / unsupported tags collapse to their children. Scripts, styles,
+   metadata, hidden tracking blocks are dropped.
 
-Implement `blitz_traits::net::NetProvider`. Its single `fetch` method receives
-every sub-resource request with a `url::Url`:
+3. **Layout.** `ui/reader.rs` walks Block-IR for the current pane width and
+   emits ratatui `Line`s + a **link table** (`Vec<(LinkId, Rect, String)>` ---
+   id, on-screen rect, href) + a list of **image draws** (`Vec<(Rect,
+   ImageRef)>`). The walker handles wrapping, list indentation, table column
+   sizing (truncate-with-ellipsis on overflow), and quote-prefix gutters
+   (`> `).
+4. **Render.** ratatui draws the cells; then for each pending image draw,
+   ratatui-image renders the inline image via the detected protocol into
+   the image's rect. Stateful image protocols (kitty/iTerm) preserve their
+   placement across scroll redraws.
+5. **Interact.** Link picker: keypress `f` overlays each link's id (e.g. `12`)
+   as a tiny inverse-video tag; typed digits select. `<Enter>` on a selected
+   link opens it via `[reader].browser` (a `<leader>` for `mailto:` links
+   that calls the compose flow with To: pre-filled --- TBD). `:open` writes
+   the message's HTML to a temp file (with `cid:` references rewritten to
+   point at extracted parts), spawns the browser command on a worker
+   thread, doesn't wait.
 
-- `cid:foo@bar` → look up the MIME part by `Content-ID` on the
-  currently-rendering message, return bytes via `handler.bytes(url, ...)`.
-- `data:` → allow (or delegate to `blitz_net::Provider`'s `data:` path).
-- `http(s)://` → return an error unless the user has flipped "load images" for
-  this message. When they flip it, drop the document and re-resolve so the
-  blocked loads retry.
-- Anything else (`file:`, custom schemes) → deny.
+### Privacy stance
+
+- `cid:` → resolved against the message's MIME parts.
+- `data:` → decoded inline (small attachments only; oversized `data:` images
+  collapse to a placeholder).
+- `http(s)://` → never fetched. Always rendered as
+  `[remote image: <alt or url>]`.
+- `file:` / anything else → placeholder.
+
+The "load images" toggle from the GUI design is gone. If a user really wants
+the live remote content, they hit `:open` and view the message in their
+browser, which is honest about the privacy trade-off (their browser fetches
+it; the mail client never does).
+
+### Inline images
+
+`ratatui-image` does the heavy lifting:
+
+- At startup we construct a `Picker` that probes for protocol support
+  (kitty graphics, iTerm2, sixel, halfblocks). The `[images]` config overrides
+  the detected choice.
+- For each renderable image (cid- or data-resolved bytes), we decode with
+  `image`, hand it to `Picker` to produce a `StatefulProtocol`, and store it
+  alongside the Block::Image.
+- During render, ratatui-image's stateful widget paints the image into the
+  reader pane at the cell rect we hand it. Subsequent frames re-use the
+  same `StatefulProtocol` so kitty/iTerm don't redraw the image on every
+  scroll tick (their protocols are placement-aware).
 
 ## Compose → send
 
 Build the MIME with `mail-builder`, then pipe the raw message to `msmtp -t` over
 stdin (`-t` makes msmtp read recipients from the To/Cc/Bcc headers). On success,
 write a copy into the account's `Sent/cur` with the `S` flag so it appears in
-the index on next scan.
+the index on next scan. The compose UI itself shells out to `$EDITOR` (or
+`[compose].editor` in config) for the body --- consistent with how aerc /
+neomutt work and keeps us from re-implementing a text editor.
 
 ## Suggested build order
 
-1. **egui + Blitz compositing skeleton, in the real panel layout.** An eframe
-   app on the wgpu backend with the four-region panel structure already in
-   place: top account bar, left folder sidebar, message list above the reader in
-   the central panel. All four regions are stubbed with placeholder content, but
-   they are real `egui` panels so the body-pane rect is the actual reader
-   sub-region. Construct a `HtmlDocument` from a hard-coded HTML string, resolve
-   it against that rect, paint into a wgpu texture sharing eframe's
-   device/queue, and display the texture as an `egui::Image` filling the reader
-   region. Wire a stub `NetProvider` that blocks everything except a hard-coded
-   `cid:` mapping pointing at a bundled image. Implement panel-focus switching
-   (Tab between panels) and the reader sub-mode with `j`/`k` viewport scrolling
-   and `Esc` to exit. **This validates the single biggest unknown in the
-   project** --- no Blitz example currently does external-host compositing into
-   a host-owned wgpu texture, and getting the rect right under egui's panel
-   layout is part of that, so it is the part you actually have to figure out
-   before anything else is worth building.
-2. **Maildir scan → SQLite → threaded list.** Walk maildirs, parse headers with
-   `mail-parser`, upsert by msgid, render unified inbox + threads in the list
-   pane.
-3. **Real body rendering.** Feed parsed `text/html` (or `text/plain` fallback
-   wrapped in a minimal stylesheet) from the selected message into the Blitz
-   pipeline from step 1. Replace the stub `NetProvider` with the real one:
-   `cid:` resolver against the current message's MIME parts, per-message "load
-   images" toggle for `http(s)://`.
-4. **Flags.** Spec-correct maildir renames on read/flag/delete, mirrored into
+1. **ratatui scaffold in the four-pane layout.** Raw-mode setup,
+   alt-screen, terminal-restore on panic. Top bar / folder sidebar / list /
+   reader / cmdline regions all drawn with placeholder content. Modal
+   keymap stub (Normal + Reader; Command/Search/Insert come later). `Tab` /
+   `Shift-Tab` cycles pane focus; `l`/`Enter` enters reader sub-mode;
+   `j`/`k` scroll a static blob of cells in the reader; `:q` quits. **This
+   replaces the egui+Blitz step 1 from the GUI design** --- the load-bearing
+   render-into-host-owned-wgpu-texture risk is gone with the pivot, and
+   this step is mostly mechanical.
+2. **Maildir scan → SQLite → threaded list.** Walk maildirs, parse headers
+   with `mail-parser`, upsert by msgid, render unified inbox + threads in the
+   list pane.
+3. **HTML rendering.** `mail/html.rs` Block-IR walker, `ui/reader.rs` layout
+   into cells + link table, Vimium-style link picker, `:open` browser
+   fallback. `cid:` resolved against MIME parts; `data:` decoded inline; no
+   remote fetches.
+4. **Inline images.** Wire `ratatui-image` into the renderer for resolved
+   image bytes. Capability detection at startup; `[images].protocol`
+   override. Honor `max_height_cells`.
+5. **Flags.** Spec-correct maildir renames on read/flag/delete, mirrored into
    the index, with self-write debouncing on the watcher.
-5. **Compose path.** `mail-builder` → `msmtp -t`, plus the `Sent/cur` copy.
-6. **`notify`watcher.** Per-folder dirty marking + rescan, full rescan on
+6. **Compose path.** `mail-builder` → `msmtp -t`, plus the `Sent/cur` copy.
+   `$EDITOR` shell-out for the body.
+7. **`notify` watcher.** Per-folder dirty marking + rescan, full rescan on
    startup as backstop.
 
 ## Development environment
@@ -374,15 +442,14 @@ The repo is its own dev environment --- no host setup beyond a working
 `direnv` + `devenv` install. `direnv allow` once and you have the pinned
 Rust toolchain (stable, with `rust-analyzer`/`clippy`/`rustfmt`), the `mold`
 linker (via `languages.rust.mold.enable`), `bacon`, `go-task`, `mbsync`,
-`msmtp`, and `cargo-insta` on `$PATH`. The graphical runtime deps for
-eframe-wgpu and Blitz/Vello (Vulkan loader, libxkbcommon, Wayland/X11 libs,
-fontconfig, freetype) are wired into `LD_LIBRARY_PATH` automatically.
+`msmtp`, and `cargo-insta` on `$PATH`. With the pivot away from GPU
+rendering, the Vulkan / Wayland / X11 / fontconfig / freetype runtime libs
+and the pkg-config build deps from the GUI era have been dropped.
 
 ### Files
 
-- **`devenv.nix`** --- packages, Rust toolchain, system libs for
-  eframe/Blitz, git pre-commit hooks (clippy + rustfmt). Pinned via
-  `devenv.lock`.
+- **`devenv.nix`** --- packages, Rust toolchain, git pre-commit hooks
+  (clippy + rustfmt). Pinned via `devenv.lock`.
 - **`Taskfile.yml`** --- canonical command surface (see below).
 - **`dev/config.toml`** --- self-contained TOML pointing at the fixture
   maildir and the stub msmtp. Selected by `--config dev/config.toml`.
@@ -391,6 +458,8 @@ fontconfig, freetype) are wired into `LD_LIBRARY_PATH` automatically.
 - **`dev/msmtp-stub`** --- shell script that writes stdin to
   `/tmp/epost-sent/<timestamp>.eml` instead of actually sending. Wired up
   by `dev/config.toml`'s `[smtp].command`.
+- **`dev/fixtures/`** --- hand-crafted HTML and image fixtures for the
+  rendering tests in step 1 and onward.
 
 ### Tasks
 
@@ -404,7 +473,7 @@ fontconfig, freetype) are wired into `LD_LIBRARY_PATH` automatically.
 | `task check`                           | `cargo check --all-targets`.                                 |
 | `task test`                            | `cargo test`.                                                |
 | `task ci`                              | `fmt:check + lint + test` (what CI would run).               |
-| `task snap:review` / `task snap:accept`| `cargo insta` for Blitz golden snapshots.                    |
+| `task snap:review` / `task snap:accept`| `cargo insta` for renderer golden snapshots.                 |
 | `task sent:clear`                      | Wipe `/tmp/epost-sent/`.                                     |
 | `task index:reset`                     | Delete the sqlite cache to force a full rescan.              |
 | `task doctor`                          | Smoke-check the devshell and fixtures.                       |
@@ -420,18 +489,30 @@ were after a bacon-driven restart --- not v1.
 
 ### Dev-loop reality
 
-Pure Rust GUI dev has no live preview comparable to web dev. With `mold` +
-incremental compilation, small changes rebuild in ~3--10 s and bacon
-auto-restarts the window; you lose in-app state on every restart. Dioxus's
-`subsecond` hot-patching crate (keep the window across edits, swap function
-bodies in place) is an aspirational add-on once the skeleton is stable ---
-not blocking on it. **WASM is explicitly out**: it would remove our access
-to maildirs / `mbsync` / `msmtp` and would not actually make builds faster.
+TUI iteration is much faster than the GUI iteration the original design
+assumed. With `mold` + incremental compilation, small changes rebuild in
+~2-5 s; bacon restarts the binary into a fresh raw-mode session. There's no
+window state to lose. The snapshot-test harness (`cargo insta`) is the
+right tool for renderer regressions --- a golden cell buffer per HTML
+fixture lets us catch layout drift without needing a window open.
+
+## Terminal capability assumptions
+
+- **Cursor / styling:** SGR + 256-color / truecolor as detected by ratatui.
+- **Inline images:** kitty graphics protocol, iTerm2 inline images, sixel,
+  or halfblocks (256-color block characters) --- ratatui-image picks one
+  automatically; user can override or disable.
+- **Hyperlinks:** OSC 8 (`ESC ] 8 ; ; URL ESC \\`) emitted around link runs
+  in the reader. Terminals that don't support OSC 8 ignore it (no garbage
+  rendered); the Vimium-style picker works either way.
+- **Resize:** crossterm `Resize` events trigger a re-layout of the reader
+  cells and re-emission of inline image draws at the new geometry.
 
 ## Out of scope for v1 (do not build)
 
-IMAP, SMTP, OAuth, notmuch integration, multi-platform support
-(Linux/eframe-wgpu only; Blitz itself is portable but we don't promise anything
-beyond Linux), encryption/signing, address book. JavaScript execution is
-structurally out of scope --- Blitz has no JS engine and that is a property we
-depend on.
+IMAP, SMTP, OAuth, notmuch integration, GUI mode (we pivoted away from
+eframe/Blitz/wgpu and are not going back without a clear reason), encryption
+/ signing, address book. JavaScript execution is structurally out of scope
+--- no HTML engine in the dep tree can execute code. Text selection inside
+the reader (terminal selection still works through the user's terminal,
+mouse-driven; we don't intercept).

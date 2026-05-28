@@ -42,26 +42,6 @@
     # cranelift.enable = true;  # debug-only, currently nightly; revisit after baseline
   };
 
-  # System libraries needed at runtime by eframe (wgpu backend) and Blitz
-  # (Vello/wgpu). Cargo does not link these statically; LD_LIBRARY_PATH lets
-  # the binary find them inside the devshell.
-  env.LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (
-    with pkgs;
-    [
-      libxkbcommon
-      vulkan-loader
-      libGL
-      wayland
-      xorg.libX11
-      xorg.libXcursor
-      xorg.libXi
-      xorg.libXrandr
-      xorg.libxcb
-      fontconfig
-      freetype
-    ]
-  );
-
   git-hooks.hooks = {
     clippy = {
       enable = true;
