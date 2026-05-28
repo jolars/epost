@@ -1,0 +1,79 @@
+---
+source: src/mail/html.rs
+expression: blocks
+---
+- Heading:
+    level: 1
+    text:
+      - Text:
+          content: "Inline image via cid:"
+          style:
+            bold: false
+            italic: false
+            underline: false
+            code: false
+- Paragraph:
+    - Text:
+        content: "The logo below is referenced via a "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: "cid:"
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " URI and resolved against the message's MIME parts. Step 3 renders it as a text placeholder; step 4 paints it via the terminal's image protocol."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Image:
+    cid: logo@epost
+    src: ~
+    alt: epost logo
+- Paragraph:
+    - Text:
+        content: The picker (
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: f
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: ") should also find this "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Link:
+        href: "https://example.invalid/spec"
+        runs:
+          - Text:
+              content: spec link
+              style:
+                bold: false
+                italic: false
+                underline: false
+                code: false
+    - Text:
+        content: "."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false

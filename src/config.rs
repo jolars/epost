@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub reader: Reader,
     #[serde(default)]
+    pub images: Images,
+    #[serde(default)]
     pub accounts: HashMap<String, Account>,
     #[serde(default)]
     pub keys: HashMap<String, HashMap<String, String>>,
@@ -68,23 +70,65 @@ pub struct Sync {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reader {
-    #[serde(default = "default_view")]
-    pub default_view: String,
     #[serde(default)]
-    pub load_images: bool,
+    pub prefer: ReaderPrefer,
+    #[serde(default = "default_browser")]
+    pub browser: Vec<String>,
 }
 
 impl Default for Reader {
     fn default() -> Self {
         Self {
-            default_view: default_view(),
-            load_images: false,
+            prefer: ReaderPrefer::default(),
+            browser: default_browser(),
         }
     }
 }
 
-fn default_view() -> String {
-    "html".to_string()
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReaderPrefer {
+    #[default]
+    Html,
+    Plain,
+}
+
+fn default_browser() -> Vec<String> {
+    vec!["xdg-open".to_string()]
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Images {
+    #[serde(default)]
+    pub protocol: ImagesProtocol,
+    #[serde(default = "default_max_height_cells")]
+    pub max_height_cells: u16,
+}
+
+impl Default for Images {
+    fn default() -> Self {
+        Self {
+            protocol: ImagesProtocol::default(),
+            max_height_cells: default_max_height_cells(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImagesProtocol {
+    #[default]
+    Auto,
+    Kitty,
+    Iterm,
+    Sixel,
+    Halfblocks,
+    Off,
+}
+
+fn default_max_height_cells() -> u16 {
+    24
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +157,12 @@ pub fn default_path() -> PathBuf {
     directories::ProjectDirs::from("", "", "epost")
         .map(|d| d.config_dir().join("config.toml"))
         .unwrap_or_else(|| PathBuf::from("config.toml"))
+}
+
+pub fn default_cache_path() -> PathBuf {
+    directories::ProjectDirs::from("", "", "epost")
+        .map(|d| d.cache_dir().join("index.sqlite"))
+        .unwrap_or_else(|| PathBuf::from("index.sqlite"))
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {
@@ -176,5 +226,66 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("mystery"));
+    }
+
+    #[test]
+    fn parses_reader_prefer_and_browser() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [reader]
+            prefer = "plain"
+            browser = ["firefox", "--new-tab"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reader.prefer, ReaderPrefer::Plain);
+        assert_eq!(cfg.reader.browser, vec!["firefox", "--new-tab"]);
+    }
+
+    #[test]
+    fn reader_defaults_to_html_and_xdg_open() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.reader.prefer, ReaderPrefer::Html);
+        assert_eq!(cfg.reader.browser, vec!["xdg-open".to_string()]);
+    }
+
+    #[test]
+    fn parses_images_section() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [images]
+            protocol = "kitty"
+            max_height_cells = 12
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.images.protocol, ImagesProtocol::Kitty);
+        assert_eq!(cfg.images.max_height_cells, 12);
+    }
+
+    #[test]
+    fn unknown_key_in_reader_fails() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [reader]
+            prefer = "html"
+            default_view = "html"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("default_view"));
+    }
+
+    #[test]
+    fn unknown_key_in_images_fails() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [images]
+            protocol = "auto"
+            bogus = true
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"));
     }
 }

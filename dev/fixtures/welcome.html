@@ -1,58 +1,51 @@
 <!doctype html>
 <html>
   <head>
-    <style>
-      body {
-        font: 14px/1.5 -apple-system, "Segoe UI", sans-serif;
-        margin: 16px;
-        color: #222;
-        background: #fff;
-      }
-      h1 {
-        font-size: 22px;
-        margin: 0 0 12px;
-      }
-      .frame {
-        border: 1px solid #ddd;
-        padding: 12px;
-        border-radius: 6px;
-      }
-      .logo {
-        display: block;
-        width: 64px;
-        height: 64px;
-        margin: 8px 0 12px;
-      }
-      code {
-        background: #f3f3f3;
-        padding: 1px 4px;
-        border-radius: 3px;
-        font-family: ui-monospace, monospace;
-      }
-      p {
-        margin: 0 0 10px;
-      }
-    </style>
+    <title>epost — fixture welcome</title>
   </head>
   <body>
     <h1>epost</h1>
-    <div class="frame">
-      <p>If you can read this in the reader pane, Blitz + eframe compositing is working.</p>
-      <img class="logo" src="cid:logo@epost" alt="epost logo">
-      <p>This is fixture HTML; remote images and scripts are blocked by the <code>NetProvider</code>.</p>
-      <p>Use <code>Tab</code> / <code>Shift-Tab</code> to cycle panel focus. Press <code>l</code> or <code>Enter</code> while the reader is focused to enter reader mode; then <code>j</code> / <code>k</code> scroll the body and <code>Esc</code> returns to normal mode.</p>
-      <p>Filler follows so that the rendered body is taller than the reader viewport and scrolling is visible:</p>
-      <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus lacinia odio vitae vestibulum vestibulum. Cras venenatis euismod malesuada.</p>
-      <p>Nulla facilisi. Etiam ultricies, lorem id vehicula posuere, tortor nisi cursus elit, in malesuada turpis lectus a magna. Phasellus consequat.</p>
-      <p>Sed cursus, nibh in vulputate dapibus, sapien lectus tincidunt sapien, nec dignissim odio nibh sed magna. Donec eu pretium velit.</p>
-      <p>Aliquam erat volutpat. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Praesent at justo.</p>
-      <p>Curabitur a libero quis lectus suscipit ullamcorper. Quisque a sapien at velit luctus tincidunt. Donec id velit ut nibh sodales fringilla.</p>
-      <p>Mauris in ipsum eu nibh hendrerit dignissim. Etiam vitae ipsum vitae enim mattis tincidunt. Nullam vitae lectus a velit feugiat aliquam.</p>
-      <p>Integer in nibh nec libero pharetra tristique. Sed venenatis lectus nec ligula tincidunt, at lacinia magna sodales. Etiam vehicula sapien.</p>
-      <p>Ut quis dolor non ipsum tincidunt vulputate. Praesent porttitor sapien at lacus tincidunt, in vehicula nibh varius. Donec at orci leo.</p>
-      <p>Vestibulum ante ipsum primis in faucibus orci luctus et ultrices posuere cubilia curae; Aenean sit amet velit a magna feugiat porta.</p>
-      <p>Suspendisse potenti. Praesent eu velit vitae tortor luctus venenatis. Cras sit amet ipsum non lacus posuere fringilla in sed sapien.</p>
-      <p>End of fixture.</p>
-    </div>
+    <p>If you can read this in the reader pane, the Block-IR walker is
+    rendering into ratatui cells correctly.</p>
+    <p><img src="cid:logo@epost" alt="epost logo"></p>
+    <p>This is fixture HTML; remote images render as
+    <code>[remote image: alt]</code> placeholders and the parser never
+    fetches any external resource.</p>
+    <p>Use <code>Tab</code> / <code>Shift-Tab</code> to cycle pane focus.
+    Press <code>l</code> or <code>Enter</code> while the reader has focus
+    to enter reader mode; then <code>j</code> / <code>k</code> scroll the
+    body and <code>Esc</code> returns to normal mode. <code>f</code>
+    enters the link picker.</p>
+    <p>Filler follows so that the rendered body is taller than the
+    reader viewport and scrolling is visible:</p>
+    <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus
+    lacinia odio vitae vestibulum vestibulum. Cras venenatis euismod
+    malesuada.</p>
+    <p>Nulla facilisi. Etiam ultricies, lorem id vehicula posuere, tortor
+    nisi cursus elit, in malesuada turpis lectus a magna. Phasellus
+    consequat.</p>
+    <p>Sed cursus, nibh in vulputate dapibus, sapien lectus tincidunt
+    sapien, nec dignissim odio nibh sed magna. Donec eu pretium velit.</p>
+    <p>Aliquam erat volutpat. Pellentesque habitant morbi tristique
+    senectus et netus et malesuada fames ac turpis egestas. Praesent at
+    justo.</p>
+    <p>Curabitur a libero quis lectus suscipit ullamcorper. Quisque a
+    sapien at velit luctus tincidunt. Donec id velit ut nibh sodales
+    fringilla.</p>
+    <p>Mauris in ipsum eu nibh hendrerit dignissim. Etiam vitae ipsum
+    vitae enim mattis tincidunt. Nullam vitae lectus a velit feugiat
+    aliquam.</p>
+    <p>Integer in nibh nec libero pharetra tristique. Sed venenatis
+    lectus nec ligula tincidunt, at lacinia magna sodales. Etiam vehicula
+    sapien.</p>
+    <p>Ut quis dolor non ipsum tincidunt vulputate. Praesent porttitor
+    sapien at lacus tincidunt, in vehicula nibh varius. Donec at orci
+    leo.</p>
+    <p>Vestibulum ante ipsum primis in faucibus orci luctus et ultrices
+    posuere cubilia curae; Aenean sit amet velit a magna feugiat porta.</p>
+    <p>Suspendisse potenti. Praesent eu velit vitae tortor luctus
+    venenatis. Cras sit amet ipsum non lacus posuere fringilla in sed
+    sapien.</p>
+    <p>End of fixture.</p>
   </body>
 </html>

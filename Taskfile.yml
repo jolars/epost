@@ -2,6 +2,7 @@ version: '3'
 
 vars:
   DEV_CONFIG: '{{.ROOT_DIR}}/dev/config.toml'
+  DEV_CACHE:  '{{.ROOT_DIR}}/dev/cache/index.sqlite'
   SENT_STUB_DIR: '/tmp/epost-sent'
 
 env:
@@ -18,17 +19,17 @@ tasks:
   dev:
     desc: Auto-rebuild + restart on file change (main loop)
     cmds:
-      - bacon run -- -- --config {{.DEV_CONFIG}}
+      - bacon run -- -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
   run:
     desc: One-shot debug run against dev/config.toml
     cmds:
-      - cargo run -- --config {{.DEV_CONFIG}}
+      - cargo run -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
   run:release:
     desc: One-shot release run
     cmds:
-      - cargo run --release -- --config {{.DEV_CONFIG}}
+      - cargo run --release -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
   build:
     desc: cargo build
@@ -86,9 +87,9 @@ tasks:
       - mkdir -p {{.SENT_STUB_DIR}}
 
   index:reset:
-    desc: Delete the sqlite index cache (forces full rescan on next run)
+    desc: Delete the dev sqlite index cache (forces full rescan on next run)
     cmds:
-      - rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/epost/index.sqlite"
+      - rm -f {{.DEV_CACHE}}
 
   doctor:
     desc: Smoke-check the devshell and fixtures

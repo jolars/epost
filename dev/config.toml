@@ -14,8 +14,19 @@ reader = true
 command = ["./dev/msmtp-stub"]
 
 [reader]
-default_view = "html"
-load_images = false
+prefer = "html"
+# `:open` (and the `f` link picker) shells out to this command, appending
+# the target path/URL as the final argument. Pointed at the in-repo stub
+# so dev runs and tests don't fire a real browser.
+browser = ["./dev/browser-stub"]
+
+[images]
+# `auto` probes the terminal for kitty / iTerm2 / sixel; if the probe
+# fails or `[images].protocol = "off"`, every inline image renders as
+# the `[image: alt]` placeholder. Override to pin a specific protocol on
+# terminals where auto-detection misfires.
+protocol = "auto"
+max_height_cells = 24
 
 # Single dev account pointing at the in-tree maildir.
 [accounts.dev]

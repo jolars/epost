@@ -1,0 +1,264 @@
+---
+source: src/mail/html.rs
+expression: blocks
+---
+- Heading:
+    level: 1
+    text:
+      - Text:
+          content: epost
+          style:
+            bold: false
+            italic: false
+            underline: false
+            code: false
+- Paragraph:
+    - Text:
+        content: "If you can read this in the reader pane, the Block-IR walker is rendering into ratatui cells correctly."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Image:
+    cid: logo@epost
+    src: ~
+    alt: epost logo
+- Paragraph:
+    - Text:
+        content: "This is fixture HTML; remote images render as "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: "[remote image: alt]"
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " placeholders and the parser never fetches any external resource."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: "Use "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: Tab
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " / "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: Shift-Tab
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " to cycle pane focus. Press "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: l
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " or "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: Enter
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " while the reader has focus to enter reader mode; then "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: j
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " / "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: k
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " scroll the body and "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: Esc
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " returns to normal mode. "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: f
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " enters the link picker."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: "Filler follows so that the rendered body is taller than the reader viewport and scrolling is visible:"
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus lacinia odio vitae vestibulum vestibulum. Cras venenatis euismod malesuada."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: "Nulla facilisi. Etiam ultricies, lorem id vehicula posuere, tortor nisi cursus elit, in malesuada turpis lectus a magna. Phasellus consequat."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: "Sed cursus, nibh in vulputate dapibus, sapien lectus tincidunt sapien, nec dignissim odio nibh sed magna. Donec eu pretium velit."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: Aliquam erat volutpat. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Praesent at justo.
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: Curabitur a libero quis lectus suscipit ullamcorper. Quisque a sapien at velit luctus tincidunt. Donec id velit ut nibh sodales fringilla.
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: Mauris in ipsum eu nibh hendrerit dignissim. Etiam vitae ipsum vitae enim mattis tincidunt. Nullam vitae lectus a velit feugiat aliquam.
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: "Integer in nibh nec libero pharetra tristique. Sed venenatis lectus nec ligula tincidunt, at lacinia magna sodales. Etiam vehicula sapien."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: "Ut quis dolor non ipsum tincidunt vulputate. Praesent porttitor sapien at lacus tincidunt, in vehicula nibh varius. Donec at orci leo."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: Vestibulum ante ipsum primis in faucibus orci luctus et ultrices posuere cubilia curae; Aenean sit amet velit a magna feugiat porta.
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: Suspendisse potenti. Praesent eu velit vitae tortor luctus venenatis. Cras sit amet ipsum non lacus posuere fringilla in sed sapien.
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Paragraph:
+    - Text:
+        content: End of fixture.
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false

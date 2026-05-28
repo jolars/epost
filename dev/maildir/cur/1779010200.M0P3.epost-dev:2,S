@@ -1,0 +1,13 @@
+Return-Path: <bob@example.net>
+Delivered-To: dev@example.invalid
+Message-ID: <thread-root-003@example.net>
+From: Bob <bob@example.net>
+To: Dev <dev@example.invalid>
+Subject: lunch?
+Date: Sun, 24 May 2026 10:30:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hey, are you around for lunch Tuesday?
+
+— Bob

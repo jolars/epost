@@ -1,0 +1,18 @@
+Return-Path: <jane@example.com>
+Delivered-To: dev@example.invalid
+Message-ID: <welcome-001@example.com>
+From: Jane Doe <jane@example.com>
+To: Dev <dev@example.invalid>
+Subject: Welcome to epost
+Date: Tue, 26 May 2026 09:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hello, and welcome to epost.
+
+This is a plain-text message — no HTML alternative. The reader pane
+should fall back to displaying this body verbatim once HTML rendering
+lands in step 3. For now it's just a header preview in the list.
+
+Cheers,
+Jane

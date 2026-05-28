@@ -6,11 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `DESIGN.md` is the authoritative architecture document. **Read it before proposing or making non-trivial changes.** It pins the rendering model (TUI via `ratatui` + `crossterm`, with HTML walked through `html5ever` into a Block-IR and drawn as cells; inline images via `ratatui-image`'s kitty/iTerm/sixel/halfblock detection), the storage model (maildir is truth; sqlite is a disposable cache; everything keys on `Message-ID`, never on path), the configuration model (declarative read-only TOML), the concurrency model (`std::thread` + `mpsc` channels, **not** `async`/`await`), and the deployment target (NixOS / Home Manager, fully config-driven). The numbered *Hard requirements / invariants* are real constraints; do not silently relax them. *Suggested build order* is the v1 roadmap.
 
-**Note on history:** this project pivoted from a GUI (eframe + Blitz + wgpu) to a TUI design after step 1 of the GUI plan was finished. The GUI code (eframe `App`, Blitz/Vello compositing in `ui/body.rs`, `mail/net.rs` `NetProvider` stub, `wgpu` / `eframe` / `blitz-*` / `vello` / `anyrender_*` deps) is on its way out; don't extend it. If you see lingering references to wgpu textures, `NetProvider`, Blitz, or a "four-panel egui layout," those are residue from the pre-pivot design and should be ripped out, not built on.
+**Note on history:** this project briefly started as a GUI (eframe + Blitz + wgpu) before pivoting to the TUI design in `DESIGN.md`. The pivot cleanup is done — no GUI code remains. If you see lingering references to wgpu, `NetProvider`, Blitz, eframe, or a "four-panel egui layout" anywhere, that's stale documentation: rip it out, don't build on it.
 
 ## Project state
 
-Mid-pivot. The repo contains a working GUI step-1 (eframe + Blitz compositing skeleton) that's being torn down in favour of a TUI redesign. `DESIGN.md` describes the new target. The new build-order step 1 (ratatui scaffold in the four-pane layout) is the next thing to land; expect to delete `src/ui/body.rs`, `src/mail/net.rs`, and the GUI deps in `Cargo.toml` as part of it.
+TUI build in progress against `DESIGN.md`'s *Suggested build order*.
+
+- **Step 1 (ratatui four-pane scaffold)** — done. Raw-mode setup with panic-safe terminal restore, four-pane layout with focus borders, Normal/Reader modal keymap (`q` / `Tab` / `BackTab` / `l` / `Enter` / `j` / `k` / `Esc` / `Ctrl-C`), placeholder content in every pane.
+- **Step 2 (maildir scan → SQLite → threaded list)** — done. Scan worker runs on `std::thread` and reports via `mpsc`; UI polls each tick. Maildir++ walk (root `cur`+`new` for INBOX, `.Subfolder/{cur,new}` for the rest), header parse via `mail-parser` (RFC 2047 decoded), upsert into bundled SQLite keyed on `Message-ID`, JWZ-style threading, list pane shows the unified INBOX with `j`/`k` selection. Selected message's headers preview in the reader; full HTML body rendering is step 3. CLI: `--cache <path>` overrides `$XDG_CACHE_HOME/epost/index.sqlite`; `task dev`/`task run` point at `dev/cache/index.sqlite` (gitignored).
+- **Step 3 (HTML rendering)** — next. Block-IR walker, link picker, `:open` browser fallback; will also realign `[reader]` config keys to the spec (`prefer` / `browser` / `[images]`) since they become load-bearing here.
+- Steps 4–7 — inline images, maildir flags, compose, notify watcher. See `DESIGN.md` for details.
+
+**Deferred carry-overs.** `src/config.rs` and `dev/config.toml` still use GUI-era reader keys (`default_view`, `load_images`) instead of the spec's `prefer` / `browser` / `[images]`. Realign in step 3, when those keys become load-bearing for the HTML reader.
 
 ## Commands
 
@@ -37,7 +44,7 @@ These are easy to flagrantly violate. The full set lives in `DESIGN.md`; this is
 
 ## Dev environment / fixtures
 
-`devenv.nix` provides the devshell (Rust toolchain, `mold` linker, `bacon`, `mbsync`, `msmtp`, `cargo-insta`). `direnv allow` activates it. With the GUI pivot the Vulkan / Wayland / X11 / fontconfig / freetype runtime libs and pkg-config build deps are no longer needed and should be trimmed when the GUI code is removed.
+`devenv.nix` provides the devshell (Rust toolchain, `mold` linker, `bacon`, `mbsync`, `msmtp`, `cargo-insta`). `direnv allow` activates it.
 
 `dev/` is the in-repo dev harness:
 

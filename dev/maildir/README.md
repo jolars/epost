@@ -24,12 +24,15 @@ per the maildir spec. Flags we care about: `S` (seen), `R` (replied),
 Filled in as the corresponding code lands. Each case is one or more `.eml`
 files placed under `cur/` or `.Sent/cur/`.
 
-- [ ] Plain text only
-- [ ] Plain + HTML multipart alternative
-- [ ] HTML with `cid:` inline image (must resolve via `NetProvider`)
-- [ ] HTML with `http(s)://` tracking pixel (must be blocked by default)
-- [ ] Threaded reply chain, 3--4 messages, real `In-Reply-To` / `References`
-- [ ] Broken / malformed HTML
-- [ ] Outlook-style table layout (Blitz stress case)
+- [x] Plain text only — `cur/1779181200…welcome…`
+- [x] Plain + HTML multipart alternative — `cur/1779105600…multipart…`
+- [x] HTML with `cid:` inline image (resolved against the message's MIME parts)
+      — `cur/1779192000…cid-image…`
+- [x] HTML with `http(s)://` tracking pixel (must render as a placeholder)
+      — `cur/1779195600…remote-image…`
+- [x] Threaded reply chain, 3 messages, real `In-Reply-To` / `References` —
+      `cur/177901020*…thread-root…` + `…thread-reply1…` + `…thread-reply2…`
+- [x] Broken / malformed HTML — `cur/1779199200…broken…`
+- [ ] Outlook-style table layout
 - [ ] Long subject + long sender name (list-pane truncation)
-- [ ] Non-ASCII subject + body (UTF-8 round-trip)
+- [x] Non-ASCII subject + body (UTF-8 round-trip) — `new/1778850000…utf8…`

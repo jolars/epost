@@ -1,1 +1,203 @@
-// placeholder for build step 2 (message list pane)
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{List, ListItem, ListState};
+
+use crate::store::index::MessageRow;
+use crate::store::thread::ThreadedRow;
+use crate::ui::app::{App, Pane, ScanState};
+use crate::ui::style::pane_block;
+
+pub fn draw(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Pane::List;
+    let block = pane_block("Messages", focused);
+
+    match &app.scan {
+        ScanState::Scanning => {
+            let widget = List::new(vec![ListItem::new(Line::from(Span::styled(
+                "Scanning maildir…",
+                Style::default().fg(Color::DarkGray),
+            )))])
+            .block(block);
+            f.render_widget(widget, area);
+        }
+        ScanState::Failed(err) => {
+            let widget = List::new(vec![ListItem::new(Line::from(Span::styled(
+                format!("scan failed: {err}"),
+                Style::default().fg(Color::Red),
+            )))])
+            .block(block);
+            f.render_widget(widget, area);
+        }
+        ScanState::Ready(rows) if rows.is_empty() => {
+            let widget = List::new(vec![ListItem::new(Line::from(Span::styled(
+                "INBOX is empty.",
+                Style::default().fg(Color::DarkGray),
+            )))])
+            .block(block);
+            f.render_widget(widget, area);
+        }
+        ScanState::Ready(rows) => {
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let items: Vec<ListItem> = rows
+                .iter()
+                .map(|t| ListItem::new(render_row(t, inner_width)))
+                .collect();
+            // Both fg and bg are set so the highlight uniformly overrides the
+            // per-Span colors used in `render_row` (date=DarkGray, from=Cyan,
+            // bold-unread); otherwise those bleed through and the selected
+            // row reads as a multicolor stripe rather than a single block.
+            let highlight = if focused {
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(Color::DarkGray).fg(Color::Gray)
+            };
+            let widget = List::new(items)
+                .block(block)
+                .highlight_style(highlight)
+                .highlight_symbol("▌ ");
+            let mut state = ListState::default();
+            state.select(Some(app.selected.min(rows.len().saturating_sub(1))));
+            f.render_stateful_widget(widget, area, &mut state);
+        }
+    }
+}
+
+fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {
+    let MessageRow {
+        date,
+        from_addr,
+        subject,
+        flags,
+        ..
+    } = &t.row;
+
+    let date_label = format_date(*date);
+    let indent = "  ".repeat(t.depth as usize);
+    let arrow = if t.depth > 0 { "↳ " } else { "" };
+    let from = from_addr.as_deref().unwrap_or("(unknown)");
+    let subject_text = subject.as_deref().unwrap_or("(no subject)");
+    let unread = !flags.contains('S');
+
+    let subj_style = if unread {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let head = format!("{date_label}  ");
+    let from_col_width: usize = 16;
+    let from_truncated = truncate_pad(from, from_col_width);
+    let from_span = format!("{from_truncated}  ");
+
+    let remaining = width
+        .saturating_sub(head.len())
+        .saturating_sub(from_span.len())
+        .saturating_sub(indent.len())
+        .saturating_sub(arrow.len());
+    let subject_truncated = truncate_to(subject_text, remaining);
+
+    Line::from(vec![
+        Span::styled(head, Style::default().fg(Color::DarkGray)),
+        Span::styled(from_span, Style::default().fg(Color::Cyan)),
+        Span::raw(indent),
+        Span::styled(arrow.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(subject_truncated, subj_style),
+    ])
+}
+
+fn format_date(unix: i64) -> String {
+    // Lightweight date label — full chrono dep is overkill for a yyyy-mm-dd
+    // header that the user reads at a glance. Sequencing matters more than
+    // wall-clock formatting; if `date == 0`, show a placeholder.
+    if unix <= 0 {
+        return "----------".to_string();
+    }
+    let days = unix / 86_400;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+// Hinnant's date algorithm (proleptic Gregorian, days from 1970-01-01).
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i32 + (era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp.wrapping_sub(9) };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn truncate_to(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in s.chars().enumerate() {
+        if count + 1 > max_chars {
+            if max_chars >= 1 {
+                out.pop();
+                out.push('…');
+            }
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn truncate_pad(s: &str, width: usize) -> String {
+    let mut out: String = s.chars().take(width).collect();
+    let len = out.chars().count();
+    if len < width {
+        out.push_str(&" ".repeat(width - len));
+    } else if s.chars().count() > width && width >= 1 {
+        out.pop();
+        out.push('…');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_label_formats_known_unix() {
+        assert_eq!(format_date(0), "----------");
+        // 1970-01-01
+        assert_eq!(format_date(1), "1970-01-01");
+        // 2026-01-01 00:00 UTC = 1767225600
+        assert_eq!(format_date(1_767_225_600), "2026-01-01");
+        // 2026-05-26 00:00 UTC = 2026-01-01 + 145 days = 1779753600
+        assert_eq!(format_date(1_779_753_600), "2026-05-26");
+        // 2024-02-29 (leap-day) 00:00 UTC = 1709164800
+        assert_eq!(format_date(1_709_164_800), "2024-02-29");
+    }
+
+    #[test]
+    fn truncate_to_short_unchanged() {
+        assert_eq!(truncate_to("hello", 10), "hello");
+        assert_eq!(truncate_to("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_long_gets_ellipsis() {
+        assert_eq!(truncate_to("hello world", 7), "hello …");
+    }
+
+    #[test]
+    fn truncate_pad_short_padded() {
+        assert_eq!(truncate_pad("bob", 6), "bob   ");
+    }
+}

@@ -1,0 +1,15 @@
+Return-Path: <dev@example.invalid>
+Delivered-To: alice@example.org
+Message-ID: <sent-007@example.invalid>
+From: Dev <dev@example.invalid>
+To: Alice Liu <alice@example.org>
+Subject: design doc — first cut
+Date: Sun, 24 May 2026 15:30:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hi Alice,
+
+Pushed the first cut of the design doc. Let me know what stands out.
+
+— Dev

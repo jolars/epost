@@ -1,0 +1,82 @@
+---
+source: src/mail/html.rs
+expression: blocks
+---
+- Heading:
+    level: 1
+    text:
+      - Text:
+          content: Remote tracking pixel — never fetched
+          style:
+            bold: false
+            italic: false
+            underline: false
+            code: false
+- Paragraph:
+    - Text:
+        content: "The image below is a remote URL. The renderer must show it as a "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Text:
+        content: "[remote image: ...]"
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: true
+    - Text:
+        content: " placeholder and never issue an HTTP request."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+- Image:
+    cid: ~
+    src: "https://tracker.example.invalid/p.gif?u=42"
+    alt: tracking pixel
+- Paragraph:
+    - Text:
+        content: "Real link for the picker: "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Link:
+        href: "https://example.invalid/news"
+        runs:
+          - Text:
+              content: news
+              style:
+                bold: false
+                italic: false
+                underline: false
+                code: false
+    - Text:
+        content: ", "
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false
+    - Link:
+        href: "mailto:dev@example.invalid"
+        runs:
+          - Text:
+              content: mailto
+              style:
+                bold: false
+                italic: false
+                underline: false
+                code: false
+    - Text:
+        content: "."
+        style:
+          bold: false
+          italic: false
+          underline: false
+          code: false

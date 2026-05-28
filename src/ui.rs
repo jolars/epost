@@ -7,3 +7,4 @@ pub mod images;
 pub mod keys;
 pub mod list;
 pub mod reader;
+pub mod style;

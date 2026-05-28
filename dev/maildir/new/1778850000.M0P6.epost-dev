@@ -1,0 +1,16 @@
+Return-Path: <yuki@example.jp>
+Delivered-To: dev@example.invalid
+Message-ID: <utf8-006@example.jp>
+From: =?UTF-8?B?44Om44Kt?= <yuki@example.jp>
+To: Dev <dev@example.invalid>
+Subject: =?UTF-8?B?5pel5pys6Kqe44Gu5Lu25ZCN44OG44K544OI?=
+Date: Fri, 22 May 2026 11:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+こんにちは。
+
+これは UTF-8 のテストメッセージです。件名と本文に日本語が含まれています。
+
+— ユキ

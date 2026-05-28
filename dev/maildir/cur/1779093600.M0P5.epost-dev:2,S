@@ -1,0 +1,15 @@
+Return-Path: <bob@example.net>
+Delivered-To: dev@example.invalid
+Message-ID: <thread-reply2-005@example.net>
+From: Bob <bob@example.net>
+To: Dev <dev@example.invalid>
+Subject: Re: lunch?
+Date: Mon, 25 May 2026 08:40:00 +0000
+In-Reply-To: <thread-reply1-004@example.invalid>
+References: <thread-root-003@example.net> <thread-reply1-004@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+12:30 it is. See you there.
+
+— Bob

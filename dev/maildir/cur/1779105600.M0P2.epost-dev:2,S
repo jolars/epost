@@ -1,0 +1,40 @@
+Return-Path: <alice@example.org>
+Delivered-To: dev@example.invalid
+Message-ID: <multipart-002@example.org>
+From: Alice Liu <alice@example.org>
+To: Dev <dev@example.invalid>
+Subject: Re: design doc — comments inline
+Date: Mon, 25 May 2026 14:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="bnd-002"
+
+--bnd-002
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Hi Dev,
+
+Some notes on the design doc:
+
+  * The pivot to TUI looks right.
+  * I'd lean harder on snapshot tests for the renderer.
+  * cid: resolution wants a doc test.
+
+— Alice
+
+--bnd-002
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p>Hi Dev,</p>
+<p>Some notes on the design doc:</p>
+<ul>
+  <li>The pivot to TUI looks right.</li>
+  <li>I'd lean harder on snapshot tests for the renderer.</li>
+  <li><code>cid:</code> resolution wants a doc test.</li>
+</ul>
+<p>— Alice</p>
+</body></html>
+
+--bnd-002--

@@ -1,0 +1,24 @@
+Return-Path: <newsletter@example.org>
+Delivered-To: dev@example.invalid
+Message-ID: <remote-image-009@example.org>
+From: Newsletter <newsletter@example.org>
+To: Dev <dev@example.invalid>
+Subject: Weekly update — please ignore tracking pixels
+Date: Tue, 26 May 2026 17:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<!doctype html>
+<html>
+  <body>
+    <h1>Remote tracking pixel — never fetched</h1>
+    <p>The image below is a remote URL. The renderer must show it as a
+    <code>[remote image: ...]</code> placeholder and never issue an HTTP
+    request.</p>
+    <p><img src="https://tracker.example.invalid/p.gif?u=42" alt="tracking pixel"></p>
+    <p>Real link for the picker:
+    <a href="https://example.invalid/news">news</a>,
+    <a href="mailto:dev@example.invalid">mailto</a>.</p>
+  </body>
+</html>

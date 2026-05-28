@@ -1,0 +1,14 @@
+---
+source: src/mail/html.rs
+expression: blocks
+---
+- Heading:
+    level: 1
+    text:
+      - Text:
+          content: Broken markup
+          style:
+            bold: false
+            italic: false
+            underline: false
+            code: false

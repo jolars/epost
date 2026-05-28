@@ -1,0 +1,35 @@
+Return-Path: <bot@example.org>
+Delivered-To: dev@example.invalid
+Message-ID: <cid-image-008@example.org>
+From: Friendly Bot <bot@example.org>
+To: Dev <dev@example.invalid>
+Subject: Welcome — inline logo via cid
+Date: Tue, 26 May 2026 16:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="bnd-008"
+
+--bnd-008
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<!doctype html>
+<html>
+  <body>
+    <h1>Inline image via cid:</h1>
+    <p>The logo below is referenced via a <code>cid:</code> URI and
+    resolved against the message's MIME parts. Step 3 renders it as a
+    text placeholder; step 4 paints it via the terminal's image protocol.</p>
+    <p><img src="cid:logo@epost" alt="epost logo"></p>
+    <p>The picker (<code>f</code>) should also find this
+    <a href="https://example.invalid/spec">spec link</a>.</p>
+  </body>
+</html>
+
+--bnd-008
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-ID: <logo@epost>
+
+aGVsbG8tcG5nLWJ5dGVz
+
+--bnd-008--

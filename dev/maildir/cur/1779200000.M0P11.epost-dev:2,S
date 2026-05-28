@@ -1,0 +1,53 @@
+Return-Path: <bot@example.org>
+Delivered-To: dev@example.invalid
+Message-ID: <real-cid-image-011@example.org>
+From: Friendly Bot <bot@example.org>
+To: Dev <dev@example.invalid>
+Subject: Inline logo (real PNG via cid)
+Date: Wed, 27 May 2026 16:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="bnd-011"
+
+--bnd-011
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<!doctype html>
+<html>
+  <body>
+    <h1>Real inline image</h1>
+    <p>The image below is the actual <code>welcome.png</code> bytes,
+    referenced via a <code>cid:</code> URI. On terminals that support
+    kitty / iTerm2 / sixel graphics it paints in place; everywhere else
+    it falls back to the magenta placeholder.</p>
+    <p><img src="cid:welcome@epost" alt="epost logo"></p>
+    <p>Compare with message 008, which carries bogus PNG bytes to
+    exercise the decode-failure path.</p>
+  </body>
+</html>
+
+--bnd-011
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-ID: <welcome@epost>
+
+iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAIGNIUk0AAHomAACAhAAA+gAAAIDo
+AAB1MAAA6mAAADqYAAAXcJy6UTwAAAAGYktHRAD/AP8A/6C9p5MAAANkSURBVHja7ZpbaBRXHIe/
+c2ZmNwaMIZiLmtZbNrWV1iJUjVGqiHhB+lINaKGVCmnBh5YilL6WlNCi4IM+KYIX9KEPRdKqiL7E
+eIsWpT4YbLJtwVbdNJcm21g3M3P6sInpdmNKYYe/sOd7250zZ37nO/9zmGFGNX4+YihitHQAaawA
+6QDSWAHSAaSxAqQDSGMFSAeQxgqQDiCNFSAdQBorQDqANFaAdABprADpANJYAdIBpLECpANIYwVI
+B5Cm6AW4UXW85mWHt99wSdQoPEfxy+8hZ24HfPO9TxBOtFv9kkNrU4yDF0b5udfw/psuC6o0w48N
+N5IhR9pHeTAY3du7SCrgow0eLVtjvPqCJpkyXO8OqJ6h+HijR2tTDGeSqzYmHL7aHqPEg3M/+DwY
+NGxa4nBoV5wFVdEVasErYO0rDtuWufQOG/acytDzKDvdpTH4YluclQmHd1a6HOvwc857fa7mu9sB
+X36bIRyb8HdXuTSv9fh0i8cHR55EIqDgarc3ZJ3uPzf6dPAAIxlobcsQhNC03EWr3PP604Z9ZycG
+D3C8w6fnUcjiOZr6mmiqoKC9TovBolkaP4Rr3UHe8dSQ4afekPJSxfzK3Et33AvI5BYFBrjSnZW4
+dF40Agq6BGZOV2gFWsHFz6ZN2bayTNGTmvj968DkG11qyDzt+7kX4IxlTD8xXOoKp2w78GfugM0z
+NvrxpRJM3d3zIaAvPdapVrS25a7n/6KybPIZnlWe/X+8EgpNQRfW8F+GZCqkxIMVdU7e8RIPjjbH
+OfBenPLS3AE31Dl5G6NWsKo+28/1noAoKPjO8nVnNuiezR6Jf+zcroZPNsVYWK0xBgb/9WlSbYXi
+w3Ue4w60gt3rPWorFFd+DLjfH00FFPw+oO2Wz5IXNRtfczi8K87d30L604ZFszVVZYrUkKHldCbv
+vN5hw44Gl8aEQzIVkqjR1FYo7vcb9p4ZjWTwkQgAaDmdoTPp8NZSl0S1pq4aHv5hOHnV59RVP28D
+BLiZDLl0L2DnapfGeoe+dLb9ics+Q4+juxWO7Fng/J2A83f+37pt7wpo74pmrT+Lon8atAKkA0ij
+7KeyRY4VIB1AGitAOoA0VoB0AGmsAOkA0lgB0gGksQKkA0hjBUgHkMYKkA4gjRUgHUCaohfwN9C3
++iRxGxr4AAAAAElFTkSuQmCC
+
+--bnd-011--

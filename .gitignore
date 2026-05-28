@@ -6,6 +6,9 @@ devenv.local.yaml
 # direnv
 .direnv
 
+# dev sqlite cache (rebuildable from dev/maildir on next run)
+dev/cache/
+
 # pre-commit
 .pre-commit-config.yaml
 

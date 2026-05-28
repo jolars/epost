@@ -10,3 +10,16 @@ anyhow = "1"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "5"
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+mail-parser = "0.11.3"
+html5ever = "0.39"
+markup5ever_rcdom = "0.39"
+tempfile = "3"
+ratatui-image = { version = "11.0.2", default-features = false, features = ["crossterm", "image-defaults"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+base64 = "0.22"
+
+[dev-dependencies]
+insta = { version = "1", features = ["yaml"] }

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Dev stub for `[reader].browser`. Instead of launching an actual
+# browser, append the invocation argv (one arg per line) to a log file
+# under /tmp/epost-opens/. Wired up by dev/config.toml so `:open` and
+# the `f` link picker can be exercised in the dev loop without firing
+# a real browser. Use `task opens:clear` to wipe the output dir.
+set -euo pipefail
+out_dir="${EPOST_OPENS_STUB_DIR:-/tmp/epost-opens}"
+mkdir -p "$out_dir"
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+log="$out_dir/${ts}-$$.log"
+{
+  printf 'argv0=%s\n' "$0"
+  for arg in "$@"; do
+    printf 'arg=%s\n' "$arg"
+  done
+} > "$log"
+echo "epost dev stub: captured open to $log" >&2
