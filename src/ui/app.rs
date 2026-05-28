@@ -231,9 +231,10 @@ impl App {
         }
     }
 
-    /// Toggle `S` on the selected row. Bound to `m` in Normal mode so
-    /// the user can mark a message unread for follow-up.
-    pub fn toggle_seen_selected(&mut self) {
+    /// Toggle a maildir flag (`S` / `F` / `T`) on the selected row.
+    /// Drives the user-facing flag bindings: `m` → Seen, `*` → Flagged,
+    /// `d` → Trashed.
+    pub fn toggle_flag_selected(&mut self, flag: char) {
         let Some(msgid) = self.selected_msgid() else {
             return;
         };
@@ -241,14 +242,14 @@ impl App {
             return;
         };
         let path = row.path.clone();
-        match flags::set_flag(&path, 'S', FlagOp::Toggle) {
+        match flags::set_flag(&path, flag, FlagOp::Toggle) {
             Ok((new_path, new_flags)) => {
                 self.self_writes.record(&path);
                 self.self_writes.record(&new_path);
                 self.apply_flag_change(&msgid, &new_path, &new_flags);
             }
             Err(e) => {
-                self.status_error = Some(format!("toggle seen: {e}"));
+                self.status_error = Some(format!("toggle {flag}: {e}"));
             }
         }
     }
@@ -669,7 +670,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let start = app.threaded().first().expect("row").row.clone();
         assert!(start.flags.contains('S'), "fixture must start Seen");
 
-        app.toggle_seen_selected();
+        app.toggle_flag_selected('S');
 
         let after = app.threaded().first().expect("row").row.clone();
         assert!(
@@ -686,6 +687,63 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         assert_eq!(after.path, expected);
         assert!(expected.exists());
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn manual_toggle_sets_flagged() {
+        let tmp = TempDir::new().unwrap();
+        let src = drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        app.toggle_flag_selected('F');
+
+        let after = app.threaded().first().expect("row").row.clone();
+        assert!(
+            after.flags.contains('F'),
+            "expected F flag after toggle, got {:?}",
+            after.flags
+        );
+        // Canonical ordering keeps the suffix sorted ASCII-uppercase.
+        let expected = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join("cur")
+            .join("1779.M0P1.host:2,FS");
+        assert_eq!(after.path, expected);
+        assert!(expected.exists());
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn manual_toggle_sets_trashed_then_clears() {
+        let tmp = TempDir::new().unwrap();
+        drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        app.toggle_flag_selected('T');
+        let after = app.threaded().first().expect("row").row.clone();
+        assert!(
+            after.flags.contains('T'),
+            "expected T, got {:?}",
+            after.flags
+        );
+
+        app.toggle_flag_selected('T');
+        let after = app.threaded().first().expect("row").row.clone();
+        assert!(
+            !after.flags.contains('T'),
+            "expected T cleared, got {:?}",
+            after.flags
+        );
     }
 
     #[test]

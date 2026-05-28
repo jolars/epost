@@ -82,12 +82,28 @@ fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {
     let from = from_addr.as_deref().unwrap_or("(unknown)");
     let subject_text = subject.as_deref().unwrap_or("(no subject)");
     let unread = !flags.contains('S');
+    let flagged = flags.contains('F');
+    let trashed = flags.contains('T');
 
-    let subj_style = if unread {
-        Style::default().add_modifier(Modifier::BOLD)
+    // Fixed 2-cell flag column: ★ + space when Flagged, two spaces
+    // otherwise. Subtracted as 2 cells below; ★ is multi-byte so a `.len()`
+    // would mis-budget.
+    let flag_glyph = if flagged { "★ " } else { "  " };
+    let flag_cells: usize = 2;
+
+    let mut subj_mods = Modifier::empty();
+    if unread {
+        subj_mods |= Modifier::BOLD;
+    }
+    if trashed {
+        subj_mods |= Modifier::CROSSED_OUT;
+    }
+    let subj_color = if trashed {
+        Color::DarkGray
     } else {
-        Style::default()
+        Color::Reset
     };
+    let subj_style = Style::default().fg(subj_color).add_modifier(subj_mods);
 
     let head = format!("{date_label}  ");
     let from_col_width: usize = 16;
@@ -97,6 +113,7 @@ fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {
     let remaining = width
         .saturating_sub(head.len())
         .saturating_sub(from_span.len())
+        .saturating_sub(flag_cells)
         .saturating_sub(indent.len())
         .saturating_sub(arrow.len());
     let subject_truncated = truncate_to(subject_text, remaining);
@@ -104,6 +121,7 @@ fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled(head, Style::default().fg(Color::DarkGray)),
         Span::styled(from_span, Style::default().fg(Color::Cyan)),
+        Span::styled(flag_glyph.to_string(), Style::default().fg(Color::Yellow)),
         Span::raw(indent),
         Span::styled(arrow.to_string(), Style::default().fg(Color::DarkGray)),
         Span::styled(subject_truncated, subj_style),
