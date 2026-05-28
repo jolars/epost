@@ -344,10 +344,8 @@ fn lone_img_child(node: &Handle) -> Option<Handle> {
 fn scan_for_lone_img(node: &Handle, found: &mut Option<Handle>) -> bool {
     for child in node.children.borrow().iter() {
         match &child.data {
-            NodeData::Text { contents } => {
-                if !contents.borrow().chars().all(char::is_whitespace) {
-                    return false;
-                }
+            NodeData::Text { contents } if !contents.borrow().chars().all(char::is_whitespace) => {
+                return false;
             }
             NodeData::Element { name, .. } => {
                 let tag = name.local.as_ref();
@@ -701,5 +699,49 @@ mod tests {
     fn snapshot_broken_fixture() {
         let blocks = parse(&fixture("broken.html"));
         insta::assert_yaml_snapshot!("broken", blocks);
+    }
+
+    #[test]
+    fn p_wrapping_lone_img_lifts_to_block_image() {
+        // The common email pattern. Before the lift, this collapsed into
+        // a Block::Paragraph with `[image: …]` text, and the
+        // image-decode walker never saw the cid → reader stuck on the
+        // placeholder forever.
+        let blocks = parse(r#"<p><img src="cid:logo@x" alt="L"></p>"#);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(
+                &blocks[0],
+                Block::Image { cid: Some(c), src: None, alt } if c == "logo@x" && alt == "L"
+            ),
+            "expected Block::Image, got {:?}",
+            blocks[0]
+        );
+    }
+
+    #[test]
+    fn p_wrapping_anchored_img_still_lifts() {
+        // <a> wrapping a lone <img> is also extremely common (click to
+        // enlarge). We lose the link target but the image renders.
+        let blocks = parse(r#"<p><a href="https://x"><img src="cid:y" alt="A"></a></p>"#);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::Image { cid: Some(c), .. } if c == "y"),
+            "expected Block::Image, got {:?}",
+            blocks[0]
+        );
+    }
+
+    #[test]
+    fn p_with_text_and_img_stays_a_paragraph() {
+        // Mixed content must NOT lift — the user-visible text would
+        // disappear. Keep the inline placeholder path.
+        let blocks = parse(r#"<p>see <img src="cid:y" alt="A"> here</p>"#);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::Paragraph(_)),
+            "expected Block::Paragraph (mixed content), got {:?}",
+            blocks[0]
+        );
     }
 }
