@@ -1,0 +1,103 @@
+version: '3'
+
+vars:
+  DEV_CONFIG: '{{.ROOT_DIR}}/dev/config.toml'
+  SENT_STUB_DIR: '/tmp/epost-sent'
+
+env:
+  RUST_LOG: epost=debug,warn
+  RUST_BACKTRACE: '1'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  dev:
+    desc: Auto-rebuild + restart on file change (main loop)
+    cmds:
+      - bacon run -- -- --config {{.DEV_CONFIG}}
+
+  run:
+    desc: One-shot debug run against dev/config.toml
+    cmds:
+      - cargo run -- --config {{.DEV_CONFIG}}
+
+  run:release:
+    desc: One-shot release run
+    cmds:
+      - cargo run --release -- --config {{.DEV_CONFIG}}
+
+  build:
+    desc: cargo build
+    cmds:
+      - cargo build
+
+  build:release:
+    desc: cargo build --release
+    cmds:
+      - cargo build --release
+
+  fmt:
+    desc: cargo fmt --all
+    cmds:
+      - cargo fmt --all
+
+  fmt:check:
+    desc: cargo fmt --all -- --check
+    cmds:
+      - cargo fmt --all -- --check
+
+  lint:
+    desc: cargo clippy --all-targets -- -D warnings
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  check:
+    desc: cargo check --all-targets
+    cmds:
+      - cargo check --all-targets
+
+  test:
+    desc: cargo test
+    cmds:
+      - cargo test
+
+  ci:
+    desc: 'fmt:check + lint + test (what CI would run)'
+    deps: [fmt:check, lint, test]
+
+  snap:review:
+    desc: Review pending insta snapshots interactively
+    cmds:
+      - cargo insta review
+
+  snap:accept:
+    desc: Accept all pending insta snapshots
+    cmds:
+      - cargo insta accept
+
+  sent:clear:
+    desc: Wipe the dev msmtp-stub sent-message directory
+    cmds:
+      - rm -rf {{.SENT_STUB_DIR}}
+      - mkdir -p {{.SENT_STUB_DIR}}
+
+  index:reset:
+    desc: Delete the sqlite index cache (forces full rescan on next run)
+    cmds:
+      - rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/epost/index.sqlite"
+
+  doctor:
+    desc: Smoke-check the devshell and fixtures
+    cmds:
+      - command -v cargo  >/dev/null && echo "ok cargo"   || echo "MISSING cargo"
+      - command -v bacon  >/dev/null && echo "ok bacon"   || echo "MISSING bacon"
+      - command -v mold   >/dev/null && echo "ok mold"    || echo "MISSING mold"
+      - command -v mbsync >/dev/null && echo "ok mbsync"  || echo "MISSING mbsync"
+      - command -v msmtp  >/dev/null && echo "ok msmtp"   || echo "MISSING msmtp"
+      - test -f {{.DEV_CONFIG}}      && echo "ok dev/config.toml" || echo "MISSING dev/config.toml"
+      - test -x {{.ROOT_DIR}}/dev/msmtp-stub && echo "ok dev/msmtp-stub" || echo "MISSING/non-exec dev/msmtp-stub"
+    silent: true

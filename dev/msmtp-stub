@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Dev stub for `msmtp -t`. Instead of sending mail, write stdin (the
+# composed MIME message) to a timestamped file under /tmp/epost-sent/.
+# Wired up by dev/config.toml's [smtp] command. Use `task sent:clear` to
+# wipe the output dir.
+set -euo pipefail
+out_dir="${EPOST_SENT_STUB_DIR:-/tmp/epost-sent}"
+mkdir -p "$out_dir"
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+out_file="$out_dir/${ts}-$$.eml"
+cat > "$out_file"
+echo "epost dev stub: captured message to $out_file" >&2

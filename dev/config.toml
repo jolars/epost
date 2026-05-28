@@ -1,0 +1,24 @@
+# Development config used by `task dev` / `task run`.
+#
+# Points at the in-repo fixture maildir and a stub msmtp so the app has
+# something to render without needing a real mbsync/msmtp setup. Selected
+# explicitly via `--config dev/config.toml` (the binary defaults to
+# $XDG_CONFIG_HOME/epost/config.toml for real use).
+
+[ui]
+sidebar = true
+list = true
+reader = true
+
+[smtp]
+command = ["./dev/msmtp-stub"]
+
+[reader]
+default_view = "html"
+load_images = false
+
+# Single dev account pointing at the in-tree maildir.
+[accounts.dev]
+maildir = "./dev/maildir"
+from = "Dev <dev@example.invalid>"
+sent_folder = "Sent"
