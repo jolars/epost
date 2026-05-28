@@ -42,26 +42,21 @@ pub struct ResolvedImage {
 /// mode. On a failed `Auto` probe falls back to halfblocks with a
 /// diagnostic in `warning`.
 pub fn build_picker(cfg: &Images) -> (Option<Picker>, Option<String>) {
+    // Silent on success; surface only when the user might wonder why an
+    // image isn't rendering. `Off` and non-tty are deliberate states and
+    // self-explanatory from the config / invocation, so they stay quiet
+    // too — only a failed Auto probe (silent terminal degradation) is
+    // worth a status-row note.
     if matches!(cfg.protocol, ImagesProtocol::Off) {
-        return (None, Some("images: protocol=off".to_string()));
+        return (None, None);
     }
     if !std::io::stdout().is_terminal() {
-        return (None, Some("images: stdout not a tty".to_string()));
+        return (None, None);
     }
     match cfg.protocol {
-        ImagesProtocol::Off => (None, Some("images: protocol=off".to_string())),
+        ImagesProtocol::Off => (None, None),
         ImagesProtocol::Auto => match Picker::from_query_stdio() {
-            Ok(p) => {
-                let proto = p.protocol_type();
-                let fs = p.font_size();
-                (
-                    Some(p),
-                    Some(format!(
-                        "images: probe ok, protocol={proto:?}, font={}x{}",
-                        fs.width, fs.height
-                    )),
-                )
-            }
+            Ok(p) => (Some(p), None),
             Err(e) => (
                 Some(Picker::halfblocks()),
                 Some(format!(
@@ -72,10 +67,7 @@ pub fn build_picker(cfg: &Images) -> (Option<Picker>, Option<String>) {
         explicit => {
             let mut p = Picker::halfblocks();
             p.set_protocol_type(map_protocol(explicit));
-            (
-                Some(p),
-                Some(format!("images: forced protocol={explicit:?}")),
-            )
+            (Some(p), None)
         }
     }
 }
@@ -233,11 +225,6 @@ mod tests {
         };
         let (picker, warn) = build_picker(&cfg);
         assert!(picker.is_none());
-        // Off mode surfaces a diagnostic so users debugging "why no
-        // image?" can see why; assert it explains itself.
-        assert!(
-            warn.as_deref().is_some_and(|s| s.contains("protocol=off")),
-            "expected protocol=off diagnostic, got {warn:?}"
-        );
+        assert!(warn.is_none(), "off mode should be silent, got {warn:?}");
     }
 }

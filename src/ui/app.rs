@@ -244,22 +244,13 @@ impl App {
                 }
             }
         }
-        let entries_n = entries.len();
         if entries.is_empty() {
             self.image_cache.remove(msgid);
         } else {
             self.image_cache.insert(msgid.to_string(), entries);
         }
-        // Diagnostic: when a message references images, surface whether
-        // we actually cached any so "why is there only a placeholder?"
-        // is debuggable without instrumentation.
-        let total_refs = entries_n + failed.len();
-        if total_refs > 0 {
-            let mut parts = vec![format!("images: {entries_n}/{total_refs} decoded")];
-            if !failed.is_empty() {
-                parts.push(format!("failed: {}", failed.join(", ")));
-            }
-            self.status_error = Some(parts.join(" — "));
+        if !failed.is_empty() {
+            self.status_error = Some(format!("image decode failed: {}", failed.join(", ")));
         }
     }
 
