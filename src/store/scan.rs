@@ -3,6 +3,7 @@ use std::sync::mpsc::{self, Receiver};
 
 use anyhow::{Context, Result};
 
+use crate::mail::flags;
 use crate::mail::parse;
 use crate::store::index::{Index, MessageRow};
 use crate::store::thread::{ThreadedRow, build_threads};
@@ -112,12 +113,9 @@ pub fn folder_label(subdir: &str) -> String {
 }
 
 pub fn extract_flags(path: &Path) -> String {
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return String::new(),
-    };
-    name.rsplit_once(":2,")
-        .map(|(_, flags)| flags.to_string())
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(flags::parse_flags)
         .unwrap_or_default()
 }
 

@@ -25,6 +25,7 @@ fn normal(app: &mut App, k: KeyEvent) {
         KeyCode::BackTab => app.cycle_focus(false),
         KeyCode::Char('j') if app.focus == Pane::List => app.select_next(),
         KeyCode::Char('k') if app.focus == Pane::List => app.select_prev(),
+        KeyCode::Char('m') if app.focus == Pane::List => app.toggle_seen_selected(),
         KeyCode::Char('l') | KeyCode::Enter if app.focus == Pane::Reader && app.reader_visible => {
             app.mode = Mode::Reader;
         }

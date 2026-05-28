@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use ratatui::Frame;
@@ -7,10 +7,13 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::picker::Picker;
 
 use crate::config::Config;
+use crate::mail::flags::{self, FlagOp};
 use crate::mail::html::{self, Block};
 use crate::mail::parse;
+use crate::store::index::{Index, MessageRow};
 use crate::store::scan::{self, ScanResult};
 use crate::store::thread::ThreadedRow;
+use crate::store::watch::SelfWrites;
 use crate::ui::images::{self, ImageKey, ResolvedImage};
 use crate::ui::{accounts, cmdline, folders, list, reader};
 
@@ -88,6 +91,14 @@ pub struct App {
     /// Set by `ensure_body_for_selection` when the body changed this
     /// tick; reader consumes it to drive the Clear pass.
     pub body_changed_this_tick: bool,
+    /// SQLite cache path. Kept so flag flips can briefly re-open the
+    /// index and mirror the new `path` / `flags` without holding a
+    /// long-lived `Connection` on the UI thread.
+    cache_path: PathBuf,
+    /// Self-write registry the future Step 7 notify watcher will consult
+    /// to suppress its own rename events. Populated whenever a flag flip
+    /// renames a maildir file under us.
+    pub self_writes: SelfWrites,
     scan_rx: Option<Receiver<ScanResult>>,
 }
 
@@ -106,7 +117,7 @@ impl App {
         let scan_rx = if accounts.is_empty() {
             None
         } else {
-            Some(scan::start_worker(accounts, cache_path))
+            Some(scan::start_worker(accounts, cache_path.clone()))
         };
         let scan = if scan_rx.is_some() {
             ScanState::Scanning
@@ -135,6 +146,8 @@ impl App {
             prev_parsed_msgid: None,
             last_image_rects: Vec::new(),
             body_changed_this_tick: false,
+            cache_path,
+            self_writes: SelfWrites::new(),
             scan_rx,
         }
     }
@@ -183,6 +196,7 @@ impl App {
                     cid_parts: body.cid_parts,
                 });
                 self.evict_image_cache(old_msgid.as_deref(), &msgid);
+                self.try_mark_seen(&msgid);
             }
             Err(e) => {
                 self.parsed = None;
@@ -190,6 +204,87 @@ impl App {
                 self.evict_image_cache(old_msgid.as_deref(), &msgid);
             }
         }
+    }
+
+    /// Add the `S` (Seen) flag to the selected row if it isn't already
+    /// set. Used by `ensure_body_for_selection` on a successful body
+    /// parse, so opening a message once is enough to mark it read.
+    /// Errors are surfaced via `status_error`; the rescan reconciles
+    /// on the next sync.
+    fn try_mark_seen(&mut self, msgid: &str) {
+        let Some(row) = self.find_row(msgid) else {
+            return;
+        };
+        if row.flags.contains('S') {
+            return;
+        }
+        let path = row.path.clone();
+        match flags::set_flag(&path, 'S', FlagOp::Add) {
+            Ok((new_path, new_flags)) => {
+                self.self_writes.record(&path);
+                self.self_writes.record(&new_path);
+                self.apply_flag_change(msgid, &new_path, &new_flags);
+            }
+            Err(e) => {
+                self.status_error = Some(format!("mark read: {e}"));
+            }
+        }
+    }
+
+    /// Toggle `S` on the selected row. Bound to `m` in Normal mode so
+    /// the user can mark a message unread for follow-up.
+    pub fn toggle_seen_selected(&mut self) {
+        let Some(msgid) = self.selected_msgid() else {
+            return;
+        };
+        let Some(row) = self.find_row(&msgid) else {
+            return;
+        };
+        let path = row.path.clone();
+        match flags::set_flag(&path, 'S', FlagOp::Toggle) {
+            Ok((new_path, new_flags)) => {
+                self.self_writes.record(&path);
+                self.self_writes.record(&new_path);
+                self.apply_flag_change(&msgid, &new_path, &new_flags);
+            }
+            Err(e) => {
+                self.status_error = Some(format!("toggle seen: {e}"));
+            }
+        }
+    }
+
+    fn find_row(&self, msgid: &str) -> Option<&MessageRow> {
+        let ScanState::Ready(rows) = &self.scan else {
+            return None;
+        };
+        rows.iter().find(|t| t.row.msgid == msgid).map(|t| &t.row)
+    }
+
+    /// Patch the in-memory row's `path` / `flags` after a successful
+    /// rename, then mirror the change into the SQLite index. Maildir is
+    /// truth (DESIGN invariant 3), so if the index update fails we leave
+    /// the in-memory row patched and let the next rescan reconcile.
+    fn apply_flag_change(&mut self, msgid: &str, new_path: &Path, new_flags: &str) {
+        let row_snapshot = {
+            let ScanState::Ready(rows) = &mut self.scan else {
+                return;
+            };
+            let Some(t) = rows.iter_mut().find(|t| t.row.msgid == msgid) else {
+                return;
+            };
+            t.row.path = new_path.to_path_buf();
+            t.row.flags = new_flags.to_string();
+            t.row.clone()
+        };
+        if let Err(e) = self.mirror_to_index(&row_snapshot) {
+            self.status_error = Some(format!("index mirror failed: {e:#}"));
+        }
+    }
+
+    fn mirror_to_index(&self, row: &MessageRow) -> anyhow::Result<()> {
+        let mut idx = Index::open(&self.cache_path)?;
+        idx.upsert(row)?;
+        Ok(())
     }
 
     /// Walks blocks, decodes resolvable images into the cache, and
@@ -443,5 +538,188 @@ fn split_right(right: Rect, list: bool, reader: bool) -> (Option<Rect>, Option<R
         (true, false) => (Some(right), None),
         (false, true) => (None, Some(right)),
         (false, false) => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod flag_integration_tests {
+    use std::fs;
+    use std::time::{Duration, Instant};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::config::Account;
+
+    const MSG: &[u8] = b"\
+Message-ID: <m1@example.invalid>\r\n\
+From: Tester <tester@example.invalid>\r\n\
+Subject: hi\r\n\
+Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
+\r\n\
+<p>body</p>\r\n";
+
+    fn drop_message(tmp: &TempDir, dir: &str, basename: &str) -> std::path::PathBuf {
+        let inbox = tmp.path().join("Mail").join("personal");
+        fs::create_dir_all(inbox.join("cur")).unwrap();
+        fs::create_dir_all(inbox.join("new")).unwrap();
+        let p = inbox.join(dir).join(basename);
+        fs::write(&p, MSG).unwrap();
+        p
+    }
+
+    fn one_account_config(tmp: &TempDir) -> Config {
+        let mut cfg = Config::default();
+        cfg.accounts.insert(
+            "personal".into(),
+            Account {
+                maildir: tmp.path().join("Mail").join("personal"),
+                from: "Tester <tester@example.invalid>".into(),
+                sent_folder: None,
+                smtp: None,
+            },
+        );
+        cfg
+    }
+
+    /// Spin until the scan worker either reports rows or fails. The
+    /// worker runs on `std::thread`; tests can't share the live event
+    /// loop, so this is the equivalent of one tick of the UI's
+    /// `poll_scan` until the channel resolves.
+    fn drain_scan(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.poll_scan();
+            if matches!(app.scan, ScanState::Ready(_) | ScanState::Failed(_)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("scan worker never reported");
+    }
+
+    #[test]
+    fn auto_mark_seen_on_first_body_parse() {
+        let tmp = TempDir::new().unwrap();
+        let src = drop_message(&tmp, "new", "1779.M0P1.host");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+        assert!(matches!(app.scan, ScanState::Ready(_)));
+
+        app.ensure_body_for_selection();
+
+        let row = app.threaded().first().expect("row").row.clone();
+        assert!(
+            row.flags.contains('S'),
+            "expected S flag after auto-mark, got {:?}",
+            row.flags
+        );
+        let expected = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join("cur")
+            .join("1779.M0P1.host:2,S");
+        assert_eq!(row.path, expected);
+        assert!(expected.exists(), "renamed file must exist");
+        assert!(!src.exists(), "original new/ file must be gone");
+        assert!(
+            app.status_error.is_none(),
+            "auto-mark must not surface an error, got {:?}",
+            app.status_error
+        );
+    }
+
+    #[test]
+    fn auto_mark_seen_idempotent_on_repeat_calls() {
+        let tmp = TempDir::new().unwrap();
+        drop_message(&tmp, "new", "1779.M0P1.host");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        app.ensure_body_for_selection();
+        // Second call on the same selection: nothing to parse, nothing to
+        // rename. Any status_error here would mean we tried (and failed)
+        // to re-rename a file that's already gone.
+        app.status_error = None;
+        app.ensure_body_for_selection();
+        assert!(
+            app.status_error.is_none(),
+            "repeat call leaked an error: {:?}",
+            app.status_error
+        );
+    }
+
+    #[test]
+    fn manual_toggle_clears_seen() {
+        let tmp = TempDir::new().unwrap();
+        let src = drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        let start = app.threaded().first().expect("row").row.clone();
+        assert!(start.flags.contains('S'), "fixture must start Seen");
+
+        app.toggle_seen_selected();
+
+        let after = app.threaded().first().expect("row").row.clone();
+        assert!(
+            !after.flags.contains('S'),
+            "toggle must clear S, got {:?}",
+            after.flags
+        );
+        let expected = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join("cur")
+            .join("1779.M0P1.host");
+        assert_eq!(after.path, expected);
+        assert!(expected.exists());
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn self_writes_recorded_on_flag_flip() {
+        let tmp = TempDir::new().unwrap();
+        drop_message(&tmp, "new", "1779.M0P1.host");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        let watcher_view = app.self_writes.clone();
+        app.ensure_body_for_selection();
+
+        let new_path = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join("cur")
+            .join("1779.M0P1.host:2,S");
+        let old_path = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join("new")
+            .join("1779.M0P1.host");
+        assert!(
+            watcher_view.consume(&new_path),
+            "destination path should be recorded"
+        );
+        assert!(
+            watcher_view.consume(&old_path),
+            "source path should be recorded"
+        );
     }
 }
