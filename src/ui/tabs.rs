@@ -11,18 +11,27 @@ use crate::ui::app::{App, Mode, Screen};
 /// SomeLongFolder` etc. and matched against the layout constraint.
 const BADGE_WIDTH: usize = 28;
 
+/// Extra cells reserved on the right of the badge for the live `/needle (N)`
+/// search chip when a search is active. Kept compact so the badge still
+/// fits in the same top-bar slot.
+const SEARCH_CHIP_WIDTH: usize = 24;
+
 /// Render the top-row strip: `[account · folder]` badge on the left,
 /// tab strip in the middle, sync indicator + mode tag right-aligned.
 /// The active tab is inverted; dirty (compose) tabs get a trailing `*`.
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
+    let search_active = matches!(app.screens.first(), Some(Screen::Inbox(i)) if i.search.is_some());
+    let chip_width = if search_active { SEARCH_CHIP_WIDTH } else { 0 };
     let parts = Layout::horizontal([
         Constraint::Length(BADGE_WIDTH as u16),
+        Constraint::Length(chip_width as u16),
         Constraint::Min(0),
         Constraint::Length(12),
     ])
     .split(area);
 
     let badge = badge_line(app);
+    let chip = search_chip(app);
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(app.screens.len() * 2 + 1);
     spans.push(Span::raw(" "));
@@ -46,8 +55,41 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     ]);
 
     f.render_widget(Paragraph::new(badge), parts[0]);
-    f.render_widget(Paragraph::new(Line::from(spans)), parts[1]);
-    f.render_widget(Paragraph::new(right), parts[2]);
+    f.render_widget(Paragraph::new(chip), parts[1]);
+    f.render_widget(Paragraph::new(Line::from(spans)), parts[2]);
+    f.render_widget(Paragraph::new(right), parts[3]);
+}
+
+/// `/needle (12)` or `g/needle (12)` chip surfaced when a search is
+/// active. Renders into the slot between the account/folder badge and
+/// the tab strip; empty `Line` when no search.
+fn search_chip(app: &App) -> Line<'static> {
+    let Some(Screen::Inbox(inbox)) = app.screens.first() else {
+        return Line::from(Span::raw(""));
+    };
+    let Some(s) = inbox.search.as_ref() else {
+        return Line::from(Span::raw(""));
+    };
+    let prefix = if s.kind.is_global() { "g/" } else { "/" };
+    // Budget: " {prefix}{query} ({n}) ", where the query is truncated to
+    // whatever fits in SEARCH_CHIP_WIDTH after the fixed parts.
+    let q = s.query.as_str();
+    let count = format!(" ({})", s.results.len());
+    let fixed = 1 + prefix.chars().count() + count.chars().count() + 1; // leading + trailing space
+    let q_budget = SEARCH_CHIP_WIDTH.saturating_sub(fixed);
+    let q_t = truncate_to(q, q_budget);
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            prefix.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(q_t, Style::default().fg(Color::Yellow)),
+        Span::styled(count, Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ])
 }
 
 /// `[account · folder]` badge. Account defaults to `all` when no scope
@@ -106,6 +148,7 @@ fn mode_tag(mode: Mode) -> &'static str {
         Mode::Normal => "NORMAL  ",
         Mode::Command => "COMMAND ",
         Mode::LinkPick => "LINKPICK",
+        Mode::Search => "SEARCH  ",
     }
 }
 

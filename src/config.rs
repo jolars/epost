@@ -27,6 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub watch: Watch,
     #[serde(default)]
+    pub search: Search,
+    #[serde(default)]
     pub accounts: HashMap<String, Account>,
     #[serde(default)]
     pub keys: HashMap<String, HashMap<String, String>>,
@@ -155,6 +157,33 @@ impl Default for Watch {
 
 fn default_debounce_ms() -> u64 {
     250
+}
+
+/// `g/` (global) search settings. `global_folders` is the priority-
+/// ordered list of folder labels covered by global search; rows in
+/// folders earlier in the list rank higher within the same score tier.
+/// An empty list means "every folder, score-only ranking."
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Search {
+    #[serde(default = "default_global_folders")]
+    pub global_folders: Vec<String>,
+}
+
+impl Default for Search {
+    fn default() -> Self {
+        Self {
+            global_folders: default_global_folders(),
+        }
+    }
+}
+
+fn default_global_folders() -> Vec<String> {
+    vec![
+        "INBOX".to_string(),
+        "Archive".to_string(),
+        "Sent".to_string(),
+    ]
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -382,6 +411,59 @@ mod tests {
             [watch]
             enabled = true
             mystery = 1
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mystery"));
+    }
+
+    #[test]
+    fn search_defaults_to_inbox_archive_sent() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.search.global_folders,
+            vec![
+                "INBOX".to_string(),
+                "Archive".to_string(),
+                "Sent".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_search_section() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [search]
+            global_folders = ["INBOX", "Archive"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.search.global_folders,
+            vec!["INBOX".to_string(), "Archive".to_string()]
+        );
+    }
+
+    #[test]
+    fn search_empty_list_is_respected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [search]
+            global_folders = []
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.search.global_folders.is_empty());
+    }
+
+    #[test]
+    fn unknown_key_in_search_fails() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [search]
+            global_folders = ["INBOX"]
+            mystery = "boom"
             "#,
         )
         .unwrap_err();

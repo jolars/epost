@@ -19,6 +19,7 @@ use crate::store::watch::{self, SelfWrites, Watcher, WatcherConfig, WatcherEvent
 use crate::ui::compose::{ComposeScreen, ComposeStatus};
 use crate::ui::events::AppEvent;
 use crate::ui::images::{self, ImageKey, ResolvedImage};
+use crate::ui::search::SearchState;
 use crate::ui::text_input::TextInput;
 use crate::ui::{cmdline, compose, folders, list, reader, tabs};
 
@@ -31,12 +32,15 @@ pub enum Pane {
 
 /// Modal layer. `Normal` is the ambient navigation mode — keys are routed
 /// by pane focus (List vs Reader), not by a separate Reader sub-mode.
-/// `Command` and `LinkPick` exist because they capture text/digit input.
+/// `Command`, `LinkPick`, and `Search` exist because they capture text /
+/// digit input. `Search`'s local-vs-global flavour lives on
+/// `InboxScreen.search.kind` so the mode enum stays `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Command,
     LinkPick,
+    Search,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +72,10 @@ pub struct App {
     pub mode: Mode,
     pub cmdline: TextInput,
     pub link_pick_buf: String,
+    /// Pending `g` prefix in Normal mode. The user has typed `g`; the
+    /// next key decides what it composes — today only `/` for global
+    /// search, future room for `gg`/`G` etc.
+    pub pending_g: bool,
     /// Transient status / error displayed in the cmdline row. Cleared
     /// when the user enters a new command or moves selection.
     pub status_error: Option<String>,
@@ -127,6 +135,14 @@ pub struct InboxScreen {
     /// reader Clears these next frame when the body changes so kitty /
     /// iTerm2 placements don't ghost across messages.
     pub last_image_rects: Vec<Rect>,
+    /// Body-line count from the previous reader draw, used by `G` to
+    /// pick a bottom-scroll position without re-running layout in the
+    /// keymap. A lower bound (counts pre-wrap `Line`s, so heavy wrap
+    /// undershoots — the user can `j` from there).
+    pub last_reader_body_lines: u16,
+    /// Inner reader-pane height (after border) from the previous draw.
+    /// Pairs with `last_reader_body_lines` for the `G` calc.
+    pub last_reader_inner_height: u16,
     /// Set by `ensure_body` when the body changed this tick; reader
     /// consumes it to drive the Clear pass.
     pub body_changed_this_tick: bool,
@@ -173,6 +189,12 @@ pub struct InboxScreen {
     /// watcher failed to start (commonly `fs.inotify.max_user_watches`
     /// exhausted). `None` once consumed by `App::new`.
     pub watcher_warning: Option<String>,
+    /// Active `/` or `g/` search. While `Some`, the list pane renders
+    /// `search.results` (flat, no threading) instead of `scan.threads`,
+    /// and the selection / flag / move ops operate against the search
+    /// row. `None` is the ambient inbox view. Boxed so the heavy
+    /// haystack doesn't bloat `Screen::Inbox` (clippy `large_enum_variant`).
+    pub search: Option<Box<SearchState>>,
 }
 
 impl App {
@@ -189,6 +211,7 @@ impl App {
             mode: Mode::Normal,
             cmdline: TextInput::new(),
             link_pick_buf: String::new(),
+            pending_g: false,
             status_error: watcher_warning,
             quit: false,
             screens: vec![Screen::Inbox(inbox)],
@@ -411,6 +434,72 @@ impl App {
         self.inbox_mut().cycle_focus(forward);
     }
 
+    /// Enter `/` (local) search: snapshot the current scope's rows from
+    /// the index, install a fresh `SearchState`, switch focus to List,
+    /// flip `Mode::Search`. Failure to open the index surfaces in the
+    /// cmdline status row and leaves search inactive.
+    pub fn enter_search_local(&mut self) {
+        let Self {
+            screens,
+            cache_path,
+            status_error,
+            mode,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        if inbox.enter_search_local(cache_path, status_error) {
+            *mode = Mode::Search;
+        }
+    }
+
+    /// Enter `g/` (global) search using `[search].global_folders`
+    /// (or every folder when the list is empty/unset), filtered to the
+    /// currently-selected account scope.
+    pub fn enter_search_global(&mut self, cfg: &Config) {
+        let Self {
+            screens,
+            cache_path,
+            status_error,
+            mode,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        if inbox.enter_search_global(&cfg.search.global_folders, cache_path, status_error) {
+            *mode = Mode::Search;
+        }
+    }
+
+    /// Exit search via `Esc`: drop results, restore the cursor to the
+    /// pre-search msgid when possible, return to Normal.
+    pub fn exit_search_cancel(&mut self) {
+        self.inbox_mut().exit_search_cancel();
+        self.mode = Mode::Normal;
+    }
+
+    /// Exit search via `Enter`: keep results active in the list pane,
+    /// return to Normal, and focus the Reader pane when visible so a
+    /// single Enter takes the user from search field straight into the
+    /// message body (vs. committing here and requiring a second Enter
+    /// for the List→Reader focus shift). When the reader is hidden,
+    /// focus stays on List. `Esc` from Reader → List → clears search,
+    /// matching the rest of the keymap.
+    pub fn exit_search_commit(&mut self) {
+        self.mode = Mode::Normal;
+        let inbox = self.inbox_mut();
+        if inbox.reader_visible {
+            inbox.focus = Pane::Reader;
+        }
+    }
+
+    /// Drop active search (post-commit Esc, or any sidebar scope change).
+    pub fn clear_search(&mut self) {
+        self.inbox_mut().clear_search();
+    }
+
     /// Switch the inbox to render `(account, folder)`. `account = None`
     /// is the unified `[all]` view. Drives `:account` from cmdline.
     pub fn switch_to_scope(&mut self, account: Option<String>, folder: &str) {
@@ -559,6 +648,8 @@ impl InboxScreen {
             image_cache: HashMap::new(),
             prev_parsed_msgid: None,
             last_image_rects: Vec::new(),
+            last_reader_body_lines: 0,
+            last_reader_inner_height: 0,
             body_changed_this_tick: false,
             folder_stats: Vec::new(),
             current_account: None,
@@ -570,6 +661,7 @@ impl InboxScreen {
             rescan_rx: None,
             rescan_in_flight: HashSet::new(),
             watcher_warning,
+            search: None,
         }
     }
 
@@ -761,43 +853,59 @@ impl InboxScreen {
         cache_path: &Path,
         status_error: &mut Option<String>,
     ) {
-        let row_snapshot = {
-            let ScanState::Ready(rows) = &mut self.scan else {
-                return;
-            };
-            let Some(i) = rows.iter().position(|t| t.row.msgid == msgid) else {
-                return;
-            };
-            let mut snapshot = rows[i].row.clone();
-            let src_folder = snapshot.folder.clone();
-            let account = snapshot.account.clone();
-            let was_unread = !snapshot.flags.contains('S');
-            snapshot.folder = target_folder.to_string();
-            snapshot.path = new_path.to_path_buf();
-            rows.remove(i);
-            if rows.is_empty() {
-                self.selected = 0;
-            } else if self.selected >= rows.len() {
-                self.selected = rows.len() - 1;
-            }
-            adjust_total(&mut self.folder_stats, &account, &src_folder, -1);
-            adjust_total(&mut self.folder_stats, &account, target_folder, 1);
-            if was_unread {
-                adjust_unread(&mut self.folder_stats, &account, &src_folder, -1);
-                adjust_unread(&mut self.folder_stats, &account, target_folder, 1);
-            }
-            snapshot
+        // Pull the pre-move snapshot from whichever in-memory view has
+        // the row. Scan is preferred when both hold it (local search +
+        // current folder), but global search may only have it in the
+        // haystack.
+        let Some(snapshot_base) = self.find_row(msgid).cloned() else {
+            return;
         };
-        if let Err(e) = mirror_to_index(cache_path, &row_snapshot) {
+        let src_folder = snapshot_base.folder.clone();
+        let account = snapshot_base.account.clone();
+        let was_unread = !snapshot_base.flags.contains('S');
+        let mut snapshot = snapshot_base;
+        snapshot.folder = target_folder.to_string();
+        snapshot.path = new_path.to_path_buf();
+
+        // Drop from scan (if there). When the row was the active list
+        // selection (no search), clamp selected against the new len.
+        let mut scan_had_row = false;
+        if let ScanState::Ready(rows) = &mut self.scan
+            && let Some(i) = rows.iter().position(|t| t.row.msgid == msgid)
+        {
+            rows.remove(i);
+            scan_had_row = true;
+            if self.search.is_none() {
+                if rows.is_empty() {
+                    self.selected = 0;
+                } else if self.selected >= rows.len() {
+                    self.selected = rows.len() - 1;
+                }
+            }
+        }
+        // Drop from search (if active). Reclamps `selected` against the
+        // new results length.
+        if let Some(s) = self.search.as_mut() {
+            s.drop_msgid(msgid);
+            if s.results.is_empty() {
+                self.selected = 0;
+            } else if self.selected >= s.results.len() {
+                self.selected = s.results.len() - 1;
+            }
+        }
+        // Stats are unconditional — the move actually shifted counts on
+        // disk regardless of which in-memory view held the row.
+        let _ = scan_had_row;
+        adjust_total(&mut self.folder_stats, &account, &src_folder, -1);
+        adjust_total(&mut self.folder_stats, &account, target_folder, 1);
+        if was_unread {
+            adjust_unread(&mut self.folder_stats, &account, &src_folder, -1);
+            adjust_unread(&mut self.folder_stats, &account, target_folder, 1);
+        }
+
+        if let Err(e) = mirror_to_index(cache_path, &snapshot) {
             *status_error = Some(format!("index mirror failed: {e:#}"));
         }
-    }
-
-    fn find_row(&self, msgid: &str) -> Option<&MessageRow> {
-        let ScanState::Ready(rows) = &self.scan else {
-            return None;
-        };
-        rows.iter().find(|t| t.row.msgid == msgid).map(|t| &t.row)
     }
 
     /// Patch the in-memory row's `path` / `flags` after a successful
@@ -812,33 +920,51 @@ impl InboxScreen {
         cache_path: &Path,
         status_error: &mut Option<String>,
     ) {
-        let row_snapshot = {
-            let ScanState::Ready(rows) = &mut self.scan else {
-                return;
-            };
-            let Some(t) = rows.iter_mut().find(|t| t.row.msgid == msgid) else {
-                return;
-            };
-            let was_unread = !t.row.flags.contains('S');
-            let now_unread = !new_flags.contains('S');
-            let unread_delta: i64 = match (was_unread, now_unread) {
-                (true, false) => -1,
-                (false, true) => 1,
-                _ => 0,
-            };
+        // Compute the unread delta + identify (account, folder) from
+        // either in-memory view. The row may live in scan only (no
+        // search), haystack only (global-search result outside the
+        // current folder), or both (local search). Whichever has it
+        // first is fine — the values that drive stats are identical.
+        let Some(pre) = self.find_row(msgid).cloned() else {
+            return;
+        };
+        let was_unread = !pre.flags.contains('S');
+        let now_unread = !new_flags.contains('S');
+        let unread_delta: i64 = match (was_unread, now_unread) {
+            (true, false) => -1,
+            (false, true) => 1,
+            _ => 0,
+        };
+        // Patch scan (if there).
+        let mut snapshot_for_index: Option<MessageRow> = None;
+        if let ScanState::Ready(rows) = &mut self.scan
+            && let Some(t) = rows.iter_mut().find(|t| t.row.msgid == msgid)
+        {
             t.row.path = new_path.to_path_buf();
             t.row.flags = new_flags.to_string();
-            if unread_delta != 0 {
-                adjust_unread(
-                    &mut self.folder_stats,
-                    &t.row.account,
-                    &t.row.folder,
-                    unread_delta,
-                );
+            snapshot_for_index = Some(t.row.clone());
+        }
+        // Patch search haystack (if there).
+        if let Some(s) = self.search.as_mut() {
+            s.patch_row(msgid, new_path, new_flags);
+            if snapshot_for_index.is_none()
+                && let Some(r) = s.haystack.iter().find(|r| r.msgid == msgid)
+            {
+                snapshot_for_index = Some(r.clone());
             }
-            t.row.clone()
+        }
+        if unread_delta != 0 {
+            adjust_unread(
+                &mut self.folder_stats,
+                &pre.account,
+                &pre.folder,
+                unread_delta,
+            );
+        }
+        let Some(snap) = snapshot_for_index else {
+            return;
         };
-        if let Err(e) = mirror_to_index(cache_path, &row_snapshot) {
+        if let Err(e) = mirror_to_index(cache_path, &snap) {
             *status_error = Some(format!("index mirror failed: {e:#}"));
         }
     }
@@ -914,6 +1040,9 @@ impl InboxScreen {
             .retain(|k, _| keep.contains(&Some(k.as_str())));
     }
 
+    /// Selected row from the *underlying scan* — only meaningful when
+    /// `search.is_none()`. Most callers want
+    /// [`InboxScreen::selected_message_row`] (search-aware).
     pub fn selected_row(&self) -> Option<&ThreadedRow> {
         match &self.scan {
             ScanState::Ready(rows) if !rows.is_empty() => {
@@ -924,19 +1053,42 @@ impl InboxScreen {
         }
     }
 
+    /// Search-aware selected row. Returns the search-result row when
+    /// search is active, else the scan-list row. The canonical accessor
+    /// for cmdline ops (move, reply, archive) that must work in both
+    /// modes.
+    pub fn selected_message_row(&self) -> Option<&MessageRow> {
+        if let Some(s) = self.search.as_ref() {
+            return s.selected_row(self.selected);
+        }
+        self.selected_row().map(|t| &t.row)
+    }
+
     pub fn selected_msgid(&self) -> Option<String> {
-        self.selected_row().map(|r| r.row.msgid.clone())
+        self.selected_message_row().map(|r| r.msgid.clone())
     }
 
     pub fn selected_path(&self) -> Option<PathBuf> {
-        self.selected_row().map(|r| r.row.path.clone())
+        self.selected_message_row().map(|r| r.path.clone())
+    }
+
+    /// Number of rows currently rendered in the list pane — switches
+    /// between search results and scan threads. Drives `select_next`
+    /// and search-result count badges.
+    pub fn list_len(&self) -> usize {
+        if let Some(s) = self.search.as_ref() {
+            return s.results.len();
+        }
+        self.threaded().len()
     }
 
     /// Switch the list pane to render `(account, folder)`. Re-reads the
     /// rows from the sqlite index (cheap — no maildir rescan) and resets
     /// per-message state so the reader doesn't show stale body content
     /// for the old selection. `account = None` means the unified `[all]`
-    /// view. No-op when already on `(account, folder)`.
+    /// view. No-op when already on `(account, folder)`. Always clears
+    /// any active search — scope changes invalidate the cached haystack
+    /// and the user expects sidebar nav to drop search state.
     pub fn switch_to_scope(
         &mut self,
         account: Option<String>,
@@ -944,7 +1096,15 @@ impl InboxScreen {
         cache_path: &Path,
         status_error: &mut Option<String>,
     ) {
-        if account.as_deref() == self.current_account.as_deref() && folder == self.current_folder {
+        let same_scope =
+            account.as_deref() == self.current_account.as_deref() && folder == self.current_folder;
+        // A no-op scope-switch still drops a stray search — the user is
+        // signalling "back to the sidebar list view."
+        if self.search.is_some() {
+            self.search = None;
+            self.selected = 0;
+        }
+        if same_scope {
             return;
         }
         let idx = match Index::open(cache_path) {
@@ -1154,8 +1314,114 @@ impl InboxScreen {
         }
     }
 
+    /// Snapshot rows for the current `(account, folder)` and install a
+    /// fresh local `SearchState`. Returns `true` on success; `false`
+    /// when the index couldn't be opened (status_error already set).
+    pub fn enter_search_local(
+        &mut self,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) -> bool {
+        let idx = match Index::open(cache_path) {
+            Ok(i) => i,
+            Err(e) => {
+                *status_error = Some(format!("search: open index: {e:#}"));
+                return false;
+            }
+        };
+        let folder = self.current_folder.clone();
+        let rows = match idx.list_scope(
+            self.current_account.as_deref(),
+            Some(std::slice::from_ref(&folder)),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                *status_error = Some(format!("search: list scope: {e:#}"));
+                return false;
+            }
+        };
+        let prior = self.selected_msgid();
+        self.search = Some(Box::new(SearchState::new(
+            crate::ui::search::SearchKind::Local {
+                account: self.current_account.clone(),
+                folder,
+            },
+            rows,
+            prior,
+        )));
+        self.selected = 0;
+        self.focus = Pane::List;
+        true
+    }
+
+    /// Snapshot rows for the global-search scope and install a fresh
+    /// global `SearchState`. `priority_folders` is `[search].global_folders`;
+    /// empty means "every folder, score-only ranking."
+    pub fn enter_search_global(
+        &mut self,
+        priority_folders: &[String],
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) -> bool {
+        let idx = match Index::open(cache_path) {
+            Ok(i) => i,
+            Err(e) => {
+                *status_error = Some(format!("search: open index: {e:#}"));
+                return false;
+            }
+        };
+        let folders_filter: Option<&[String]> = if priority_folders.is_empty() {
+            None
+        } else {
+            Some(priority_folders)
+        };
+        let rows = match idx.list_scope(self.current_account.as_deref(), folders_filter) {
+            Ok(r) => r,
+            Err(e) => {
+                *status_error = Some(format!("search: list scope: {e:#}"));
+                return false;
+            }
+        };
+        let prior = self.selected_msgid();
+        self.search = Some(Box::new(SearchState::new(
+            crate::ui::search::SearchKind::Global {
+                account: self.current_account.clone(),
+                folders: priority_folders.to_vec(),
+            },
+            rows,
+            prior,
+        )));
+        self.selected = 0;
+        self.focus = Pane::List;
+        true
+    }
+
+    /// Drop the active search and restore the cursor to the pre-search
+    /// msgid when possible. No-op when search is inactive.
+    pub fn exit_search_cancel(&mut self) {
+        let Some(s) = self.search.take() else {
+            return;
+        };
+        self.selected = 0;
+        if let Some(prior) = s.prior_selected_msgid
+            && let ScanState::Ready(rows) = &self.scan
+            && let Some(i) = rows.iter().position(|t| t.row.msgid == prior)
+        {
+            self.selected = i;
+        }
+    }
+
+    /// Drop the active search without restoring prior selection — used
+    /// when the user explicitly returns to the inbox view via `Esc` in
+    /// Normal mode after committing a search.
+    pub fn clear_search(&mut self) {
+        if self.search.take().is_some() {
+            self.selected = 0;
+        }
+    }
+
     pub fn select_next(&mut self) {
-        let len = self.threaded().len();
+        let len = self.list_len();
         if len == 0 {
             return;
         }
@@ -1166,6 +1432,21 @@ impl InboxScreen {
 
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Look up a row by msgid across both the scan view and the search
+    /// haystack (when search is active). Used by flag-toggle / move
+    /// callsites that must keep the in-memory rows consistent regardless
+    /// of which view is current.
+    fn find_row(&self, msgid: &str) -> Option<&MessageRow> {
+        if let ScanState::Ready(rows) = &self.scan
+            && let Some(t) = rows.iter().find(|t| t.row.msgid == msgid)
+        {
+            return Some(&t.row);
+        }
+        self.search
+            .as_ref()
+            .and_then(|s| s.haystack.iter().find(|r| r.msgid == msgid))
     }
 }
 

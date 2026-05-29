@@ -7,11 +7,21 @@ use ratatui::widgets::{List, ListItem, ListState};
 use crate::store::index::MessageRow;
 use crate::store::thread::ThreadedRow;
 use crate::ui::app::{InboxScreen, Pane, ScanState};
+use crate::ui::search::{SearchKind, SearchState};
 use crate::ui::style::pane_block;
 
 pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
     let focused = inbox.focus == Pane::List;
     let block = pane_block("Messages", focused);
+
+    // Search results take over the list pane when active. Flat, no
+    // threading — fzf-style. Each row prefixed with the folder (and
+    // account when the scope crosses accounts) so cross-folder mixes
+    // stay readable.
+    if let Some(s) = inbox.search.as_ref() {
+        draw_search(f, area, inbox, s, block, focused);
+        return;
+    }
 
     match &inbox.scan {
         ScanState::Scanning => {
@@ -65,6 +75,123 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
             f.render_stateful_widget(widget, area, &mut state);
         }
     }
+}
+
+fn draw_search(
+    f: &mut Frame,
+    area: Rect,
+    inbox: &InboxScreen,
+    s: &SearchState,
+    block: ratatui::widgets::Block<'static>,
+    focused: bool,
+) {
+    if s.results.is_empty() {
+        let msg = if s.query.is_empty() {
+            "no messages in scope"
+        } else {
+            "no matches"
+        };
+        let widget = List::new(vec![ListItem::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(Color::DarkGray),
+        )))])
+        .block(block);
+        f.render_widget(widget, area);
+        return;
+    }
+    // Account prefix only when the haystack spans accounts (`g/` from
+    // `[all]`, or local `/` from `[all]`). Otherwise account is
+    // redundant — the badge already names it.
+    let show_account = match &s.kind {
+        SearchKind::Local { account, .. } | SearchKind::Global { account, .. } => account.is_none(),
+    };
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let items: Vec<ListItem> = s
+        .results
+        .iter()
+        .filter_map(|(i, _)| s.haystack.get(*i))
+        .map(|row| ListItem::new(render_search_row(row, show_account, inner_width)))
+        .collect();
+    let highlight = if focused {
+        Style::default()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(Color::DarkGray).fg(Color::Gray)
+    };
+    let widget = List::new(items)
+        .block(block)
+        .highlight_style(highlight)
+        .highlight_symbol("▌ ");
+    let mut state = ListState::default();
+    state.select(Some(inbox.selected.min(s.results.len().saturating_sub(1))));
+    f.render_stateful_widget(widget, area, &mut state);
+}
+
+/// Flat search-result row. Layout: `YYYY-MM-DD  acct/Folder  From            Subject`.
+/// Account is omitted when the haystack is already scoped to one account.
+fn render_search_row(row: &MessageRow, show_account: bool, width: usize) -> Line<'static> {
+    let MessageRow {
+        date,
+        from_addr,
+        subject,
+        flags,
+        account,
+        folder,
+        ..
+    } = row;
+    let date_label = format_date(*date);
+    let from = from_addr.as_deref().unwrap_or("(unknown)");
+    let subject_text = subject.as_deref().unwrap_or("(no subject)");
+    let unread = !flags.contains('S');
+    let flagged = flags.contains('F');
+    let trashed = flags.contains('T');
+
+    let flag_glyph = if flagged { "★ " } else { "  " };
+    let flag_cells: usize = 2;
+
+    let mut subj_mods = Modifier::empty();
+    if unread {
+        subj_mods |= Modifier::BOLD;
+    }
+    if trashed {
+        subj_mods |= Modifier::CROSSED_OUT;
+    }
+    let subj_color = if trashed {
+        Color::DarkGray
+    } else {
+        Color::Reset
+    };
+    let subj_style = Style::default().fg(subj_color).add_modifier(subj_mods);
+
+    let head = format!("{date_label}  ");
+    let folder_col_width: usize = 14;
+    let folder_label = if show_account {
+        format!("{account}/{folder}")
+    } else {
+        folder.clone()
+    };
+    let folder_truncated = truncate_pad(&folder_label, folder_col_width);
+    let folder_span = format!("{folder_truncated}  ");
+    let from_col_width: usize = 14;
+    let from_truncated = truncate_pad(from, from_col_width);
+    let from_span = format!("{from_truncated}  ");
+
+    let remaining = width
+        .saturating_sub(head.len())
+        .saturating_sub(folder_span.len())
+        .saturating_sub(from_span.len())
+        .saturating_sub(flag_cells);
+    let subject_truncated = truncate_to(subject_text, remaining);
+
+    Line::from(vec![
+        Span::styled(head, Style::default().fg(Color::DarkGray)),
+        Span::styled(folder_span, Style::default().fg(Color::Magenta)),
+        Span::styled(from_span, Style::default().fg(Color::Cyan)),
+        Span::styled(flag_glyph.to_string(), Style::default().fg(Color::Yellow)),
+        Span::styled(subject_truncated, subj_style),
+    ])
 }
 
 fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {

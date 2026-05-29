@@ -9,6 +9,7 @@ pub mod images;
 pub mod keys;
 pub mod list;
 pub mod reader;
+pub mod search;
 pub mod style;
 pub mod tabs;
 pub mod text_input;

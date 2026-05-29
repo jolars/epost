@@ -8,7 +8,7 @@ use crate::config;
 use crate::config::Config;
 use crate::mail::compose::{self as mail_compose, Draft};
 use crate::mail::parse;
-use crate::ui::app::{App, Mode};
+use crate::ui::app::{App, Mode, Screen};
 use crate::ui::browser;
 use crate::ui::compose::{ComposeScreen, ComposeStatus};
 
@@ -34,6 +34,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(app.link_pick_buf.clone()),
             Span::styled("_", Style::default().fg(Color::Yellow)),
         ]),
+        Mode::Search => search_line(app),
         _ => {
             if let Some(err) = &app.status_error {
                 Line::from(Span::styled(
@@ -56,7 +57,36 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::Normal => "-- NORMAL --",
         Mode::Command => "-- COMMAND --",
         Mode::LinkPick => "-- LINK PICK --",
+        Mode::Search => "-- SEARCH --",
     }
+}
+
+/// `:`-style strip for the active search: `/needle_  (12)` (local) or
+/// `g/needle_  (12)` (global). Result count is the live match count
+/// after the matcher ran on the last keystroke.
+fn search_line(app: &App) -> Line<'static> {
+    let Some(Screen::Inbox(inbox)) = app.screens.first() else {
+        return Line::from(Span::raw(""));
+    };
+    let Some(s) = inbox.search.as_ref() else {
+        return Line::from(Span::raw(""));
+    };
+    let prefix = if s.kind.is_global() { "g/" } else { "/" };
+    let buf = s.query.as_str();
+    let (before, after) = buf.split_at(s.query.cursor());
+    let count = format!("  ({})", s.results.len());
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(Color::Yellow)),
+        Span::raw(before.to_string()),
+        Span::styled(
+            "_",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+        Span::raw(after.to_string()),
+        Span::styled(count, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 /// Parse a command-line input (without the leading `:`) and execute it

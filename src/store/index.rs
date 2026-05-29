@@ -160,6 +160,58 @@ impl Index {
         }
     }
 
+    /// Pull every row in `(account, folders)` ordered by date DESC. Used
+    /// by the `/` and `g/` search modes to seed an in-memory haystack
+    /// for fuzzy matching: `account = None` crosses accounts, `folders =
+    /// None` crosses every folder. The full row set fits comfortably in
+    /// memory for typical mailboxes (≤50K × ~500 B) and avoids re-querying
+    /// per keystroke.
+    pub fn list_scope(
+        &self,
+        account: Option<&str>,
+        folders: Option<&[String]>,
+    ) -> Result<Vec<MessageRow>> {
+        let cols = "msgid, account, folder, path, date, from_addr, subject, in_reply, refs, flags";
+        // Build the WHERE + params on the fly. SQLite caps SQLITE_MAX_VARIABLE_NUMBER
+        // at 999 by default; the global_folders config tops out at a handful in
+        // practice, so a single IN list is fine.
+        let mut sql = format!("SELECT {cols} FROM msg");
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(acc) = account {
+            where_parts.push(format!("account = ?{}", params_vec.len() + 1));
+            params_vec.push(acc.to_string().into());
+        }
+        if let Some(folders) = folders {
+            if folders.is_empty() {
+                // No folders is no scope — return empty rather than every row.
+                return Ok(Vec::new());
+            }
+            let placeholders: Vec<String> = (0..folders.len())
+                .map(|i| format!("?{}", params_vec.len() + 1 + i))
+                .collect();
+            where_parts.push(format!("folder IN ({})", placeholders.join(",")));
+            for f in folders {
+                params_vec.push(f.clone().into());
+            }
+        }
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        sql.push_str(" ORDER BY date DESC");
+        let mut stmt = self.conn.prepare(&sql).context("preparing list_scope")?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), row_from_sqlite)
+            .context("executing list_scope")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collecting list_scope rows")
+    }
+
     /// Per-folder counts (total and unread). `account = None` aggregates
     /// across accounts (today's default — two INBOXes merge into one row);
     /// `Some(name)` restricts to that account. "Unread" is the absence of
@@ -396,6 +448,52 @@ mod tests {
         // Sent is personal-only.
         assert_eq!(stats[1].folder, "Sent");
         assert_eq!(stats[1].total, 1);
+    }
+
+    #[test]
+    fn list_scope_none_account_none_folders_returns_all_rows() {
+        let idx = seed_two_accounts();
+        let rows = idx.list_scope(None, None).unwrap();
+        // 5 rows seeded total; date DESC.
+        let ids: Vec<&str> = rows.iter().map(|r| r.msgid.as_str()).collect();
+        assert_eq!(ids, vec!["<p3>", "<w2>", "<p2>", "<w1>", "<p1>"]);
+    }
+
+    #[test]
+    fn list_scope_filters_by_account() {
+        let idx = seed_two_accounts();
+        let rows = idx.list_scope(Some("personal"), None).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.msgid.as_str()).collect();
+        // personal across all folders: <p3> Sent, then <p2>, <p1> INBOX.
+        assert_eq!(ids, vec!["<p3>", "<p2>", "<p1>"]);
+    }
+
+    #[test]
+    fn list_scope_filters_by_folder_list() {
+        let idx = seed_two_accounts();
+        let folders = vec!["INBOX".to_string(), "Sent".to_string()];
+        let rows = idx.list_scope(None, Some(&folders)).unwrap();
+        // Everything (all folders are in the list).
+        assert_eq!(rows.len(), 5);
+        let rows = idx.list_scope(None, Some(&["Sent".to_string()])).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.msgid.as_str()).collect();
+        assert_eq!(ids, vec!["<p3>"]);
+    }
+
+    #[test]
+    fn list_scope_account_and_folders_combine() {
+        let idx = seed_two_accounts();
+        let folders = vec!["INBOX".to_string()];
+        let rows = idx.list_scope(Some("work"), Some(&folders)).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.msgid.as_str()).collect();
+        assert_eq!(ids, vec!["<w2>", "<w1>"]);
+    }
+
+    #[test]
+    fn list_scope_empty_folder_list_returns_nothing() {
+        let idx = seed_two_accounts();
+        let rows = idx.list_scope(None, Some(&[])).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]

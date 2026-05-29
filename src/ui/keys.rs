@@ -36,6 +36,7 @@ pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
         Mode::Normal => normal(app, cfg, k),
         Mode::Command => command(app, cfg, k),
         Mode::LinkPick => link_pick(app, cfg, k),
+        Mode::Search => search(app, cfg, k),
     }
 }
 
@@ -67,12 +68,47 @@ fn global(app: &mut App, k: KeyEvent) -> bool {
 }
 
 fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
+    // `/` and `g/` enter Search mode (local / global). Handled before
+    // the `q` / `:` early-returns so the pending-`g` state can settle
+    // on the next key. Only applies to the inbox screen.
+    if matches!(app.screens.get(app.active), Some(Screen::Inbox(_))) {
+        if app.pending_g {
+            app.pending_g = false;
+            if k.code == KeyCode::Char('/') {
+                app.enter_search_global(cfg);
+                return;
+            }
+            if k.code == KeyCode::Char('g') {
+                // `gg` → scroll to top in whichever pane supports it.
+                // Reader: jump body to row 0. (Lists use a different
+                // convention today and aren't wired here.)
+                let inbox = app.inbox_mut();
+                if inbox.focus == Pane::Reader {
+                    inbox.reader_scroll = 0;
+                }
+                return;
+            }
+            // Any other key falls through to the rest of Normal mode
+            // (so e.g. `g` then `j` still moves selection).
+        }
+        if k.code == KeyCode::Char('/') && !k.modifiers.intersects(KeyModifiers::CONTROL) {
+            app.enter_search_local();
+            return;
+        }
+        if k.code == KeyCode::Char('g') && !k.modifiers.intersects(KeyModifiers::CONTROL) {
+            app.pending_g = true;
+            return;
+        }
+    }
+
     // `q` and `:` are global in Normal mode, regardless of active screen.
     if k.code == KeyCode::Char('q') && !k.modifiers.contains(KeyModifiers::CONTROL) {
         // In a compose tab, `q` should type a literal `q` into the
         // focused field — never quit the app. Inbox keeps the old
         // semantics.
         if !matches!(app.screens.get(app.active), Some(Screen::Compose(_))) {
+            // Esc-after-commit: if a search is pinned and the user hits
+            // `q`, that's still quit. Search clearing lives on Esc.
             app.quit = true;
             return;
         }
@@ -158,6 +194,10 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             KeyCode::Char('l') | KeyCode::Enter if app.inbox().reader_visible => {
                 app.inbox_mut().focus = Pane::Reader;
             }
+            KeyCode::Esc if app.inbox().search.is_some() => app.clear_search(),
+            KeyCode::Esc if app.inbox().sidebar_visible => {
+                app.inbox_mut().focus = Pane::Folders;
+            }
             _ => {}
         },
         Pane::Reader => match k.code {
@@ -168,6 +208,12 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             KeyCode::Char('k') => {
                 let inbox = app.inbox_mut();
                 inbox.reader_scroll = inbox.reader_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('G') => {
+                let inbox = app.inbox_mut();
+                inbox.reader_scroll = inbox
+                    .last_reader_body_lines
+                    .saturating_sub(inbox.last_reader_inner_height);
             }
             KeyCode::Char('f') => {
                 app.link_pick_buf.clear();
@@ -191,6 +237,10 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
         Pane::Folders => match k.code {
             KeyCode::Char('j') => app.cycle_folder(true),
             KeyCode::Char('k') => app.cycle_folder(false),
+            KeyCode::Char('l') | KeyCode::Enter if app.inbox().list_visible => {
+                app.inbox_mut().focus = Pane::List;
+            }
+            KeyCode::Esc if app.inbox().search.is_some() => app.clear_search(),
             _ => {}
         },
     }
@@ -209,6 +259,41 @@ fn command(app: &mut App, cfg: &Config, k: KeyEvent) {
             app.cmdline.handle(k);
         }
     }
+}
+
+/// `Mode::Search` keymap: text input edits the query (re-ranking each
+/// keystroke), `Esc` cancels (restoring the prior selection), `Enter`
+/// commits (returns to Normal with results pinned in the list pane).
+/// Up/Down (and Ctrl-N/Ctrl-P, fzf-style) walk the result list without
+/// leaving the search field — the reader pane follows automatically
+/// via the next-tick `ensure_body_for_selection`.
+fn search(app: &mut App, _cfg: &Config, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc => app.exit_search_cancel(),
+        KeyCode::Enter => app.exit_search_commit(),
+        KeyCode::Backspace if search_query_is_empty(app) => app.exit_search_cancel(),
+        KeyCode::Down => app.select_next(),
+        KeyCode::Up => app.select_prev(),
+        KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => app.select_next(),
+        KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => app.select_prev(),
+        _ => {
+            let inbox = app.inbox_mut();
+            let Some(s) = inbox.search.as_mut() else {
+                return;
+            };
+            if s.query.handle(k) {
+                s.refresh();
+                inbox.selected = 0;
+            }
+        }
+    }
+}
+
+fn search_query_is_empty(app: &App) -> bool {
+    app.inbox()
+        .search
+        .as_ref()
+        .is_some_and(|s| s.query.is_empty())
 }
 
 fn link_pick(app: &mut App, cfg: &Config, k: KeyEvent) {

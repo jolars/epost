@@ -20,6 +20,12 @@ prefer = "html"
 # so dev runs and tests don't fire a real browser.
 browser = ["./dev/browser-stub"]
 
+[search]
+# Folders covered by `g/` (global) search, in priority order. Empty list
+# means "every folder, score-only ranking." Trash/Spam are excluded by
+# default; add them here if you want them in the global haystack.
+global_folders = ["INBOX", "Archive", "Sent"]
+
 [images]
 # `auto` probes the terminal for kitty / iTerm2 / sixel; if the probe
 # fails or `[images].protocol = "off"`, every inline image renders as

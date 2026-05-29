@@ -81,14 +81,12 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     let mut laid: Option<LaidOutBody> = None;
     let header_lines: Vec<Line<'static>>;
 
-    let lines: Vec<Line<'static>> = match &inbox.scan {
-        ScanState::Scanning => vec![dim_line("(scanning maildir…)")],
-        ScanState::Failed(err) => vec![Line::from(Span::styled(
-            format!("scan failed: {err}"),
-            Style::default().fg(Color::Red),
-        ))],
-        ScanState::Ready(rows) if rows.is_empty() => vec![dim_line("(nothing to read)")],
-        ScanState::Ready(_) => match &inbox.parsed {
+    // Gate on the search-aware selected row, not raw `inbox.scan`: a
+    // global-search result may live in a folder whose scan isn't the
+    // current scope's, so the old `match &inbox.scan` rendered "nothing
+    // to read" for perfectly valid selections.
+    let lines: Vec<Line<'static>> = if inbox.selected_message_row().is_some() {
+        match &inbox.parsed {
             Some(parsed) => {
                 let mut out = render_headers(inbox);
                 out.push(Line::raw(""));
@@ -123,8 +121,26 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                 combined
             }
             None => render_headers(inbox),
-        },
+        }
+    } else if inbox.search.is_some() {
+        vec![dim_line("(no matches)")]
+    } else {
+        match &inbox.scan {
+            ScanState::Scanning => vec![dim_line("(scanning maildir…)")],
+            ScanState::Failed(err) => vec![Line::from(Span::styled(
+                format!("scan failed: {err}"),
+                Style::default().fg(Color::Red),
+            ))],
+            ScanState::Ready(_) => vec![dim_line("(nothing to read)")],
+        }
     };
+
+    // Stash body height + inner area for the `G` keybinding so the
+    // keymap can pick a bottom-scroll position without re-running
+    // layout. Counts pre-wrap `Line`s — heavy CSS wrap undershoots,
+    // but `j` from there is fine.
+    inbox.last_reader_body_lines = lines.len().min(u16::MAX as usize) as u16;
+    inbox.last_reader_inner_height = area.height.saturating_sub(2);
 
     let widget = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -182,23 +198,13 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
 }
 
 fn selected_subject(inbox: &InboxScreen) -> Option<String> {
-    match &inbox.scan {
-        ScanState::Ready(rows) if !rows.is_empty() => {
-            let i = inbox.selected.min(rows.len() - 1);
-            rows[i].row.subject.clone()
-        }
-        _ => None,
-    }
+    inbox.selected_message_row().and_then(|r| r.subject.clone())
 }
 
 fn render_headers(inbox: &InboxScreen) -> Vec<Line<'static>> {
-    let ScanState::Ready(rows) = &inbox.scan else {
+    let Some(row) = inbox.selected_message_row() else {
         return Vec::new();
     };
-    if rows.is_empty() {
-        return Vec::new();
-    }
-    let row = &rows[inbox.selected.min(rows.len() - 1)].row;
     let mut out = Vec::with_capacity(6);
     out.push(header_line(
         "From",
