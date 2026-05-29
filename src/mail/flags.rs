@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::store::watch::SelfWrites;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FlagOp {
     Add,
@@ -108,7 +110,24 @@ pub fn rename_for_flags(current_path: &Path, target_cur_dir: &Path, new_flags: &
 ///
 /// On success returns the new path and the canonical flag string so the
 /// caller can mirror both into the index without re-reading the filename.
+///
+/// Tested primitive only: production callers go through
+/// `set_flag_recorded` so the inotify watcher can suppress echoes.
+#[cfg(test)]
 pub fn set_flag(
+    current_path: &Path,
+    flag: char,
+    op: FlagOp,
+) -> Result<(PathBuf, String), FlagError> {
+    let (new_path, new_flags) = flag_change_target(current_path, flag, op)?;
+    do_rename(current_path, &new_path)?;
+    Ok((new_path, new_flags))
+}
+
+/// Validate the maildir layout of `current_path` and compute the
+/// destination path + canonical flag set after applying `op` to `flag`.
+/// Pure: does not touch the filesystem.
+fn flag_change_target(
     current_path: &Path,
     flag: char,
     op: FlagOp,
@@ -135,12 +154,15 @@ pub fn set_flag(
     let current_flags = parse_flags(name);
     let new_flags = apply_op(&current_flags, flag, op);
     let new_path = rename_for_flags(current_path, &target_cur_dir, &new_flags);
-    do_rename(current_path, &new_path)?;
     Ok((new_path, new_flags))
 }
 
 /// Move a message file into a different folder's `cur/`, preserving (or
 /// rewriting) its flag suffix.
+///
+/// Tested primitive only: production callers go through
+/// `move_to_folder_recorded`.
+#[cfg(test)]
 pub fn move_to_folder(
     current_path: &Path,
     target_cur_dir: &Path,
@@ -149,6 +171,50 @@ pub fn move_to_folder(
     let new_path = rename_for_flags(current_path, target_cur_dir, new_flags);
     do_rename(current_path, &new_path)?;
     Ok(new_path)
+}
+
+/// Same as `set_flag`, but records both the source and destination on
+/// `SelfWrites` *before* the rename so the inotify watcher can never see
+/// our own write as an external event. On rename failure both
+/// registrations are consumed so a future genuine event isn't swallowed.
+pub fn set_flag_recorded(
+    current_path: &Path,
+    flag: char,
+    op: FlagOp,
+    sw: &SelfWrites,
+) -> Result<(PathBuf, String), FlagError> {
+    let (new_path, new_flags) = flag_change_target(current_path, flag, op)?;
+    sw.record(current_path);
+    sw.record(&new_path);
+    match do_rename(current_path, &new_path) {
+        Ok(()) => Ok((new_path, new_flags)),
+        Err(e) => {
+            sw.consume(current_path);
+            sw.consume(&new_path);
+            Err(e)
+        }
+    }
+}
+
+/// Same as `move_to_folder`, but records both src and dst on
+/// `SelfWrites` before the rename (see `set_flag_recorded`).
+pub fn move_to_folder_recorded(
+    current_path: &Path,
+    target_cur_dir: &Path,
+    new_flags: &str,
+    sw: &SelfWrites,
+) -> Result<PathBuf, FlagError> {
+    let new_path = rename_for_flags(current_path, target_cur_dir, new_flags);
+    sw.record(current_path);
+    sw.record(&new_path);
+    match do_rename(current_path, &new_path) {
+        Ok(()) => Ok(new_path),
+        Err(e) => {
+            sw.consume(current_path);
+            sw.consume(&new_path);
+            Err(e)
+        }
+    }
 }
 
 /// Create `cur/`, `new/`, and `tmp/` under `folder_root` if missing. The
@@ -419,6 +485,50 @@ mod tests {
         assert!(root.join("cur").is_dir());
         assert!(root.join("new").is_dir());
         assert!(root.join("tmp").is_dir());
+    }
+
+    #[test]
+    fn set_flag_recorded_registers_both_paths_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let root = folder(&tmp, "INBOX");
+        let src = deliver_cur(&root, "1779.M0P1.host:2,R");
+        let sw = SelfWrites::new();
+
+        let (new_path, new_flags) = set_flag_recorded(&src, 'S', FlagOp::Add, &sw).unwrap();
+        assert_eq!(new_flags, "RS");
+        // Both src and dst recorded so the watcher swallows the
+        // MOVED_FROM + MOVED_TO pair.
+        assert!(sw.consume(&src));
+        assert!(sw.consume(&new_path));
+    }
+
+    #[test]
+    fn set_flag_recorded_consumes_on_rename_failure() {
+        let tmp = TempDir::new().unwrap();
+        let root = folder(&tmp, "INBOX");
+        let src = deliver_new(&root, "1779.M0P1.host");
+        std::fs::write(root.join("cur").join("1779.M0P1.host:2,S"), b"squat").unwrap();
+        let sw = SelfWrites::new();
+
+        let expected_dst = root.join("cur").join("1779.M0P1.host:2,S");
+        let err = set_flag_recorded(&src, 'S', FlagOp::Add, &sw).unwrap_err();
+        assert!(matches!(err, FlagError::TargetExists(_)));
+        // Both registrations cleaned up so a later genuine event isn't lost.
+        assert!(!sw.consume(&src));
+        assert!(!sw.consume(&expected_dst));
+    }
+
+    #[test]
+    fn move_to_folder_recorded_registers_both_paths_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let inbox = folder(&tmp, "INBOX");
+        let archive = folder(&tmp, ".Archive");
+        let src = deliver_cur(&inbox, "1779.M0P1.host:2,RS");
+        let sw = SelfWrites::new();
+
+        let new = move_to_folder_recorded(&src, &archive.join("cur"), "RS", &sw).unwrap();
+        assert!(sw.consume(&src));
+        assert!(sw.consume(&new));
     }
 
     #[test]

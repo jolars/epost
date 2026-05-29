@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -14,8 +15,9 @@ use crate::mail::parse;
 use crate::store::index::{FolderStat, Index, MessageRow};
 use crate::store::scan::{self, ScanResult};
 use crate::store::thread::{ThreadedRow, build_threads};
-use crate::store::watch::SelfWrites;
+use crate::store::watch::{self, SelfWrites, Watcher, WatcherConfig, WatcherEvent};
 use crate::ui::compose::{ComposeScreen, ComposeStatus};
+use crate::ui::events::AppEvent;
 use crate::ui::images::{self, ImageKey, ResolvedImage};
 use crate::ui::text_input::TextInput;
 use crate::ui::{cmdline, compose, folders, list, reader, tabs};
@@ -138,23 +140,56 @@ pub struct InboxScreen {
     /// pane) cycle through `folder_stats` and re-fetch from the index.
     pub current_folder: String,
     scan_rx: Option<Receiver<ScanResult>>,
+    /// `notify`-backed maildir watcher. `None` when `[watch].enabled =
+    /// false`, no accounts are configured, or `notify::Watcher::new`
+    /// failed (degraded mode: startup full rescan only, no live updates).
+    /// Lives on `InboxScreen` so its `Drop` releases inotify FDs when
+    /// the screen goes away.
+    watcher: Option<Watcher>,
+    /// Receiver half of the watcher's flush channel. Drained each tick
+    /// into `pending_dirty`.
+    watch_rx: Option<Receiver<WatcherEvent>>,
+    /// Folder keys waiting to be rescanned. Accumulates while a
+    /// rescan is in flight so we never overlap two rescans; the next
+    /// `poll_watch` after the in-flight rescan completes fires one
+    /// combined rescan over the union.
+    pending_dirty: HashSet<(String, String)>,
+    /// Receiver for the per-folder rescan worker kicked from
+    /// `poll_watch`. Separate from `scan_rx` so the startup full scan
+    /// and watcher-driven rescans don't fight over the same channel.
+    rescan_rx: Option<Receiver<ScanResult>>,
+    /// The dirty set the in-flight `rescan_rx` covers, so
+    /// `apply_rescan` knows whether the current list view was
+    /// re-walked and needs its rows replaced.
+    rescan_in_flight: HashSet<(String, String)>,
+    /// One-shot warning surfaced to the cmdline status row when the
+    /// watcher failed to start (commonly `fs.inotify.max_user_watches`
+    /// exhausted). `None` once consumed by `App::new`.
+    pub watcher_warning: Option<String>,
 }
 
 impl App {
-    pub fn new(cfg: &Config, cache_path: PathBuf, picker: Option<Picker>) -> Self {
-        let inbox = InboxScreen::new(cfg, &cache_path);
+    pub fn new(
+        cfg: &Config,
+        cache_path: PathBuf,
+        picker: Option<Picker>,
+        event_tx: Option<Sender<AppEvent>>,
+    ) -> Self {
+        let self_writes = SelfWrites::new();
+        let inbox = InboxScreen::new(cfg, &cache_path, self_writes.clone(), event_tx);
+        let watcher_warning = inbox.watcher_warning.clone();
         Self {
             mode: Mode::Normal,
             cmdline: TextInput::new(),
             link_pick_buf: String::new(),
-            status_error: None,
+            status_error: watcher_warning,
             quit: false,
             screens: vec![Screen::Inbox(inbox)],
             active: 0,
             picker,
             image_max_height_cells: cfg.images.max_height_cells,
             cache_path,
-            self_writes: SelfWrites::new(),
+            self_writes,
         }
     }
 
@@ -253,6 +288,23 @@ impl App {
 
     pub fn poll_scan(&mut self) {
         self.inbox_mut().poll_scan();
+    }
+
+    /// Drain the inotify watcher channel into `pending_dirty`, harvest
+    /// any completed per-folder rescan, and kick a fresh rescan when
+    /// there's work and no in-flight worker. Called every main-loop
+    /// tick alongside `poll_scan`.
+    pub fn poll_watch(&mut self, cfg: &Config) {
+        let Self {
+            screens,
+            cache_path,
+            status_error,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        inbox.poll_watch(cfg, cache_path, status_error);
     }
 
     /// Tab navigation. With only the inbox screen in Step 1 / Step 2,
@@ -416,7 +468,12 @@ impl App {
 }
 
 impl InboxScreen {
-    pub fn new(cfg: &Config, cache_path: &Path) -> Self {
+    pub fn new(
+        cfg: &Config,
+        cache_path: &Path,
+        self_writes: SelfWrites,
+        event_tx: Option<Sender<AppEvent>>,
+    ) -> Self {
         let sidebar_visible = cfg.ui.sidebar;
         let list_visible = cfg.ui.list;
         let reader_visible = cfg.ui.reader;
@@ -430,13 +487,42 @@ impl InboxScreen {
         let scan_rx = if accounts.is_empty() {
             None
         } else {
-            Some(scan::start_worker(accounts, cache_path.to_path_buf()))
+            Some(scan::start_worker(
+                accounts.clone(),
+                cache_path.to_path_buf(),
+            ))
         };
         let scan = if scan_rx.is_some() {
             ScanState::Scanning
         } else {
             ScanState::Ready(Vec::new())
         };
+
+        // Start the inotify watcher when the user hasn't disabled it,
+        // accounts are configured, and an event channel is available
+        // (in tests no event channel is plumbed in). On failure surface
+        // a one-shot warning and degrade to "no live updates" rather
+        // than crashing — startup full rescan already ran.
+        let mut watcher: Option<Watcher> = None;
+        let mut watch_rx: Option<Receiver<WatcherEvent>> = None;
+        let mut watcher_warning: Option<String> = None;
+        if cfg.watch.enabled
+            && !accounts.is_empty()
+            && let Some(tx) = event_tx
+        {
+            let wcfg = WatcherConfig {
+                debounce: Duration::from_millis(cfg.watch.debounce_ms),
+            };
+            match watch::start(&accounts, self_writes, wcfg, tx) {
+                Ok((w, rx)) => {
+                    watcher = Some(w);
+                    watch_rx = Some(rx);
+                }
+                Err(e) => {
+                    watcher_warning = Some(format!("watcher disabled: {e:#}"));
+                }
+            }
+        }
 
         Self {
             focus,
@@ -455,6 +541,12 @@ impl InboxScreen {
             folder_stats: Vec::new(),
             current_folder: "INBOX".to_string(),
             scan_rx,
+            watcher,
+            watch_rx,
+            pending_dirty: HashSet::new(),
+            rescan_rx: None,
+            rescan_in_flight: HashSet::new(),
+            watcher_warning,
         }
     }
 
@@ -541,10 +633,8 @@ impl InboxScreen {
             return;
         }
         let path = row.path.clone();
-        match flags::set_flag(&path, 'S', FlagOp::Add) {
+        match flags::set_flag_recorded(&path, 'S', FlagOp::Add, self_writes) {
             Ok((new_path, new_flags)) => {
-                self_writes.record(&path);
-                self_writes.record(&new_path);
                 self.apply_flag_change(msgid, &new_path, &new_flags, cache_path, status_error);
             }
             Err(e) => {
@@ -567,10 +657,8 @@ impl InboxScreen {
             return;
         };
         let path = row.path.clone();
-        match flags::set_flag(&path, flag, FlagOp::Toggle) {
+        match flags::set_flag_recorded(&path, flag, FlagOp::Toggle, self_writes) {
             Ok((new_path, new_flags)) => {
-                self_writes.record(&path);
-                self_writes.record(&new_path);
                 self.apply_flag_change(&msgid, &new_path, &new_flags, cache_path, status_error);
             }
             Err(e) => {
@@ -614,10 +702,14 @@ impl InboxScreen {
             return;
         }
 
-        match flags::move_to_folder(&path, &target_cur, &row_flags) {
+        match flags::move_to_folder_recorded(&path, &target_cur, &row_flags, self_writes) {
             Ok(new_path) => {
-                self_writes.record(&path);
-                self_writes.record(&new_path);
+                // Auto-register the destination folder with the watcher
+                // so MOVED_TO events from external clients into it are
+                // tracked. Idempotent: a no-op when already watched.
+                if let Some(w) = self.watcher.as_ref() {
+                    w.register_folder(&account_name, target_folder, &folder_root);
+                }
                 self.drop_row_after_move(
                     &msgid,
                     target_folder,
@@ -875,6 +967,91 @@ impl InboxScreen {
         }
     }
 
+    pub fn poll_watch(
+        &mut self,
+        cfg: &Config,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) {
+        // 1. Drain the watcher channel into pending_dirty.
+        if let Some(rx) = self.watch_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(WatcherEvent::FoldersDirty(set)) => self.pending_dirty.extend(set),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.watch_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. Drain any in-flight rescan result.
+        if let Some(rx) = self.rescan_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    let covered = std::mem::take(&mut self.rescan_in_flight);
+                    self.apply_rescan(data, &covered);
+                    self.rescan_rx = None;
+                }
+                Ok(Err(msg)) => {
+                    *status_error = Some(format!("rescan: {msg}"));
+                    self.rescan_rx = None;
+                    self.rescan_in_flight.clear();
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.rescan_rx = None;
+                    self.rescan_in_flight.clear();
+                }
+            }
+        }
+
+        // 3. Kick a fresh rescan when there's pending work and no
+        //    in-flight worker. Coalesce all pending dirt into one call.
+        if self.rescan_rx.is_none() && !self.pending_dirty.is_empty() {
+            let dirty = std::mem::take(&mut self.pending_dirty);
+            let accounts: HashMap<String, PathBuf> = cfg
+                .accounts
+                .iter()
+                .map(|(n, a)| (n.clone(), a.maildir.clone()))
+                .collect();
+            self.rescan_in_flight = dirty.clone();
+            self.rescan_rx = Some(scan::rescan_folders(
+                cache_path.to_path_buf(),
+                accounts,
+                dirty,
+                self.current_folder.clone(),
+            ));
+        }
+    }
+
+    /// Apply a per-folder rescan payload. `folder_stats` is always
+    /// replaced (counts may have shifted). The list `scan` is replaced
+    /// only when the currently-viewed folder was actually re-walked
+    /// (i.e. `current_folder` is in `dirty`); otherwise the rescan
+    /// affected other folders and we leave the visible rows alone.
+    /// Selection is preserved by `msgid` when possible, snapping to row
+    /// 0 when the previously-selected message is no longer present.
+    fn apply_rescan(&mut self, data: scan::ScanData, dirty: &HashSet<(String, String)>) {
+        self.folder_stats = data.folder_stats;
+        let view_touched = dirty
+            .iter()
+            .any(|(_, folder)| folder == &self.current_folder);
+        if !view_touched {
+            return;
+        }
+        let old_msgid = self.selected_msgid();
+        self.scan = ScanState::Ready(data.threads);
+        self.selected = match (old_msgid, &self.scan) {
+            (Some(mid), ScanState::Ready(rows)) => {
+                rows.iter().position(|r| r.row.msgid == mid).unwrap_or(0)
+            }
+            _ => 0,
+        };
+    }
+
     pub fn cycle_focus(&mut self, forward: bool) {
         let ring = [Pane::Folders, Pane::List, Pane::Reader];
         let n = ring.len();
@@ -1120,7 +1297,12 @@ mod focus_nav_tests {
         cfg.ui.sidebar = sidebar;
         cfg.ui.list = list;
         cfg.ui.reader = reader;
-        InboxScreen::new(&cfg, Path::new("/tmp/epost-test.sqlite"))
+        InboxScreen::new(
+            &cfg,
+            Path::new("/tmp/epost-test.sqlite"),
+            SelfWrites::new(),
+            None,
+        )
     }
 
     #[test]
@@ -1271,7 +1453,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = one_account_config(&tmp);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
         assert!(matches!(app.inbox().scan, ScanState::Ready(_)));
 
@@ -1306,7 +1488,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = one_account_config(&tmp);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         app.ensure_body_for_selection();
@@ -1329,7 +1511,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = one_account_config(&tmp);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         let start = app.inbox().threaded().first().expect("row").row.clone();
@@ -1361,7 +1543,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = one_account_config(&tmp);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         app.toggle_flag_selected('F');
@@ -1391,7 +1573,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = one_account_config(&tmp);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         app.toggle_flag_selected('T');
@@ -1418,7 +1600,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = one_account_config(&tmp);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         let watcher_view = app.self_writes.clone();
@@ -1470,7 +1652,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = account_with_folders(&tmp, Some("Archive"), None);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache.clone(), None);
+        let mut app = App::new(&cfg, cache.clone(), None, None);
         drain_scan(&mut app);
         let msgid = app.inbox().selected_msgid().expect("a selected row");
 
@@ -1503,7 +1685,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = account_with_folders(&tmp, None, Some("Trash"));
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         cmdline::dispatch("trash", &mut app, &cfg);
@@ -1534,7 +1716,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
             "precondition: .Archive must be absent before the move"
         );
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         cmdline::dispatch("archive", &mut app, &cfg);
@@ -1551,7 +1733,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = account_with_folders(&tmp, None, None);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         cmdline::dispatch("archive", &mut app, &cfg);
@@ -1579,7 +1761,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = account_with_folders(&tmp, None, None);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         cmdline::dispatch("mv Receipts", &mut app, &cfg);
@@ -1602,7 +1784,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = account_with_folders(&tmp, None, None);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         cmdline::dispatch("mv", &mut app, &cfg);
@@ -1619,7 +1801,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = account_with_folders(&tmp, Some("Archive"), None);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         let watcher_view = app.self_writes.clone();
@@ -1668,7 +1850,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = one_account_config(&tmp);
         let cache = tmp.path().join("index.sqlite");
 
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         drain_scan(&mut app);
 
         assert_eq!(app.inbox().current_folder, "INBOX");
@@ -1703,8 +1885,110 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cfg = Config::default();
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("index.sqlite");
-        let mut app = App::new(&cfg, cache, None);
+        let mut app = App::new(&cfg, cache, None, None);
         app.cycle_folder(true);
         assert_eq!(app.inbox().current_folder, "INBOX");
+    }
+
+    #[test]
+    fn poll_watch_rescan_preserves_selection_by_msgid() {
+        // Two INBOX messages, select the second by msgid. Externally
+        // delete the first, mark INBOX dirty, poll_watch fires a
+        // rescan — selection must follow msgid to the new index (now
+        // row 0).
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("index.sqlite");
+
+        let inbox = tmp.path().join("Mail").join("personal");
+        fs::create_dir_all(inbox.join("cur")).unwrap();
+        fs::create_dir_all(inbox.join("new")).unwrap();
+        let m1 = inbox.join("cur").join("1.M0.h:2,S");
+        let m2 = inbox.join("cur").join("2.M0.h:2,S");
+        fs::write(
+            &m1,
+            b"Message-ID: <a@x>\r\nDate: Thu, 1 Jan 1970 00:00:00 +0000\r\n\r\n",
+        )
+        .unwrap();
+        fs::write(
+            &m2,
+            b"Message-ID: <b@x>\r\nDate: Fri, 2 Jan 1970 00:00:00 +0000\r\n\r\n",
+        )
+        .unwrap();
+
+        let cfg = one_account_config(&tmp);
+        let mut app = App::new(&cfg, cache.clone(), None, None);
+        drain_scan(&mut app);
+
+        // The list orders by date DESC, so <b> is row 0, <a> is row 1.
+        // Select <a> (row 1) so the test exercises msgid-follow.
+        app.inbox_mut().selected = 1;
+        let pre = app.inbox().selected_msgid().unwrap();
+        assert_eq!(pre, "a@x");
+
+        // Externally delete <b> and dirty-mark INBOX.
+        fs::remove_file(&m2).unwrap();
+        app.inbox_mut()
+            .pending_dirty
+            .insert(("personal".into(), "INBOX".into()));
+
+        // Pump poll_watch until the rescan completes.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.poll_watch(&cfg);
+            if app.inbox().rescan_rx.is_none() && app.inbox().threaded().len() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.inbox().threaded().len(), 1);
+        assert_eq!(app.inbox().selected_msgid().as_deref(), Some("a@x"));
+        assert_eq!(app.inbox().selected, 0, "msgid stayed, index updated");
+    }
+
+    #[test]
+    fn poll_watch_rescan_snaps_to_zero_when_selected_msgid_gone() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("index.sqlite");
+
+        let inbox = tmp.path().join("Mail").join("personal");
+        fs::create_dir_all(inbox.join("cur")).unwrap();
+        fs::create_dir_all(inbox.join("new")).unwrap();
+        let m1 = inbox.join("cur").join("1.M0.h:2,S");
+        let m2 = inbox.join("cur").join("2.M0.h:2,S");
+        fs::write(
+            &m1,
+            b"Message-ID: <a@x>\r\nDate: Thu, 1 Jan 1970 00:00:00 +0000\r\n\r\n",
+        )
+        .unwrap();
+        fs::write(
+            &m2,
+            b"Message-ID: <b@x>\r\nDate: Fri, 2 Jan 1970 00:00:00 +0000\r\n\r\n",
+        )
+        .unwrap();
+
+        let cfg = one_account_config(&tmp);
+        let mut app = App::new(&cfg, cache.clone(), None, None);
+        drain_scan(&mut app);
+
+        // Select <a> (row 1, older), then delete <a> externally and
+        // expect selected to snap to 0 after the rescan.
+        app.inbox_mut().selected = 1;
+        assert_eq!(app.inbox().selected_msgid().as_deref(), Some("a@x"));
+        fs::remove_file(&m1).unwrap();
+        app.inbox_mut()
+            .pending_dirty
+            .insert(("personal".into(), "INBOX".into()));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.poll_watch(&cfg);
+            if app.inbox().rescan_rx.is_none() && app.inbox().threaded().len() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.inbox().threaded().len(), 1);
+        assert_eq!(app.inbox().selected, 0);
+        assert_eq!(app.inbox().selected_msgid().as_deref(), Some("b@x"));
     }
 }

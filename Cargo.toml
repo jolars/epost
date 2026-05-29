@@ -24,6 +24,7 @@ base64 = "0.22"
 tui-term = "0.3.4"
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
+notify = "8"
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }

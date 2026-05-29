@@ -301,7 +301,7 @@ mod tests {
     fn test_app() -> (App, Config) {
         let cfg = Config::default();
         // Fresh App with no scan worker; selected_msgid will be None.
-        let app = App::new(&cfg, PathBuf::from("/tmp/epost-test.sqlite"), None);
+        let app = App::new(&cfg, PathBuf::from("/tmp/epost-test.sqlite"), None, None);
         (app, cfg)
     }
 

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
@@ -42,7 +43,8 @@ fn run(cache_path: &Path, accounts: &[(String, PathBuf)]) -> Result<ScanData> {
 
 pub fn scan_account(account: &str, root: &Path, index: &mut Index) -> Result<ScanReport> {
     let mut report = ScanReport::default();
-    scan_folder(account, root, "INBOX", index, &mut report)?;
+    let found = scan_folder(account, root, "INBOX", index, &mut report)?;
+    index.prune_folder(account, "INBOX", &found)?;
 
     let entries = std::fs::read_dir(root)
         .with_context(|| format!("listing maildir root {}", root.display()))?;
@@ -65,9 +67,64 @@ pub fn scan_account(account: &str, root: &Path, index: &mut Index) -> Result<Sca
             .and_then(|n| n.to_str())
             .map(folder_label)
             .unwrap_or_else(|| "?".to_string());
-        scan_folder(account, &sub, &label, index, &mut report)?;
+        let found = scan_folder(account, &sub, &label, index, &mut report)?;
+        index.prune_folder(account, &label, &found)?;
     }
     Ok(report)
+}
+
+/// Re-walk only the dirty (account, folder) pairs, prune the index for
+/// each one, and return a fresh `ScanData` whose `threads` reflects the
+/// current view (`list_folder`) and whose `folder_stats` aggregates
+/// across all folders. Disk I/O is restricted to the dirty folders'
+/// `cur/` and `new/`; everything else is pure SQL.
+pub fn rescan_folders(
+    cache_path: PathBuf,
+    accounts: HashMap<String, PathBuf>,
+    dirty: HashSet<(String, String)>,
+    list_folder: String,
+) -> Receiver<ScanResult> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result =
+            rescan_run(&cache_path, &accounts, &dirty, &list_folder).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn rescan_run(
+    cache_path: &Path,
+    accounts: &HashMap<String, PathBuf>,
+    dirty: &HashSet<(String, String)>,
+    list_folder: &str,
+) -> Result<ScanData> {
+    let mut idx = Index::open(cache_path)?;
+    let mut report = ScanReport::default();
+    for (account, folder) in dirty {
+        let Some(root) = accounts.get(account) else {
+            continue;
+        };
+        let folder_root = if folder == "INBOX" {
+            root.clone()
+        } else {
+            root.join(format!(".{folder}"))
+        };
+        if !folder_root.is_dir() {
+            // The folder vanished entirely — drop every row we have for
+            // it (empty keep-set) and move on.
+            idx.prune_folder(account, folder, &HashSet::new())?;
+            continue;
+        }
+        let found = scan_folder(account, &folder_root, folder, &mut idx, &mut report)?;
+        idx.prune_folder(account, folder, &found)?;
+    }
+    let rows = idx.list_folder(list_folder)?;
+    let folder_stats = idx.folder_stats()?;
+    Ok(ScanData {
+        threads: build_threads(rows),
+        folder_stats,
+    })
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -82,7 +139,8 @@ fn scan_folder(
     folder: &str,
     index: &mut Index,
     report: &mut ScanReport,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
+    let mut found = HashSet::new();
     for sub in ["cur", "new"] {
         let dir = folder_root.join(sub);
         if !dir.is_dir() {
@@ -98,6 +156,7 @@ fn scan_folder(
             match parse::read_headers(&path)? {
                 Some(headers) => {
                     let flags = extract_flags(&path);
+                    let msgid = headers.msgid.clone();
                     let row = MessageRow {
                         msgid: headers.msgid,
                         account: account.to_string(),
@@ -111,13 +170,14 @@ fn scan_folder(
                         flags,
                     };
                     index.upsert(&row)?;
+                    found.insert(msgid);
                     report.scanned += 1;
                 }
                 None => report.skipped += 1,
             }
         }
     }
-    Ok(())
+    Ok(found)
 }
 
 pub fn folder_label(subdir: &str) -> String {
@@ -157,6 +217,82 @@ mod tests {
     #[test]
     fn extract_flags_blank_when_missing() {
         assert_eq!(extract_flags(Path::new("1778850000.M0P6.epost-dev")), "");
+    }
+
+    #[test]
+    fn rescan_folders_walks_only_dirty_and_prunes_deletes() {
+        use std::fs;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("idx.sqlite");
+        let root = tmp.path().join("dev");
+        // INBOX + .Archive layout.
+        for sub in ["cur", "new", "tmp"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        for sub in ["cur", "new", "tmp"] {
+            fs::create_dir_all(root.join(".Archive").join(sub)).unwrap();
+        }
+        let write_eml = |p: &Path, mid: &str| {
+            let mut f = fs::File::create(p).unwrap();
+            writeln!(f, "Message-ID: <{mid}>").unwrap();
+            writeln!(f, "Date: Thu, 1 Jan 1970 00:00:00 +0000").unwrap();
+            writeln!(f, "From: a@b").unwrap();
+            writeln!(f, "Subject: t").unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "body").unwrap();
+        };
+        write_eml(&root.join("cur").join("1.M0.h:2,S"), "a");
+        write_eml(&root.join("cur").join("2.M0.h:2,S"), "b");
+        write_eml(&root.join(".Archive").join("cur").join("3.M0.h:2,S"), "c");
+
+        // Seed the index via full scan.
+        let mut accounts = HashMap::new();
+        accounts.insert("dev".to_string(), root.clone());
+        let rx = start_worker(
+            accounts
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            cache.clone(),
+        );
+        let initial = rx.recv().unwrap().unwrap();
+        let inbox_count_initial = initial
+            .folder_stats
+            .iter()
+            .find(|s| s.folder == "INBOX")
+            .map(|s| s.total)
+            .unwrap_or(0);
+        assert_eq!(inbox_count_initial, 2);
+
+        // Delete one INBOX file, add another to Archive — but mark only
+        // INBOX dirty. Archive should NOT be re-walked.
+        fs::remove_file(root.join("cur").join("1.M0.h:2,S")).unwrap();
+        write_eml(&root.join(".Archive").join("cur").join("4.M0.h:2,S"), "d");
+
+        let mut dirty = HashSet::new();
+        dirty.insert(("dev".to_string(), "INBOX".to_string()));
+        let rx = rescan_folders(cache.clone(), accounts.clone(), dirty, "INBOX".to_string());
+        let data = rx.recv().unwrap().unwrap();
+
+        // INBOX dropped to 1 (pruned <a>).
+        let inbox = data
+            .folder_stats
+            .iter()
+            .find(|s| s.folder == "INBOX")
+            .map(|s| s.total)
+            .unwrap_or(99);
+        assert_eq!(inbox, 1, "INBOX should reflect the deletion");
+        // Archive unchanged because not dirty (<d> not picked up).
+        let archive = data
+            .folder_stats
+            .iter()
+            .find(|s| s.folder == "Archive")
+            .map(|s| s.total)
+            .unwrap_or(99);
+        assert_eq!(archive, 1, "Archive must NOT be re-walked");
     }
 
     #[test]

@@ -86,6 +86,45 @@ impl Index {
         Ok(())
     }
 
+    /// Drop rows for `(account, folder)` whose `msgid` is not in `keep`.
+    /// Returns the number of rows pruned. Used after a per-folder rescan
+    /// to reflect files deleted on disk between scans.
+    pub fn prune_folder(
+        &mut self,
+        account: &str,
+        folder: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let tx = self.conn.transaction().context("begin prune_folder")?;
+        let mut to_drop: Vec<String> = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare("SELECT msgid FROM msg WHERE account = ?1 AND folder = ?2")
+                .context("preparing prune_folder select")?;
+            let rows = stmt
+                .query_map(params![account, folder], |r| r.get::<_, String>(0))
+                .context("executing prune_folder select")?;
+            for row in rows {
+                let msgid = row.context("collecting prune_folder msgid")?;
+                if !keep.contains(&msgid) {
+                    to_drop.push(msgid);
+                }
+            }
+        }
+        let dropped = to_drop.len();
+        if !to_drop.is_empty() {
+            let mut del = tx
+                .prepare("DELETE FROM msg WHERE msgid = ?1")
+                .context("preparing prune_folder delete")?;
+            for msgid in &to_drop {
+                del.execute(params![msgid])
+                    .context("executing prune_folder delete")?;
+            }
+        }
+        tx.commit().context("committing prune_folder")?;
+        Ok(dropped)
+    }
+
     pub fn list_folder(&self, folder: &str) -> Result<Vec<MessageRow>> {
         let mut stmt = self
             .conn
@@ -250,6 +289,26 @@ mod tests {
         assert_eq!(stats[1].folder, "Sent");
         assert_eq!(stats[1].total, 1);
         assert_eq!(stats[1].unread, 0);
+    }
+
+    #[test]
+    fn prune_folder_drops_rows_not_in_keep() {
+        use std::collections::HashSet;
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.upsert(&sample("<a>", 100)).unwrap();
+        idx.upsert(&sample("<b>", 200)).unwrap();
+        idx.upsert(&sample("<c>", 300)).unwrap();
+        // <c> lives in a different folder — pruning INBOX must leave it alone.
+        let mut other = sample("<c>", 300);
+        other.folder = "Sent".into();
+        idx.upsert(&other).unwrap();
+
+        let keep: HashSet<String> = ["<a>".to_string()].into_iter().collect();
+        let dropped = idx.prune_folder("dev", "INBOX", &keep).unwrap();
+        assert_eq!(dropped, 1, "only <b> should be pruned");
+        assert!(idx.get("<a>").unwrap().is_some());
+        assert!(idx.get("<b>").unwrap().is_none());
+        assert!(idx.get("<c>").unwrap().is_some(), "Sent row untouched");
     }
 
     #[test]

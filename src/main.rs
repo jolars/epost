@@ -93,17 +93,18 @@ fn run(
     picker: Option<ratatui_image::picker::Picker>,
     picker_warning: Option<String>,
 ) -> Result<()> {
-    let mut app = App::new(cfg, cache_path, picker);
+    // Single fan-in channel: crossterm input goes through one reader
+    // thread, and subsystems (editor pty, scan/send workers, the
+    // maildir notify watcher) post `Wake` events when they have work
+    // to surface. The main loop blocks on `recv` instead of polling,
+    // so reaction time is the cost of one channel hand-off — not a
+    // poll interval.
+    let (event_tx, event_rx) = events::channel().context("starting input reader")?;
+
+    let mut app = App::new(cfg, cache_path, picker, Some(event_tx.clone()));
     if let Some(w) = picker_warning {
         app.status_error = Some(w);
     }
-
-    // Single fan-in channel: crossterm input goes through one reader
-    // thread, and subsystems (editor pty, future scan/send workers)
-    // post `Wake` events when they have work to surface. The main
-    // loop blocks on `recv` instead of polling, so reaction time is
-    // the cost of one channel hand-off — not a poll interval.
-    let (event_tx, event_rx) = events::channel().context("starting input reader")?;
 
     // Draw once before blocking so the initial UI appears even before
     // any event arrives.
@@ -147,6 +148,7 @@ fn tick(
     event_tx: &Sender<AppEvent>,
 ) -> Result<()> {
     app.poll_scan();
+    app.poll_watch(cfg);
     app.poll_compose_sends();
     app.ensure_body_for_selection();
 

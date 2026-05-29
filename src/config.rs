@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub compose: Compose,
     #[serde(default)]
+    pub watch: Watch,
+    #[serde(default)]
     pub accounts: HashMap<String, Account>,
     #[serde(default)]
     pub keys: HashMap<String, HashMap<String, String>>,
@@ -131,6 +133,28 @@ pub enum ImagesProtocol {
 
 fn default_max_height_cells() -> u16 {
     24
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Watch {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debounce_ms: default_debounce_ms(),
+        }
+    }
+}
+
+fn default_debounce_ms() -> u64 {
+    250
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -328,6 +352,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("default_view"));
+    }
+
+    #[test]
+    fn watch_defaults_on_with_250ms_debounce() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.watch.enabled);
+        assert_eq!(cfg.watch.debounce_ms, 250);
+    }
+
+    #[test]
+    fn parses_watch_section() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [watch]
+            enabled = false
+            debounce_ms = 500
+            "#,
+        )
+        .unwrap();
+        assert!(!cfg.watch.enabled);
+        assert_eq!(cfg.watch.debounce_ms, 500);
+    }
+
+    #[test]
+    fn unknown_key_in_watch_fails() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [watch]
+            enabled = true
+            mystery = 1
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mystery"));
     }
 
     #[test]
