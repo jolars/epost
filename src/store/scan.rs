@@ -5,10 +5,18 @@ use anyhow::{Context, Result};
 
 use crate::mail::flags;
 use crate::mail::parse;
-use crate::store::index::{Index, MessageRow};
+use crate::store::index::{FolderStat, Index, MessageRow};
 use crate::store::thread::{ThreadedRow, build_threads};
 
-pub type ScanResult = std::result::Result<Vec<ThreadedRow>, String>;
+/// Successful scan payload: the threaded INBOX rows the list pane
+/// renders, plus the per-folder roll-up the sidebar renders. Both are
+/// derived from the same index pass so the two views are consistent.
+pub struct ScanData {
+    pub threads: Vec<ThreadedRow>,
+    pub folder_stats: Vec<FolderStat>,
+}
+
+pub type ScanResult = std::result::Result<ScanData, String>;
 
 pub fn start_worker(accounts: Vec<(String, PathBuf)>, cache_path: PathBuf) -> Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel();
@@ -19,13 +27,17 @@ pub fn start_worker(accounts: Vec<(String, PathBuf)>, cache_path: PathBuf) -> Re
     rx
 }
 
-fn run(cache_path: &Path, accounts: &[(String, PathBuf)]) -> Result<Vec<ThreadedRow>> {
+fn run(cache_path: &Path, accounts: &[(String, PathBuf)]) -> Result<ScanData> {
     let mut idx = Index::open(cache_path)?;
     for (name, root) in accounts {
         scan_account(name, root, &mut idx)?;
     }
     let rows = idx.list_folder("INBOX")?;
-    Ok(build_threads(rows))
+    let folder_stats = idx.folder_stats()?;
+    Ok(ScanData {
+        threads: build_threads(rows),
+        folder_stats,
+    })
 }
 
 pub fn scan_account(account: &str, root: &Path, index: &mut Index) -> Result<ScanReport> {

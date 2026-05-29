@@ -107,6 +107,23 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
         return;
     }
 
+    // Alt-j/k: cycle the active folder from any focus. Match before
+    // the focus-routed arms so plain j/k still navigate the list /
+    // scroll the reader while the Alt variant always switches folders.
+    if k.modifiers.contains(KeyModifiers::ALT) {
+        match k.code {
+            KeyCode::Char('j') => {
+                app.cycle_folder(true);
+                return;
+            }
+            KeyCode::Char('k') => {
+                app.cycle_folder(false);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Universal keys (work in any focus).
     match k.code {
         KeyCode::Tab => {
@@ -171,7 +188,11 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             }
             _ => {}
         },
-        Pane::Folders => {}
+        Pane::Folders => match k.code {
+            KeyCode::Char('j') => app.cycle_folder(true),
+            KeyCode::Char('k') => app.cycle_folder(false),
+            _ => {}
+        },
     }
 }
 

@@ -17,6 +17,16 @@ pub struct MessageRow {
     pub flags: String,
 }
 
+/// Per-folder roll-up surfaced to the sidebar. Unified across accounts
+/// (matches how `list_folder("INBOX")` already merges accounts), so a
+/// user with two accounts sees one `INBOX` row whose counts sum both.
+#[derive(Debug, Clone)]
+pub struct FolderStat {
+    pub folder: String,
+    pub total: u64,
+    pub unread: u64,
+}
+
 pub struct Index {
     conn: Connection,
 }
@@ -89,6 +99,35 @@ impl Index {
             .context("executing list_folder")?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("collecting list_folder rows")
+    }
+
+    /// Per-folder counts (total and unread) aggregated across accounts.
+    /// "Unread" is the absence of the maildir `S` flag; the column stores
+    /// the suffix verbatim so a `LIKE '%S%'` check is precise (flags are
+    /// uppercase ASCII letters, no false matches).
+    pub fn folder_stats(&self) -> Result<Vec<FolderStat>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT folder, COUNT(*) AS total, \
+                        SUM(CASE WHEN flags LIKE '%S%' THEN 0 ELSE 1 END) AS unread \
+                 FROM msg GROUP BY folder",
+            )
+            .context("preparing folder_stats")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let folder: String = r.get(0)?;
+                let total: i64 = r.get(1)?;
+                let unread: i64 = r.get(2)?;
+                Ok(FolderStat {
+                    folder,
+                    total: total.max(0) as u64,
+                    unread: unread.max(0) as u64,
+                })
+            })
+            .context("executing folder_stats")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collecting folder_stats rows")
     }
 
     #[cfg(test)]
@@ -185,6 +224,32 @@ mod tests {
         let got = idx.get("<a>").unwrap().unwrap();
         assert_eq!(got.path, PathBuf::from("/new"));
         assert_eq!(got.flags, "S");
+    }
+
+    #[test]
+    fn folder_stats_groups_and_counts_unread() {
+        let mut idx = Index::open_in_memory().unwrap();
+        // Two INBOX rows (one read, one unread), one Sent row (read).
+        let mut r = sample("<a>", 100);
+        r.flags = "S".into();
+        idx.upsert(&r).unwrap();
+        let mut r = sample("<b>", 200);
+        r.flags = "".into();
+        idx.upsert(&r).unwrap();
+        let mut r = sample("<c>", 300);
+        r.folder = "Sent".into();
+        r.flags = "S".into();
+        idx.upsert(&r).unwrap();
+
+        let mut stats = idx.folder_stats().unwrap();
+        stats.sort_by(|a, b| a.folder.cmp(&b.folder));
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].folder, "INBOX");
+        assert_eq!(stats[0].total, 2);
+        assert_eq!(stats[0].unread, 1);
+        assert_eq!(stats[1].folder, "Sent");
+        assert_eq!(stats[1].total, 1);
+        assert_eq!(stats[1].unread, 0);
     }
 
     #[test]

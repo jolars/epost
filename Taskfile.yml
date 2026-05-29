@@ -3,6 +3,8 @@ version: '3'
 vars:
   DEV_CONFIG: '{{.ROOT_DIR}}/dev/config.toml'
   DEV_CACHE:  '{{.ROOT_DIR}}/dev/cache/index.sqlite'
+  DEV_MAILDIR_SRC: '{{.ROOT_DIR}}/dev/maildir'
+  DEV_MAILDIR_SCRATCH: '{{.ROOT_DIR}}/dev/scratch/maildir'
   SENT_STUB_DIR: '/tmp/epost-sent'
 
 env:
@@ -18,16 +20,19 @@ tasks:
 
   dev:
     desc: Auto-rebuild + restart on file change (main loop)
+    deps: [_maildir:ensure]
     cmds:
       - bacon run -- -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
   run:
     desc: One-shot debug run against dev/config.toml
+    deps: [_maildir:ensure]
     cmds:
       - cargo run -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
   run:release:
     desc: One-shot release run
+    deps: [_maildir:ensure]
     cmds:
       - cargo run --release -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
@@ -90,6 +95,25 @@ tasks:
     desc: Delete the dev sqlite index cache (forces full rescan on next run)
     cmds:
       - rm -f {{.DEV_CACHE}}
+
+  _maildir:ensure:
+    desc: Bootstrap dev/scratch/maildir from dev/maildir if missing
+    internal: true
+    status:
+      - test -d {{.DEV_MAILDIR_SCRATCH}}
+    cmds:
+      - mkdir -p {{.DEV_MAILDIR_SCRATCH}}
+      # cp -a preserves mtimes / flag-suffix filenames byte-for-byte so
+      # the first scan of the scratch maildir mirrors the tracked one.
+      # `/.` copies the contents (incl. dotfile subfolders like .Sent).
+      - cp -a {{.DEV_MAILDIR_SRC}}/. {{.DEV_MAILDIR_SCRATCH}}/
+
+  maildir:reset:
+    desc: Wipe dev/scratch/maildir and re-mirror from dev/maildir (also clears index cache)
+    cmds:
+      - rm -rf {{.DEV_MAILDIR_SCRATCH}}
+      - rm -f {{.DEV_CACHE}}
+      - task: _maildir:ensure
 
   doctor:
     desc: Smoke-check the devshell and fixtures

@@ -11,9 +11,9 @@ use crate::mail::compose::SendOutcome;
 use crate::mail::flags::{self, FlagOp};
 use crate::mail::html::{self, Block};
 use crate::mail::parse;
-use crate::store::index::{Index, MessageRow};
+use crate::store::index::{FolderStat, Index, MessageRow};
 use crate::store::scan::{self, ScanResult};
-use crate::store::thread::ThreadedRow;
+use crate::store::thread::{ThreadedRow, build_threads};
 use crate::store::watch::SelfWrites;
 use crate::ui::compose::{ComposeScreen, ComposeStatus};
 use crate::ui::images::{self, ImageKey, ResolvedImage};
@@ -128,6 +128,15 @@ pub struct InboxScreen {
     /// Set by `ensure_body` when the body changed this tick; reader
     /// consumes it to drive the Clear pass.
     pub body_changed_this_tick: bool,
+    /// Per-folder (total, unread) roll-up surfaced to the sidebar.
+    /// Populated from the scan result and patched locally on flag
+    /// flips and cross-folder moves so the counts stay live without
+    /// a re-scan.
+    pub folder_stats: Vec<FolderStat>,
+    /// Which folder the list pane is currently rendering. `INBOX` is
+    /// the unified default; `Alt-j`/`Alt-k` (and `j`/`k` in the Folders
+    /// pane) cycle through `folder_stats` and re-fetch from the index.
+    pub current_folder: String,
     scan_rx: Option<Receiver<ScanResult>>,
 }
 
@@ -366,6 +375,44 @@ impl App {
     pub fn select_prev(&mut self) {
         self.inbox_mut().select_prev();
     }
+
+    /// Advance / retreat through the sidebar's folder list and switch
+    /// the list pane to the new folder. Order mirrors what `folders::draw`
+    /// renders (INBOX pinned, rest alphabetical). Wraps at the ends so
+    /// holding Alt-j cycles indefinitely. No-op when no folders are
+    /// known yet (initial scan still pending).
+    pub fn cycle_folder(&mut self, forward: bool) {
+        let Self {
+            screens,
+            cache_path,
+            status_error,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        let mut order: Vec<String> = inbox
+            .folder_stats
+            .iter()
+            .map(|s| s.folder.clone())
+            .collect();
+        order.sort_by_key(|n| crate::ui::folders::folder_sort_key(n));
+        if order.is_empty() {
+            return;
+        }
+        let n = order.len();
+        let current_idx = order
+            .iter()
+            .position(|f| f == &inbox.current_folder)
+            .unwrap_or(0);
+        let next = if forward {
+            (current_idx + 1) % n
+        } else {
+            (current_idx + n - 1) % n
+        };
+        let target = order[next].clone();
+        inbox.switch_to_folder(&target, cache_path, status_error);
+    }
 }
 
 impl InboxScreen {
@@ -405,6 +452,8 @@ impl InboxScreen {
             prev_parsed_msgid: None,
             last_image_rects: Vec::new(),
             body_changed_this_tick: false,
+            folder_stats: Vec::new(),
+            current_folder: "INBOX".to_string(),
             scan_rx,
         }
     }
@@ -605,6 +654,8 @@ impl InboxScreen {
                 return;
             };
             let mut snapshot = rows[i].row.clone();
+            let src_folder = snapshot.folder.clone();
+            let was_unread = !snapshot.flags.contains('S');
             snapshot.folder = target_folder.to_string();
             snapshot.path = new_path.to_path_buf();
             rows.remove(i);
@@ -612,6 +663,12 @@ impl InboxScreen {
                 self.selected = 0;
             } else if self.selected >= rows.len() {
                 self.selected = rows.len() - 1;
+            }
+            adjust_total(&mut self.folder_stats, &src_folder, -1);
+            adjust_total(&mut self.folder_stats, target_folder, 1);
+            if was_unread {
+                adjust_unread(&mut self.folder_stats, &src_folder, -1);
+                adjust_unread(&mut self.folder_stats, target_folder, 1);
             }
             snapshot
         };
@@ -646,8 +703,18 @@ impl InboxScreen {
             let Some(t) = rows.iter_mut().find(|t| t.row.msgid == msgid) else {
                 return;
             };
+            let was_unread = !t.row.flags.contains('S');
+            let now_unread = !new_flags.contains('S');
+            let unread_delta: i64 = match (was_unread, now_unread) {
+                (true, false) => -1,
+                (false, true) => 1,
+                _ => 0,
+            };
             t.row.path = new_path.to_path_buf();
             t.row.flags = new_flags.to_string();
+            if unread_delta != 0 {
+                adjust_unread(&mut self.folder_stats, &t.row.folder, unread_delta);
+            }
             t.row.clone()
         };
         if let Err(e) = mirror_to_index(cache_path, &row_snapshot) {
@@ -744,13 +811,55 @@ impl InboxScreen {
         self.selected_row().map(|r| r.row.path.clone())
     }
 
+    /// Switch the list pane to render `target` folder. Re-reads the
+    /// rows from the sqlite index (cheap — no maildir rescan) and
+    /// resets per-message state so the reader doesn't show stale body
+    /// content for the old selection. No-op when already on `target`.
+    pub fn switch_to_folder(
+        &mut self,
+        target: &str,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) {
+        if target == self.current_folder {
+            return;
+        }
+        let idx = match Index::open(cache_path) {
+            Ok(i) => i,
+            Err(e) => {
+                *status_error = Some(format!("switch folder: open index: {e:#}"));
+                return;
+            }
+        };
+        let rows = match idx.list_folder(target) {
+            Ok(r) => r,
+            Err(e) => {
+                *status_error = Some(format!("switch folder: list {target}: {e:#}"));
+                return;
+            }
+        };
+        self.scan = ScanState::Ready(build_threads(rows));
+        self.current_folder = target.to_string();
+        self.selected = 0;
+        self.reader_scroll = 0;
+        self.parsed = None;
+        self.last_parsed_msgid = None;
+        self.prev_parsed_msgid = None;
+        self.image_cache.clear();
+        // Drives the reader's next-frame Clear pass so kitty/iTerm
+        // image placements from the previous body don't ghost over
+        // the new folder's first message.
+        self.body_changed_this_tick = true;
+    }
+
     pub fn poll_scan(&mut self) {
         let Some(rx) = self.scan_rx.as_ref() else {
             return;
         };
         match rx.try_recv() {
-            Ok(Ok(rows)) => {
-                self.scan = ScanState::Ready(rows);
+            Ok(Ok(data)) => {
+                self.scan = ScanState::Ready(data.threads);
+                self.folder_stats = data.folder_stats;
                 self.selected = 0;
                 self.scan_rx = None;
             }
@@ -850,6 +959,37 @@ fn mirror_to_index(cache_path: &Path, row: &MessageRow) -> anyhow::Result<()> {
     let mut idx = Index::open(cache_path)?;
     idx.upsert(row)?;
     Ok(())
+}
+
+fn adjust_unread(stats: &mut Vec<FolderStat>, folder: &str, delta: i64) {
+    let entry = ensure_folder_entry(stats, folder);
+    entry.unread = apply_delta(entry.unread, delta);
+}
+
+fn adjust_total(stats: &mut Vec<FolderStat>, folder: &str, delta: i64) {
+    let entry = ensure_folder_entry(stats, folder);
+    entry.total = apply_delta(entry.total, delta);
+}
+
+fn ensure_folder_entry<'a>(stats: &'a mut Vec<FolderStat>, folder: &str) -> &'a mut FolderStat {
+    let pos = stats.iter().position(|s| s.folder == folder);
+    if let Some(i) = pos {
+        return &mut stats[i];
+    }
+    stats.push(FolderStat {
+        folder: folder.to_string(),
+        total: 0,
+        unread: 0,
+    });
+    stats.last_mut().unwrap()
+}
+
+fn apply_delta(value: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        value.saturating_add(delta as u64)
+    } else {
+        value.saturating_sub(delta.unsigned_abs())
+    }
 }
 
 /// Single image reference reached from a Block-IR walk. Used by
@@ -1500,5 +1640,71 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
             watcher_view.consume(&dst),
             "destination path should be on the self-write registry"
         );
+    }
+
+    #[test]
+    fn cycle_folder_switches_list_and_current_folder() {
+        let tmp = TempDir::new().unwrap();
+        // Two folders, one message each. Distinct Message-IDs so the
+        // index keeps both rows (msgid is the primary key, so reused
+        // ids collapse and the second upsert overwrites the first).
+        drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let sent_root = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join(".Sent")
+            .join("cur");
+        std::fs::create_dir_all(&sent_root).unwrap();
+        let sent_msg = b"\
+Message-ID: <m2@example.invalid>\r\n\
+From: Tester <tester@example.invalid>\r\n\
+Subject: sent hi\r\n\
+Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
+\r\n\
+<p>sent body</p>\r\n";
+        std::fs::write(sent_root.join("9999.M0P9.host:2,S"), sent_msg).unwrap();
+
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        assert_eq!(app.inbox().current_folder, "INBOX");
+        let folders: Vec<&str> = app
+            .inbox()
+            .folder_stats
+            .iter()
+            .map(|s| s.folder.as_str())
+            .collect();
+        assert!(folders.contains(&"INBOX"));
+        assert!(folders.contains(&"Sent"));
+
+        // INBOX → Sent (next in canonical order: INBOX, then Sent).
+        app.cycle_folder(true);
+        assert_eq!(app.inbox().current_folder, "Sent");
+        assert_eq!(app.inbox().threaded().len(), 1);
+
+        // Wrap back to INBOX.
+        app.cycle_folder(true);
+        assert_eq!(app.inbox().current_folder, "INBOX");
+        assert_eq!(app.inbox().threaded().len(), 1);
+
+        // And cycle backwards lands on Sent again.
+        app.cycle_folder(false);
+        assert_eq!(app.inbox().current_folder, "Sent");
+    }
+
+    #[test]
+    fn cycle_folder_no_op_when_stats_empty() {
+        // No accounts → no scan, folder_stats stays empty. cycle_folder
+        // must not panic or set a phantom current_folder.
+        let cfg = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("index.sqlite");
+        let mut app = App::new(&cfg, cache, None);
+        app.cycle_folder(true);
+        assert_eq!(app.inbox().current_folder, "INBOX");
     }
 }

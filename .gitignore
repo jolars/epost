@@ -9,6 +9,11 @@ devenv.local.yaml
 # dev sqlite cache (rebuildable from dev/maildir on next run)
 dev/cache/
 
+# dev scratch maildir — mirrored from dev/maildir on `task dev`/`task run`
+# so interactive use (flag flips, moves, etc.) never touches the tracked
+# fixture. Rebuild with `task maildir:reset`.
+dev/scratch/
+
 # pre-commit
 .pre-commit-config.yaml
 
