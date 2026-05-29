@@ -140,10 +140,7 @@ pub fn set_flag(
 }
 
 /// Move a message file into a different folder's `cur/`, preserving (or
-/// rewriting) its flag suffix. Not wired into Step 5; included so the
-/// rename spec lives in one place when the move-between-folders feature
-/// arrives.
-#[allow(dead_code)]
+/// rewriting) its flag suffix.
 pub fn move_to_folder(
     current_path: &Path,
     target_cur_dir: &Path,
@@ -152,6 +149,16 @@ pub fn move_to_folder(
     let new_path = rename_for_flags(current_path, target_cur_dir, new_flags);
     do_rename(current_path, &new_path)?;
     Ok(new_path)
+}
+
+/// Create `cur/`, `new/`, and `tmp/` under `folder_root` if missing. The
+/// cross-folder move calls this before the rename when the user targets
+/// a folder mbsync hasn't created locally yet.
+pub fn ensure_maildir(folder_root: &Path) -> std::io::Result<()> {
+    for sub in ["cur", "new", "tmp"] {
+        std::fs::create_dir_all(folder_root.join(sub))?;
+    }
+    Ok(())
 }
 
 fn canonicalize(s: &str) -> String {
@@ -402,5 +409,24 @@ mod tests {
         assert_eq!(new, archive.join("cur").join("1779.M0P1.host:2,RS"));
         assert!(new.exists());
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn ensure_maildir_creates_cur_new_tmp() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join(".Archive");
+        ensure_maildir(&root).unwrap();
+        assert!(root.join("cur").is_dir());
+        assert!(root.join("new").is_dir());
+        assert!(root.join("tmp").is_dir());
+    }
+
+    #[test]
+    fn ensure_maildir_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join(".Archive");
+        ensure_maildir(&root).unwrap();
+        ensure_maildir(&root).unwrap();
+        assert!(root.join("cur").is_dir());
     }
 }

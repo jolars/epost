@@ -33,3 +33,6 @@ max_height_cells = 24
 maildir = "./dev/maildir"
 from = "Dev <dev@example.invalid>"
 sent_folder = "Sent"
+archive_folder = "Archive"
+spam_folder = "Spam"
+trash_folder = "Trash"

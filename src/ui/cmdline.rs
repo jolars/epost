@@ -90,10 +90,84 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
         "reply" => open_reply(app, cfg, ReplyKind::Reply),
         "reply-all" => open_reply(app, cfg, ReplyKind::ReplyAll),
         "forward" => open_reply(app, cfg, ReplyKind::Forward),
+        "archive" => move_named(app, cfg, MoveKind::Archive),
+        "spam" => move_named(app, cfg, MoveKind::Spam),
+        "trash" => move_named(app, cfg, MoveKind::Trash),
+        "mv" => {
+            let Some(folder) = parts.next() else {
+                app.status_error = Some("mv: missing folder".into());
+                return;
+            };
+            app.move_selected_to(folder, cfg);
+        }
         other => {
             app.status_error = Some(format!("unknown command: {other:?}"));
         }
     }
+}
+
+/// The three account-config-driven move targets. Sits alongside `:mv
+/// <folder>` so the cross-folder primitive has both a "well-known
+/// destination" form (driven by `[accounts.*]` config) and a free-form
+/// one.
+#[derive(Copy, Clone)]
+enum MoveKind {
+    Archive,
+    Spam,
+    Trash,
+}
+
+impl MoveKind {
+    fn label(self) -> &'static str {
+        match self {
+            MoveKind::Archive => "archive",
+            MoveKind::Spam => "spam",
+            MoveKind::Trash => "trash",
+        }
+    }
+
+    fn folder(self, acc: &crate::config::Account) -> Option<&String> {
+        match self {
+            MoveKind::Archive => acc.archive_folder.as_ref(),
+            MoveKind::Spam => acc.spam_folder.as_ref(),
+            MoveKind::Trash => acc.trash_folder.as_ref(),
+        }
+    }
+}
+
+/// Resolve the selected row's account → look up the configured target
+/// folder for `kind` → dispatch the move. Errors land in
+/// `app.status_error`; success leaves `move_selected_to` to set the
+/// "moved to X" message.
+fn move_named(app: &mut App, cfg: &Config, kind: MoveKind) {
+    let label = kind.label();
+    let Some(row) = app.inbox().selected_row().map(|t| t.row.clone()) else {
+        app.status_error = Some(format!("{label}: no message selected"));
+        return;
+    };
+    let Some(account) = cfg.accounts.get(&row.account) else {
+        app.status_error = Some(format!("{label}: unknown account {}", row.account));
+        return;
+    };
+    let Some(folder) = kind.folder(account).cloned() else {
+        app.status_error = Some(format!(
+            "{label}: no {label}_folder configured for {}",
+            row.account
+        ));
+        return;
+    };
+    app.move_selected_to(&folder, cfg);
+}
+
+/// Re-export for the `a` / `D` keybindings: dispatch the same `:archive`
+/// / `:trash` path the cmdline would, so account/folder resolution lives
+/// in one place.
+pub fn archive_selected(app: &mut App, cfg: &Config) {
+    move_named(app, cfg, MoveKind::Archive);
+}
+
+pub fn trash_selected(app: &mut App, cfg: &Config) {
+    move_named(app, cfg, MoveKind::Trash);
 }
 
 fn send_active(app: &mut App, cfg: &Config) {

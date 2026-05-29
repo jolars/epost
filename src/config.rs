@@ -180,6 +180,12 @@ pub struct Account {
     #[serde(default)]
     pub sent_folder: Option<String>,
     #[serde(default)]
+    pub archive_folder: Option<String>,
+    #[serde(default)]
+    pub spam_folder: Option<String>,
+    #[serde(default)]
+    pub trash_folder: Option<String>,
+    #[serde(default)]
     pub smtp: Option<Smtp>,
 }
 
@@ -239,11 +245,18 @@ mod tests {
             maildir = "./dev/maildir"
             from = "Dev <dev@example.invalid>"
             sent_folder = "Sent"
+            archive_folder = "Archive"
+            spam_folder = "Spam"
+            trash_folder = "Trash"
             "#,
         )
         .unwrap();
         assert!(cfg.ui.reader);
         assert_eq!(cfg.accounts["dev"].from, "Dev <dev@example.invalid>");
+        let dev = &cfg.accounts["dev"];
+        assert_eq!(dev.archive_folder.as_deref(), Some("Archive"));
+        assert_eq!(dev.spam_folder.as_deref(), Some("Spam"));
+        assert_eq!(dev.trash_folder.as_deref(), Some("Trash"));
     }
 
     #[test]

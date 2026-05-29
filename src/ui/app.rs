@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::picker::Picker;
 
-use crate::config::Config;
+use crate::config::{Account, Config};
 use crate::mail::compose::SendOutcome;
 use crate::mail::flags::{self, FlagOp};
 use crate::mail::html::{self, Block};
@@ -311,6 +311,31 @@ impl App {
         inbox.toggle_flag(flag, cache_path, self_writes, status_error);
     }
 
+    /// Move the selected row's message file into `target_folder` of the
+    /// owning account. Drives `:archive` / `:spam` / `:trash` / `:mv`.
+    /// The folder name is the Maildir++ label (e.g. `"Archive"`), not the
+    /// on-disk `.Archive` directory. The target maildir is created if
+    /// missing.
+    pub fn move_selected_to(&mut self, target_folder: &str, cfg: &Config) {
+        let Self {
+            screens,
+            cache_path,
+            self_writes,
+            status_error,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        inbox.move_selected_to(
+            target_folder,
+            &cfg.accounts,
+            cache_path,
+            self_writes,
+            status_error,
+        );
+    }
+
     // --- Convenience pass-throughs so keys.rs doesn't reach into inbox
     // for every keystroke. Step 1: all key dispatch is inbox-only. ---
 
@@ -502,6 +527,96 @@ impl InboxScreen {
             Err(e) => {
                 *status_error = Some(format!("toggle {flag}: {e}"));
             }
+        }
+    }
+
+    /// Rename the selected row's file into `<account_maildir>/.<folder>/cur/`,
+    /// preserving its flag suffix. On success: records both paths on the
+    /// self-write registry (so the future Step 7 watcher will skip its own
+    /// echo), drops the row from the in-memory inbox view, and mirrors the
+    /// new folder/path into the SQLite index.
+    pub fn move_selected_to(
+        &mut self,
+        target_folder: &str,
+        accounts: &HashMap<String, Account>,
+        cache_path: &Path,
+        self_writes: &SelfWrites,
+        status_error: &mut Option<String>,
+    ) {
+        let Some(msgid) = self.selected_msgid() else {
+            return;
+        };
+        let Some(row) = self.find_row(&msgid) else {
+            return;
+        };
+        let account_name = row.account.clone();
+        let path = row.path.clone();
+        let row_flags = row.flags.clone();
+
+        let Some(account) = accounts.get(&account_name) else {
+            *status_error = Some(format!("move: unknown account {account_name}"));
+            return;
+        };
+        let folder_root = account.maildir.join(format!(".{target_folder}"));
+        let target_cur = folder_root.join("cur");
+
+        if let Err(e) = flags::ensure_maildir(&folder_root) {
+            *status_error = Some(format!("move: create {target_folder}: {e}"));
+            return;
+        }
+
+        match flags::move_to_folder(&path, &target_cur, &row_flags) {
+            Ok(new_path) => {
+                self_writes.record(&path);
+                self_writes.record(&new_path);
+                self.drop_row_after_move(
+                    &msgid,
+                    target_folder,
+                    &new_path,
+                    cache_path,
+                    status_error,
+                );
+                *status_error = Some(format!("moved to {target_folder}"));
+            }
+            Err(e) => {
+                *status_error = Some(format!("move to {target_folder}: {e}"));
+            }
+        }
+    }
+
+    /// Inbox bookkeeping after a successful cross-folder rename: remove
+    /// the row from the in-memory view (the unified list is INBOX-only
+    /// and the moved row no longer belongs there), clamp `selected`, then
+    /// mirror the new folder/path into the index. Mirroring failures are
+    /// surfaced but don't roll back — the next rescan reconciles.
+    fn drop_row_after_move(
+        &mut self,
+        msgid: &str,
+        target_folder: &str,
+        new_path: &Path,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) {
+        let row_snapshot = {
+            let ScanState::Ready(rows) = &mut self.scan else {
+                return;
+            };
+            let Some(i) = rows.iter().position(|t| t.row.msgid == msgid) else {
+                return;
+            };
+            let mut snapshot = rows[i].row.clone();
+            snapshot.folder = target_folder.to_string();
+            snapshot.path = new_path.to_path_buf();
+            rows.remove(i);
+            if rows.is_empty() {
+                self.selected = 0;
+            } else if self.selected >= rows.len() {
+                self.selected = rows.len() - 1;
+            }
+            snapshot
+        };
+        if let Err(e) = mirror_to_index(cache_path, &row_snapshot) {
+            *status_error = Some(format!("index mirror failed: {e:#}"));
         }
     }
 
@@ -984,6 +1099,9 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
                 sent_folder: None,
+                archive_folder: None,
+                spam_folder: None,
+                trash_folder: None,
                 smtp: None,
             },
         );
@@ -1185,6 +1303,202 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         assert!(
             watcher_view.consume(&old_path),
             "source path should be recorded"
+        );
+    }
+
+    fn account_with_folders(tmp: &TempDir, archive: Option<&str>, trash: Option<&str>) -> Config {
+        let mut cfg = Config::default();
+        cfg.accounts.insert(
+            "personal".into(),
+            Account {
+                maildir: tmp.path().join("Mail").join("personal"),
+                from: "Tester <tester@example.invalid>".into(),
+                sent_folder: None,
+                archive_folder: archive.map(str::to_string),
+                spam_folder: None,
+                trash_folder: trash.map(str::to_string),
+                smtp: None,
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn archive_moves_message_out_of_inbox() {
+        let tmp = TempDir::new().unwrap();
+        let src = drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = account_with_folders(&tmp, Some("Archive"), None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache.clone(), None);
+        drain_scan(&mut app);
+        let msgid = app.inbox().selected_msgid().expect("a selected row");
+
+        cmdline::dispatch("archive", &mut app, &cfg);
+
+        let expected = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join(".Archive")
+            .join("cur")
+            .join("1779.M0P1.host:2,S");
+        assert!(expected.exists(), "moved file must exist at {expected:?}");
+        assert!(!src.exists(), "original inbox path must be gone");
+        assert!(
+            app.inbox().threaded().is_empty(),
+            "inbox list must drop the archived row"
+        );
+
+        let idx = crate::store::index::Index::open(&cache).unwrap();
+        let got = idx.get(&msgid).unwrap().expect("row in index");
+        assert_eq!(got.folder, "Archive");
+        assert_eq!(got.path, expected);
+    }
+
+    #[test]
+    fn trash_moves_to_trash_folder_preserving_flags() {
+        let tmp = TempDir::new().unwrap();
+        drop_message(&tmp, "cur", "1779.M0P1.host:2,FS");
+        let cfg = account_with_folders(&tmp, None, Some("Trash"));
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        cmdline::dispatch("trash", &mut app, &cfg);
+
+        let expected = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join(".Trash")
+            .join("cur")
+            .join("1779.M0P1.host:2,FS");
+        assert!(
+            expected.exists(),
+            "trash must preserve the suffix verbatim; expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn archive_creates_missing_target_folder() {
+        let tmp = TempDir::new().unwrap();
+        drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = account_with_folders(&tmp, Some("Archive"), None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let archive_root = tmp.path().join("Mail").join("personal").join(".Archive");
+        assert!(
+            !archive_root.exists(),
+            "precondition: .Archive must be absent before the move"
+        );
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        cmdline::dispatch("archive", &mut app, &cfg);
+
+        assert!(archive_root.join("cur").is_dir(), "cur/ must be created");
+        assert!(archive_root.join("new").is_dir(), "new/ must be created");
+        assert!(archive_root.join("tmp").is_dir(), "tmp/ must be created");
+    }
+
+    #[test]
+    fn archive_without_config_reports_error() {
+        let tmp = TempDir::new().unwrap();
+        let src = drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = account_with_folders(&tmp, None, None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        cmdline::dispatch("archive", &mut app, &cfg);
+
+        assert!(src.exists(), "file must stay put when config is missing");
+        assert_eq!(
+            app.inbox().threaded().len(),
+            1,
+            "row must remain visible in the inbox list"
+        );
+        let err = app
+            .status_error
+            .as_deref()
+            .expect("status_error should be set");
+        assert!(
+            err.contains("archive_folder"),
+            "error must mention the missing config key, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mv_to_custom_folder() {
+        let tmp = TempDir::new().unwrap();
+        drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = account_with_folders(&tmp, None, None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        cmdline::dispatch("mv Receipts", &mut app, &cfg);
+
+        let expected = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join(".Receipts")
+            .join("cur")
+            .join("1779.M0P1.host:2,S");
+        assert!(expected.exists(), "mv must land at {expected:?}");
+        assert!(app.inbox().threaded().is_empty());
+    }
+
+    #[test]
+    fn mv_without_folder_reports_error() {
+        let tmp = TempDir::new().unwrap();
+        let src = drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = account_with_folders(&tmp, None, None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        cmdline::dispatch("mv", &mut app, &cfg);
+
+        assert!(src.exists(), "no move, no file rename");
+        let err = app.status_error.as_deref().expect("error expected");
+        assert!(err.contains("missing folder"), "got {err:?}");
+    }
+
+    #[test]
+    fn move_records_both_paths_in_self_writes() {
+        let tmp = TempDir::new().unwrap();
+        let src = drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = account_with_folders(&tmp, Some("Archive"), None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None);
+        drain_scan(&mut app);
+
+        let watcher_view = app.self_writes.clone();
+        cmdline::dispatch("archive", &mut app, &cfg);
+
+        let dst = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join(".Archive")
+            .join("cur")
+            .join("1779.M0P1.host:2,S");
+        assert!(
+            watcher_view.consume(&src),
+            "source path should be on the self-write registry"
+        );
+        assert!(
+            watcher_view.consume(&dst),
+            "destination path should be on the self-write registry"
         );
     }
 }

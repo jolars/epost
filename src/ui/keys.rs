@@ -132,6 +132,8 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             KeyCode::Char('m') => app.toggle_flag_selected('S'),
             KeyCode::Char('*') => app.toggle_flag_selected('F'),
             KeyCode::Char('d') => app.toggle_flag_selected('T'),
+            KeyCode::Char('a') => cmdline::archive_selected(app, cfg),
+            KeyCode::Char('D') => cmdline::trash_selected(app, cfg),
             KeyCode::Char('c') => cmdline::open_blank_compose_external(app, cfg),
             KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
             KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
