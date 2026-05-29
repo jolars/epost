@@ -14,6 +14,7 @@ use crate::mail::html::{self, Block};
 use crate::mail::parse;
 use crate::store::index::{FolderStat, Index, MessageRow};
 use crate::store::scan::{self, AccountFolderStats, ScanResult};
+use crate::store::sync::SyncResult;
 use crate::store::thread::{ThreadedRow, build_threads};
 use crate::store::watch::{self, SelfWrites, Watcher, WatcherConfig, WatcherEvent};
 use crate::ui::compose::{ComposeScreen, ComposeStatus};
@@ -100,6 +101,15 @@ pub struct App {
     /// to suppress its own rename events. Populated whenever a flag flip
     /// renames a maildir file under us.
     pub self_writes: SelfWrites,
+    /// In-flight `:sync` worker. `Some` while the configured
+    /// `[sync].command` is running; cleared on completion. A second
+    /// `:sync` while one is in flight errors out rather than queueing.
+    pub sync_rx: Option<Receiver<SyncResult>>,
+    /// Clone of the unified event channel so the sync worker (and any
+    /// future workers spawned from cmdline dispatch) can push
+    /// `AppEvent::Wake` events. `None` in tests where no event loop is
+    /// running.
+    pub event_tx: Option<Sender<AppEvent>>,
 }
 
 /// A user-visible screen with its own tab in the strip and its own
@@ -205,7 +215,7 @@ impl App {
         event_tx: Option<Sender<AppEvent>>,
     ) -> Self {
         let self_writes = SelfWrites::new();
-        let inbox = InboxScreen::new(cfg, &cache_path, self_writes.clone(), event_tx);
+        let inbox = InboxScreen::new(cfg, &cache_path, self_writes.clone(), event_tx.clone());
         let watcher_warning = inbox.watcher_warning.clone();
         Self {
             mode: Mode::Normal,
@@ -220,6 +230,8 @@ impl App {
             image_max_height_cells: cfg.images.max_height_cells,
             cache_path,
             self_writes,
+            sync_rx: None,
+            event_tx,
         }
     }
 
@@ -306,6 +318,32 @@ impl App {
                     c.send_rx = None;
                     *status_error = Some("send: worker died".into());
                 }
+            }
+        }
+    }
+
+    /// Drain the in-flight `:sync` worker. Mirrors `poll_compose_sends`:
+    /// on completion clears `sync_rx` and writes a one-shot message to
+    /// the cmdline status row. The maildir watcher reconciles the new
+    /// files separately; success here only means the sync command
+    /// exited cleanly.
+    pub fn poll_sync(&mut self) {
+        let Some(rx) = self.sync_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.sync_rx = None;
+                self.status_error = Some("synced".into());
+            }
+            Ok(Err(e)) => {
+                self.sync_rx = None;
+                self.status_error = Some(format!("sync failed: {e}"));
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.sync_rx = None;
+                self.status_error = Some("sync: worker died".into());
             }
         }
     }

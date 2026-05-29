@@ -8,6 +8,7 @@ use crate::config;
 use crate::config::Config;
 use crate::mail::compose::{self as mail_compose, Draft};
 use crate::mail::parse;
+use crate::store::sync as store_sync;
 use crate::ui::app::{App, Mode, Screen};
 use crate::ui::browser;
 use crate::ui::compose::{ComposeScreen, ComposeStatus};
@@ -112,6 +113,7 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
             }
         },
         "compose" => open_blank_compose(app, cfg),
+        "sync" => dispatch_sync(app, cfg),
         "close" => match app.close_active_tab() {
             Ok(()) => {}
             Err(msg) => app.status_error = Some(msg.into()),
@@ -207,6 +209,28 @@ pub fn archive_selected(app: &mut App, cfg: &Config) {
 
 pub fn trash_selected(app: &mut App, cfg: &Config) {
     move_named(app, cfg, MoveKind::Trash);
+}
+
+/// Spawn the `[sync].command` worker if one isn't already running.
+/// Mirrors the browser-fallback shell-out from Step 3: the command
+/// lives on a `std::thread`, the result lands on `app.sync_rx`, and
+/// `App::poll_sync` surfaces the outcome on the cmdline row. The
+/// maildir watcher reconciles whatever the sync wrote to disk — we
+/// only report on the command itself.
+fn dispatch_sync(app: &mut App, cfg: &Config) {
+    if app.sync_rx.is_some() {
+        app.status_error = Some("sync: already running".into());
+        return;
+    }
+    let cmd = match cfg.sync.command.as_ref() {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => {
+            app.status_error = Some("sync: command not configured".into());
+            return;
+        }
+    };
+    app.sync_rx = Some(store_sync::start_worker(cmd, app.event_tx.clone()));
+    app.status_error = Some("syncing…".into());
 }
 
 fn send_active(app: &mut App, cfg: &Config) {
@@ -371,5 +395,81 @@ mod tests {
         dispatch("", &mut app, &cfg);
         assert!(app.status_error.is_none());
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn dispatch_sync_without_command_reports_error() {
+        let (mut app, cfg) = test_app();
+        dispatch("sync", &mut app, &cfg);
+        assert!(app.sync_rx.is_none());
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("not configured"), "got {err:?}");
+    }
+
+    #[test]
+    fn dispatch_sync_with_empty_command_reports_error() {
+        let (mut app, mut cfg) = test_app();
+        cfg.sync.command = Some(Vec::new());
+        dispatch("sync", &mut app, &cfg);
+        assert!(app.sync_rx.is_none());
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("not configured"), "got {err:?}");
+    }
+
+    #[test]
+    fn dispatch_sync_spawns_worker_and_completes() {
+        let (mut app, mut cfg) = test_app();
+        cfg.sync.command = Some(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]);
+        dispatch("sync", &mut app, &cfg);
+        assert!(app.sync_rx.is_some(), "worker should be in flight");
+        let pending = app.status_error.as_deref().expect("status");
+        assert!(pending.contains("syncing"), "got {pending:?}");
+
+        // Spin the poll loop briefly so the worker has time to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.sync_rx.is_some() {
+            app.poll_sync();
+            if std::time::Instant::now() >= deadline {
+                panic!("sync worker did not complete");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(app.status_error.as_deref(), Some("synced"));
+    }
+
+    #[test]
+    fn dispatch_sync_already_running_reports_error() {
+        let (mut app, mut cfg) = test_app();
+        // `sleep 5` keeps the first worker alive long enough that the
+        // second `:sync` lands on a busy slot.
+        cfg.sync.command = Some(vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]);
+        dispatch("sync", &mut app, &cfg);
+        assert!(app.sync_rx.is_some());
+        dispatch("sync", &mut app, &cfg);
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("already running"), "got {err:?}");
+    }
+
+    #[test]
+    fn dispatch_sync_nonzero_exit_reports_failure() {
+        let (mut app, mut cfg) = test_app();
+        cfg.sync.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'mbsync: broken pipe' 1>&2; exit 3".into(),
+        ]);
+        dispatch("sync", &mut app, &cfg);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.sync_rx.is_some() {
+            app.poll_sync();
+            if std::time::Instant::now() >= deadline {
+                panic!("sync worker did not complete");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.starts_with("sync failed:"), "got {err:?}");
+        assert!(err.contains("exit 3"), "got {err:?}");
     }
 }

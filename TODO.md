@@ -9,10 +9,6 @@ are the v1.x finish, not the original v1 spec.
 
 ## Near-term
 
-- **`:sync`command dispatch.** Config stub `[sync].command` already parsed in
-  `src/config.rs`. Wire `:sync` in `src/ui/cmdline.rs` through a worker thread
-  (mirror the browser-fallback shell-out from Step 3). Surface result in the
-  cmdline status row. Bindable to a key once dispatch exists. \~30 LoC.
 - **OSC 8 hyperlinks in the reader.** Wrap link runs with
   `ESC ] 8 ; ; URL ESC \` in `src/ui/reader.rs` so capable terminals (kitty,
   wezterm, foot) get native click/copy. Picker (`f`) keeps working unchanged for
@@ -56,7 +52,7 @@ usability gap.
 
 ## Out of scope (don't accidentally pick up)
 
-- IMAP / SMTP / OAuth --- `DESIGN.md` *Out of scope for v1*.
+- IMAP / SMTP / OAuth --- `DESIGN.md` *Out of scope permanently*.
 - Webview, JavaScript, CSS engine --- security invariant #5.
 - `async`/`await` / tokio --- concurrency model is `std::thread` + `mpsc`.
   Adding tokio is a redesign, raise it explicitly.
