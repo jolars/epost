@@ -1,11 +1,12 @@
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use ratatui::Terminal;
@@ -19,13 +20,14 @@ mod ui;
 use crate::config::Config;
 use crate::ui::app::App;
 use crate::ui::embed::EditorSession;
+use crate::ui::events::{self, AppEvent};
 use crate::ui::tty;
 
-const POLL_TIMEOUT: Duration = Duration::from_millis(250);
-/// Shorter poll while a compose tab is hosting an embedded `$EDITOR`
-/// session — drives the redraw cadence so typed characters appear
-/// promptly in the parsed terminal grid.
-const EDITOR_POLL_TIMEOUT: Duration = Duration::from_millis(30);
+/// Soft tick used as a heartbeat when the scan worker is still
+/// running — once a worker exists we'll have completion-driven wakes
+/// too, but the initial scan from Step 2 doesn't push to the event
+/// channel yet, so we keep a slow timer to pick it up.
+const IDLE_TICK: Duration = Duration::from_millis(250);
 
 #[derive(Parser)]
 #[command(name = "epost", about = "Linux maildir email reader/composer")]
@@ -95,35 +97,68 @@ fn run(
     if let Some(w) = picker_warning {
         app.status_error = Some(w);
     }
+
+    // Single fan-in channel: crossterm input goes through one reader
+    // thread, and subsystems (editor pty, future scan/send workers)
+    // post `Wake` events when they have work to surface. The main
+    // loop blocks on `recv` instead of polling, so reaction time is
+    // the cost of one channel hand-off — not a poll interval.
+    let (event_tx, event_rx) = events::channel().context("starting input reader")?;
+
+    // Draw once before blocking so the initial UI appears even before
+    // any event arrives.
+    tick(terminal, &mut app, cfg, &event_tx)?;
+
     while !app.quit {
-        app.poll_scan();
-        app.poll_compose_sends();
-        app.ensure_body_for_selection();
-
-        // Editor lifecycle handled around the draw so each frame
-        // shows the freshest state: exits surface the saved body the
-        // same frame; new sessions spawn against the previously-
-        // recorded body rect so no transitional empty-pty frame ever
-        // hits the screen.
-        finalize_finished_editors(&mut app);
-        spawn_pending_editors(&mut app, &cfg.compose);
-
-        terminal
-            .draw(|f| ui::app::draw(f, &mut app))
-            .context("drawing frame")?;
-
-        let timeout = if app.has_active_editor() {
-            EDITOR_POLL_TIMEOUT
-        } else {
-            POLL_TIMEOUT
-        };
-        if event::poll(timeout).context("polling input")?
-            && let Event::Key(k) = event::read().context("reading input")?
-            && k.kind == KeyEventKind::Press
-        {
-            ui::keys::handle(&mut app, cfg, k);
+        // Block until something wakes us — input, editor exit, pty
+        // bytes, or the idle heartbeat (so initial scan results get
+        // picked up even though `scan::start_worker` doesn't push
+        // to the event channel yet).
+        match event_rx.recv_timeout(IDLE_TICK) {
+            Ok(ev) => process_event(&mut app, cfg, ev),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
+        // Drain any events that piled up while we were sleeping so we
+        // don't spend a draw per byte during fast editor output.
+        while let Ok(ev) = event_rx.try_recv() {
+            process_event(&mut app, cfg, ev);
+        }
+
+        tick(terminal, &mut app, cfg, &event_tx)?;
     }
+    Ok(())
+}
+
+fn process_event(app: &mut App, cfg: &Config, ev: AppEvent) {
+    match ev {
+        AppEvent::Input(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+            ui::keys::handle(app, cfg, k);
+        }
+        AppEvent::Input(_) => {}
+        AppEvent::Wake => {}
+    }
+}
+
+fn tick(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    cfg: &Config,
+    event_tx: &Sender<AppEvent>,
+) -> Result<()> {
+    app.poll_scan();
+    app.poll_compose_sends();
+    app.ensure_body_for_selection();
+
+    finalize_finished_editors(app);
+    let term_size = terminal
+        .size()
+        .unwrap_or(ratatui::layout::Size::new(80, 24));
+    spawn_pending_editors(app, &cfg.compose, term_size, event_tx);
+
+    terminal
+        .draw(|f| ui::app::draw(f, app))
+        .context("drawing frame")?;
     Ok(())
 }
 
@@ -145,9 +180,13 @@ fn finalize_finished_editors(app: &mut App) {
     }
 }
 
-fn spawn_pending_editors(app: &mut App, cfg: &config::Compose) {
+fn spawn_pending_editors(
+    app: &mut App,
+    cfg: &config::Compose,
+    term_size: ratatui::layout::Size,
+    event_tx: &Sender<AppEvent>,
+) {
     let argv = config::resolve_editor(cfg);
-    // Iterate by index so we can borrow status_error mutably alongside.
     let mut to_error: Option<String> = None;
     for screen in app.screens.iter_mut() {
         let ui::app::Screen::Compose(c) = screen else {
@@ -157,8 +196,10 @@ fn spawn_pending_editors(app: &mut App, cfg: &config::Compose) {
             continue;
         }
         c.editor_pending = false;
-        let (rows, cols) = c.last_body_inner.unwrap_or((24, 80));
-        match EditorSession::start(&c.body_path(), &argv, rows, cols) {
+        let (rows, cols) = c
+            .last_body_inner
+            .unwrap_or_else(|| compose_body_inner_size(term_size));
+        match EditorSession::start(&c.body_path(), &argv, rows, cols, event_tx.clone()) {
             Ok(session) => {
                 c.editor = Some(session);
             }
@@ -170,6 +211,16 @@ fn spawn_pending_editors(app: &mut App, cfg: &config::Compose) {
     if let Some(msg) = to_error {
         app.status_error = Some(msg);
     }
+}
+
+/// Compute the size `ui::compose::draw` will give the body's inner
+/// rect for a given terminal size. Mirrors the layout constants:
+/// outer = 1 (tabs) + body + 1 (cmdline); compose = 7 (header block)
+/// + body + 1 (hint); body block subtracts 2 for its border.
+fn compose_body_inner_size(term_size: ratatui::layout::Size) -> (u16, u16) {
+    let rows = term_size.height.saturating_sub(1 + 1 + 7 + 1 + 2).max(1);
+    let cols = term_size.width.saturating_sub(2).max(1);
+    (rows, cols)
 }
 
 fn install_panic_hook() {

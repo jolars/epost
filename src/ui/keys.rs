@@ -5,12 +5,30 @@ use crate::ui::app::{App, Mode, Pane, Screen};
 use crate::ui::{cmdline, compose};
 
 pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-        app.quit = true;
+    // Tab-switch chords stay global so the user can navigate away
+    // even when an editor session is intercepting everything else.
+    if global(app, k) {
         return;
     }
 
-    if global(app, k) {
+    // If the active tab hosts a live `$EDITOR` session, every other
+    // key forwards to the pty — including `:`, `q`, and Ctrl-C, which
+    // vim/nvim/emacs all need for their own commands (`:wq` to save,
+    // `q` to record/quit a buffer, Ctrl-C to cancel a partial input).
+    // The user exits the editor through the editor's own quit, which
+    // ends the session and returns the form.
+    if let Some(Screen::Compose(c)) = app.screens.get_mut(app.active)
+        && let Some(ed) = c.editor.as_mut()
+    {
+        ed.forward_key(k);
+        return;
+    }
+
+    // Ctrl-C quits the app — only reachable when no editor is live,
+    // so a long-running edit isn't an accidental ^C away from losing
+    // the draft tempfile.
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+        app.quit = true;
         return;
     }
 

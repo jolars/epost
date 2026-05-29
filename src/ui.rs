@@ -3,6 +3,7 @@ pub mod browser;
 pub mod cmdline;
 pub mod compose;
 pub mod embed;
+pub mod events;
 pub mod folders;
 pub mod images;
 pub mod keys;

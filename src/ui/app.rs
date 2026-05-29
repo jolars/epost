@@ -196,16 +196,6 @@ impl App {
         }
     }
 
-    /// True if any compose tab currently has a live embedded editor
-    /// session. The main loop polls inputs more frequently in this
-    /// state so the editor feels responsive.
-    pub fn has_active_editor(&self) -> bool {
-        self.screens.iter().any(|s| match s {
-            Screen::Compose(c) => c.editor.is_some(),
-            _ => false,
-        })
-    }
-
     /// Drain any pending send-worker result on each compose tab.
     /// Transitions `ComposeStatus` and surfaces a one-shot message to
     /// the cmdline status row. Mirrors the `poll_scan` pattern.

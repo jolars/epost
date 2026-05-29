@@ -88,11 +88,14 @@ impl ComposeScreen {
             cc: TextInput::from_string(draft.cc.join(", ")),
             bcc: TextInput::from_string(draft.bcc.join(", ")),
             subject: TextInput::from_string(draft.subject),
-            focused: ComposeField::To,
+            // Aerc-style: focus starts on the body and the editor
+            // spawns immediately, so switching to this tab lands the
+            // user inside `$EDITOR` with no transition.
+            focused: ComposeField::Body,
             body_file,
             body_preview,
             body_dirty,
-            editor_pending: false,
+            editor_pending: true,
             editor: None,
             last_body_inner: None,
             status: ComposeStatus::Editing,
@@ -164,15 +167,11 @@ impl ComposeScreen {
     }
 }
 
-/// Compose-mode key dispatch. While an editor session is live, every
-/// key forwards to the pty. Otherwise: Tab cycles fields; `Alt-e`
-/// from any field (or `Enter` / `e` on the body row) requests
-/// `$EDITOR` — the main loop spawns the session on the next tick.
+/// Compose-mode key dispatch. Only called when no editor session is
+/// active — `ui::keys::handle` forwards everything to the pty when
+/// one is live, so this path only handles form editing (Tab cycles
+/// fields, `Alt-e` / `Enter` on Body requests a re-open of `$EDITOR`).
 pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent) {
-    if let Some(ed) = screen.editor.as_mut() {
-        ed.forward_key(k);
-        return;
-    }
     // Alt-e always requests editor; convenient from any header field.
     if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('e') {
         screen.editor_pending = true;
@@ -271,18 +270,24 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     screen.last_body_inner = Some((body_inner.height, body_inner.width));
     f.render_widget(body_block, body_area);
 
-    if let Some(ed) = screen.editor.as_mut()
-        && ed.is_primed()
-    {
-        ed.resize(body_inner.height, body_inner.width);
-        ed.with_screen(|s| {
-            let widget = PseudoTerminal::new(s);
-            f.render_widget(widget, body_inner);
-        });
+    if let Some(ed) = screen.editor.as_mut() {
+        if ed.is_primed() {
+            ed.resize(body_inner.height, body_inner.width);
+            ed.with_screen(|s| {
+                let widget = PseudoTerminal::new(s);
+                f.render_widget(widget, body_inner);
+            });
+        } else {
+            let placeholder = Paragraph::new(Line::from(Span::styled(
+                "starting $EDITOR…",
+                Style::default().fg(Color::DarkGray),
+            )));
+            f.render_widget(placeholder, body_inner);
+        }
     } else {
         let body_lines: Vec<Line<'static>> = if screen.body_preview.is_empty() {
             vec![Line::from(Span::styled(
-                "(empty — press Tab to body row, then Enter or e to edit)",
+                "(editor closed — press e to re-open, :send to send)",
                 Style::default().fg(Color::DarkGray),
             ))]
         } else {

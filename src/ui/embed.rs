@@ -12,12 +12,14 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+
+use crate::ui::events::AppEvent;
 
 pub struct EditorSession {
     parser: Arc<Mutex<vt100::Parser>>,
@@ -36,9 +38,17 @@ pub struct EditorSession {
 
 impl EditorSession {
     /// Spawn `argv` under a pty sized `rows x cols`, with `path` as
-    /// the final argument. Returns once the child is running; the
-    /// caller polls `is_done` to detect exit.
-    pub fn start(path: &Path, argv: &[String], rows: u16, cols: u16) -> Result<Self> {
+    /// the final argument. `wake` is the main-loop event channel; the
+    /// reader and waiter threads send `AppEvent::Wake` whenever new
+    /// pty output arrives or the child exits, so the UI reacts in
+    /// real time instead of polling on a timer.
+    pub fn start(
+        path: &Path,
+        argv: &[String],
+        rows: u16,
+        cols: u16,
+        wake: Sender<AppEvent>,
+    ) -> Result<Self> {
         if argv.is_empty() {
             anyhow::bail!("no editor configured");
         }
@@ -70,11 +80,10 @@ impl EditorSession {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let primed = Arc::new(AtomicBool::new(false));
 
-        // Reader thread: pull bytes from the pty master and feed the
-        // parser. The main loop redraws on a short timer while an
-        // editor session is active, so there's no separate notify;
-        // it just flips `primed` so the UI knows when to start
-        // rendering the pty grid instead of the form preview.
+        // Reader thread: pull bytes from the pty master, feed the
+        // parser, and wake the main loop so it redraws. `primed`
+        // flips on first byte so the UI knows when to swap the
+        // "starting $EDITOR…" placeholder for the pty grid.
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -82,6 +91,7 @@ impl EditorSession {
         {
             let parser = parser.clone();
             let primed = primed.clone();
+            let wake = wake.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -92,6 +102,7 @@ impl EditorSession {
                                 p.process(&buf[..n]);
                             }
                             primed.store(true, Ordering::Release);
+                            let _ = wake.send(AppEvent::Wake);
                         }
                         Err(_) => break,
                     }
@@ -99,11 +110,15 @@ impl EditorSession {
             });
         }
 
-        // Waiter thread: block on child.wait(), notify the UI on exit.
+        // Waiter thread: block on child.wait(), then both signal
+        // `done` (for the UI's `is_done` check) and wake the main
+        // loop so finalize runs in the same iteration as the exit.
         let (done_tx, done_rx) = mpsc::channel();
+        let wake_for_wait = wake.clone();
         std::thread::spawn(move || {
             let _ = child.wait();
             let _ = done_tx.send(());
+            let _ = wake_for_wait.send(AppEvent::Wake);
         });
 
         let writer = pair.master.take_writer().context("taking pty writer")?;
