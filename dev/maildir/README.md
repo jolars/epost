@@ -2,7 +2,9 @@
 
 In-tree synthetic maildir used by `task dev` / `task run` so the app has
 something to render without needing a real `mbsync` setup. Selected by
-`dev/config.toml`'s `accounts.dev.maildir`.
+`dev/config.toml`'s `accounts.dev.maildir`. The companion
+`dev/maildir-work/` fixture backs `accounts.work` so the multi-account
+UI has a second tree to render — see its README for the cases there.
 
 ## Layout (maildir++)
 

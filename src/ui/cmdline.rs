@@ -100,6 +100,15 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
             };
             app.move_selected_to(folder, cfg);
         }
+        "account" => match parts.next() {
+            None | Some("all") => app.switch_to_scope(None, "INBOX"),
+            Some(name) if cfg.accounts.contains_key(name) => {
+                app.switch_to_scope(Some(name.to_string()), "INBOX");
+            }
+            Some(other) => {
+                app.status_error = Some(format!("account: unknown {other:?}"));
+            }
+        },
         other => {
             app.status_error = Some(format!("unknown command: {other:?}"));
         }

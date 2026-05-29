@@ -1,0 +1,24 @@
+Return-Path: <dev@work.example>
+Delivered-To: morgan@work.example
+Message-ID: <work-status-001-reply@work.example>
+In-Reply-To: <work-status-001@work.example>
+References: <work-status-001@work.example>
+From: Dev <dev@work.example>
+To: Morgan Cho <morgan@work.example>
+Subject: Re: Q2 status report — please review
+Date: Wed, 27 May 2026 11:15:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hi Morgan,
+
+Read through it — Risks section looks honest. Two notes:
+
+  1. The "schema migration" risk should probably be high-confidence by
+     now; we shipped the dry-run pass last week and it's clean.
+  2. Missing a callout for the auth middleware rewrite landing in the
+     same window. That's the real Q3 risk.
+
+Happy to walk through both on Friday.
+
+— Dev

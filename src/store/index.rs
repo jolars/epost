@@ -125,48 +125,90 @@ impl Index {
         Ok(dropped)
     }
 
-    pub fn list_folder(&self, folder: &str) -> Result<Vec<MessageRow>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT msgid, account, folder, path, date, from_addr, subject, in_reply, refs, flags \
-                 FROM msg WHERE folder = ?1 ORDER BY date DESC",
-            )
-            .context("preparing list_folder")?;
-        let rows = stmt
-            .query_map(params![folder], row_from_sqlite)
-            .context("executing list_folder")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("collecting list_folder rows")
+    /// `account = None` means "all accounts" — the unified inbox view
+    /// today's UI defaults to. `Some(name)` filters by `account`.
+    pub fn list_folder(&self, account: Option<&str>, folder: &str) -> Result<Vec<MessageRow>> {
+        match account {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT msgid, account, folder, path, date, from_addr, subject, in_reply, refs, flags \
+                         FROM msg WHERE folder = ?1 ORDER BY date DESC",
+                    )
+                    .context("preparing list_folder")?;
+                let rows = stmt
+                    .query_map(params![folder], row_from_sqlite)
+                    .context("executing list_folder")?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .context("collecting list_folder rows")
+            }
+            Some(acc) => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT msgid, account, folder, path, date, from_addr, subject, in_reply, refs, flags \
+                         FROM msg WHERE account = ?1 AND folder = ?2 ORDER BY date DESC",
+                    )
+                    .context("preparing list_folder (scoped)")?;
+                let rows = stmt
+                    .query_map(params![acc, folder], row_from_sqlite)
+                    .context("executing list_folder (scoped)")?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .context("collecting list_folder rows")
+            }
+        }
     }
 
-    /// Per-folder counts (total and unread) aggregated across accounts.
-    /// "Unread" is the absence of the maildir `S` flag; the column stores
-    /// the suffix verbatim so a `LIKE '%S%'` check is precise (flags are
-    /// uppercase ASCII letters, no false matches).
-    pub fn folder_stats(&self) -> Result<Vec<FolderStat>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT folder, COUNT(*) AS total, \
-                        SUM(CASE WHEN flags LIKE '%S%' THEN 0 ELSE 1 END) AS unread \
-                 FROM msg GROUP BY folder",
-            )
-            .context("preparing folder_stats")?;
-        let rows = stmt
-            .query_map([], |r| {
-                let folder: String = r.get(0)?;
-                let total: i64 = r.get(1)?;
-                let unread: i64 = r.get(2)?;
-                Ok(FolderStat {
-                    folder,
-                    total: total.max(0) as u64,
-                    unread: unread.max(0) as u64,
-                })
+    /// Per-folder counts (total and unread). `account = None` aggregates
+    /// across accounts (today's default — two INBOXes merge into one row);
+    /// `Some(name)` restricts to that account. "Unread" is the absence of
+    /// the maildir `S` flag; the column stores the suffix verbatim so a
+    /// `LIKE '%S%'` check is precise (flags are uppercase ASCII letters,
+    /// no false matches).
+    pub fn folder_stats(&self, account: Option<&str>) -> Result<Vec<FolderStat>> {
+        let row_to_stat = |r: &rusqlite::Row<'_>| {
+            let folder: String = r.get(0)?;
+            let total: i64 = r.get(1)?;
+            let unread: i64 = r.get(2)?;
+            Ok(FolderStat {
+                folder,
+                total: total.max(0) as u64,
+                unread: unread.max(0) as u64,
             })
-            .context("executing folder_stats")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("collecting folder_stats rows")
+        };
+        match account {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT folder, COUNT(*) AS total, \
+                                SUM(CASE WHEN flags LIKE '%S%' THEN 0 ELSE 1 END) AS unread \
+                         FROM msg GROUP BY folder",
+                    )
+                    .context("preparing folder_stats")?;
+                let rows = stmt
+                    .query_map([], row_to_stat)
+                    .context("executing folder_stats")?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .context("collecting folder_stats rows")
+            }
+            Some(acc) => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT folder, COUNT(*) AS total, \
+                                SUM(CASE WHEN flags LIKE '%S%' THEN 0 ELSE 1 END) AS unread \
+                         FROM msg WHERE account = ?1 GROUP BY folder",
+                    )
+                    .context("preparing folder_stats (scoped)")?;
+                let rows = stmt
+                    .query_map(params![acc], row_to_stat)
+                    .context("executing folder_stats (scoped)")?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .context("collecting folder_stats rows")
+            }
+        }
     }
 
     #[cfg(test)]
@@ -243,7 +285,7 @@ mod tests {
         idx.upsert(&sample("<a>", 100)).unwrap();
         idx.upsert(&sample("<b>", 200)).unwrap();
         idx.upsert(&sample("<c>", 150)).unwrap();
-        let rows = idx.list_folder("INBOX").unwrap();
+        let rows = idx.list_folder(None, "INBOX").unwrap();
         assert_eq!(
             rows.iter().map(|r| r.msgid.as_str()).collect::<Vec<_>>(),
             vec!["<b>", "<c>", "<a>"]
@@ -280,7 +322,7 @@ mod tests {
         r.flags = "S".into();
         idx.upsert(&r).unwrap();
 
-        let mut stats = idx.folder_stats().unwrap();
+        let mut stats = idx.folder_stats(None).unwrap();
         stats.sort_by(|a, b| a.folder.cmp(&b.folder));
         assert_eq!(stats.len(), 2);
         assert_eq!(stats[0].folder, "INBOX");
@@ -289,6 +331,71 @@ mod tests {
         assert_eq!(stats[1].folder, "Sent");
         assert_eq!(stats[1].total, 1);
         assert_eq!(stats[1].unread, 0);
+    }
+
+    /// Seed two accounts (personal + work), each with an INBOX, plus a
+    /// personal Sent. Used by the scope-aware tests below.
+    fn seed_two_accounts() -> Index {
+        let mut idx = Index::open_in_memory().unwrap();
+        let mut mk = |msgid: &str, account: &str, folder: &str, flags: &str, date: i64| {
+            let mut r = sample(msgid, date);
+            r.account = account.into();
+            r.folder = folder.into();
+            r.flags = flags.into();
+            idx.upsert(&r).unwrap();
+        };
+        mk("<p1>", "personal", "INBOX", "S", 100);
+        mk("<p2>", "personal", "INBOX", "", 200);
+        mk("<p3>", "personal", "Sent", "S", 300);
+        mk("<w1>", "work", "INBOX", "S", 110);
+        mk("<w2>", "work", "INBOX", "", 220);
+        idx
+    }
+
+    #[test]
+    fn list_folder_scoped_by_account_returns_only_that_account() {
+        let idx = seed_two_accounts();
+        let rows = idx.list_folder(Some("personal"), "INBOX").unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.msgid.as_str()).collect();
+        // INBOX-personal: <p2> (date 200) then <p1> (date 100).
+        assert_eq!(ids, vec!["<p2>", "<p1>"]);
+    }
+
+    #[test]
+    fn list_folder_none_returns_all_accounts() {
+        let idx = seed_two_accounts();
+        let rows = idx.list_folder(None, "INBOX").unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.msgid.as_str()).collect();
+        // INBOX across both: ordered by date desc.
+        assert_eq!(ids, vec!["<w2>", "<p2>", "<w1>", "<p1>"]);
+    }
+
+    #[test]
+    fn folder_stats_scoped_by_account_excludes_others() {
+        let idx = seed_two_accounts();
+        let mut stats = idx.folder_stats(Some("personal")).unwrap();
+        stats.sort_by(|a, b| a.folder.cmp(&b.folder));
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].folder, "INBOX");
+        assert_eq!(stats[0].total, 2);
+        assert_eq!(stats[0].unread, 1);
+        assert_eq!(stats[1].folder, "Sent");
+        assert_eq!(stats[1].total, 1);
+        assert_eq!(stats[1].unread, 0);
+    }
+
+    #[test]
+    fn folder_stats_none_aggregates_across_accounts() {
+        let idx = seed_two_accounts();
+        let mut stats = idx.folder_stats(None).unwrap();
+        stats.sort_by(|a, b| a.folder.cmp(&b.folder));
+        // INBOX merges both accounts: 2 + 2 = 4 total, 1 + 1 = 2 unread.
+        assert_eq!(stats[0].folder, "INBOX");
+        assert_eq!(stats[0].total, 4);
+        assert_eq!(stats[0].unread, 2);
+        // Sent is personal-only.
+        assert_eq!(stats[1].folder, "Sent");
+        assert_eq!(stats[1].total, 1);
     }
 
     #[test]

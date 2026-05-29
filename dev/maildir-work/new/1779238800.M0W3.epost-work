@@ -1,0 +1,26 @@
+Return-Path: <ci@work.example>
+Delivered-To: dev@work.example
+Message-ID: <work-ci-003@work.example>
+From: CI Bot <ci@work.example>
+To: Dev <dev@work.example>
+Subject: [FAILED] platform/main #4217 — flaky integration test
+Date: Wed, 27 May 2026 19:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Build platform/main #4217 failed.
+
+  test: ingest::pipeline::tests::partial_batch_recovery
+  duration: 12.4s
+  attempt: 1/1
+
+Last 20 lines of output:
+
+  ---- ingest::pipeline::tests::partial_batch_recovery stdout ----
+  thread 'partial_batch_recovery' panicked at ingest/src/pipeline.rs:874:9:
+  assertion `left == right` failed
+    left: 3
+   right: 4
+
+Re-run: https://ci.work.example/jobs/platform-main/4217/restart
+Triage:  https://ci.work.example/jobs/platform-main/4217

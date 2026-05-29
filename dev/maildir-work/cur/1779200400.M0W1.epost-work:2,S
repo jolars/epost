@@ -1,0 +1,18 @@
+Return-Path: <morgan@work.example>
+Delivered-To: dev@work.example
+Message-ID: <work-status-001@work.example>
+From: Morgan Cho <morgan@work.example>
+To: Dev <dev@work.example>
+Subject: Q2 status report — please review
+Date: Wed, 27 May 2026 08:30:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hi Dev,
+
+Could you give the attached Q2 status doc a read-through before our
+sync on Friday? The "Risks" section in particular — I want a second
+opinion on whether the migration is going to slip into Q3.
+
+Thanks,
+Morgan

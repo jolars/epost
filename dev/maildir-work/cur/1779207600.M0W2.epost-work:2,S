@@ -1,0 +1,24 @@
+Return-Path: <noreply@calendar.work.example>
+Delivered-To: dev@work.example
+Message-ID: <work-meeting-002@work.example>
+From: Calendar <noreply@calendar.work.example>
+To: Dev <dev@work.example>
+Subject: Invite: Platform sync (Fri 30 May, 10:00)
+Date: Wed, 27 May 2026 10:30:00 +0000
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html>
+  <body>
+    <h2>Platform sync</h2>
+    <p><strong>When:</strong> Friday, 30 May 2026 — 10:00–10:45 UTC</p>
+    <p><strong>Where:</strong> meet.work.example/platform-sync</p>
+    <p>Agenda:</p>
+    <ul>
+      <li>Q2 status review (Morgan)</li>
+      <li>Migration timeline confirmation</li>
+      <li>Open floor</li>
+    </ul>
+    <p><a href="https://calendar.work.example/respond?evt=platform-sync-0530">RSVP</a></p>
+  </body>
+</html>

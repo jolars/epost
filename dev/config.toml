@@ -28,14 +28,24 @@ browser = ["./dev/browser-stub"]
 protocol = "auto"
 max_height_cells = 24
 
-# Single dev account pointing at the scratch maildir. `dev/maildir/`
-# is the tracked, immutable fixture; `task dev` / `task run` mirror
-# it into `dev/scratch/maildir/` on first use so interactive flag
-# flips and folder moves stay out of git. Run `task maildir:reset` to
-# rebuild scratch from the tracked source.
+# Two dev accounts pointing at scratch maildirs. `dev/maildir/` and
+# `dev/maildir-work/` are the tracked, immutable fixtures; `task dev`
+# / `task run` mirror them into `dev/scratch/maildir{,-work}/` on first
+# use so interactive flag flips and folder moves stay out of git. Run
+# `task maildir:reset` to rebuild both scratch trees from the tracked
+# sources.
+
 [accounts.dev]
 maildir = "./dev/scratch/maildir"
 from = "Dev <dev@example.invalid>"
+sent_folder = "Sent"
+archive_folder = "Archive"
+spam_folder = "Spam"
+trash_folder = "Trash"
+
+[accounts.work]
+maildir = "./dev/scratch/maildir-work"
+from = "Dev <dev@work.example>"
 sent_folder = "Sent"
 archive_folder = "Archive"
 spam_folder = "Spam"

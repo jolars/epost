@@ -9,36 +9,79 @@ use crate::mail::parse;
 use crate::store::index::{FolderStat, Index, MessageRow};
 use crate::store::thread::{ThreadedRow, build_threads};
 
-/// Successful scan payload: the threaded INBOX rows the list pane
-/// renders, plus the per-folder roll-up the sidebar renders. Both are
-/// derived from the same index pass so the two views are consistent.
+/// Per-scope folder stats: `scope = None` is the unified "[all]" group;
+/// `Some(name)` is one account. The sidebar renders one group block per
+/// entry in display order: `[all]` first, then accounts alphabetically.
+#[derive(Debug, Clone)]
+pub struct AccountFolderStats {
+    pub scope: Option<String>,
+    pub folders: Vec<FolderStat>,
+}
+
+/// Successful scan payload: the threaded rows for the current scope the
+/// list pane renders, plus the multi-group folder roll-up the sidebar
+/// renders. Both are derived from the same index pass so the two views
+/// are consistent.
 pub struct ScanData {
     pub threads: Vec<ThreadedRow>,
-    pub folder_stats: Vec<FolderStat>,
+    pub groups: Vec<AccountFolderStats>,
 }
 
 pub type ScanResult = std::result::Result<ScanData, String>;
 
-pub fn start_worker(accounts: Vec<(String, PathBuf)>, cache_path: PathBuf) -> Receiver<ScanResult> {
+/// `current_scope` is the `(account, folder)` pair driving the list
+/// pane — `account = None` means the unified view. The grouped stats
+/// returned by the worker always cover every configured account plus
+/// the "[all]" group regardless of scope.
+pub fn start_worker(
+    accounts: Vec<(String, PathBuf)>,
+    cache_path: PathBuf,
+    current_scope: (Option<String>, String),
+) -> Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = run(&cache_path, &accounts).map_err(|e| format!("{e:#}"));
+        let result = run(&cache_path, &accounts, &current_scope).map_err(|e| format!("{e:#}"));
         let _ = tx.send(result);
     });
     rx
 }
 
-fn run(cache_path: &Path, accounts: &[(String, PathBuf)]) -> Result<ScanData> {
+fn run(
+    cache_path: &Path,
+    accounts: &[(String, PathBuf)],
+    current_scope: &(Option<String>, String),
+) -> Result<ScanData> {
     let mut idx = Index::open(cache_path)?;
     for (name, root) in accounts {
         scan_account(name, root, &mut idx)?;
     }
-    let rows = idx.list_folder("INBOX")?;
-    let folder_stats = idx.folder_stats()?;
+    let (scope_account, scope_folder) = current_scope;
+    let rows = idx.list_folder(scope_account.as_deref(), scope_folder)?;
+    let groups = build_groups(&idx, accounts)?;
     Ok(ScanData {
         threads: build_threads(rows),
-        folder_stats,
+        groups,
     })
+}
+
+/// One `folder_stats(None)` for the "[all]" group, then one
+/// `folder_stats(Some(account))` per configured account, sorted by name.
+/// Order matches what the sidebar renders top-to-bottom.
+fn build_groups(idx: &Index, accounts: &[(String, PathBuf)]) -> Result<Vec<AccountFolderStats>> {
+    let mut groups = Vec::with_capacity(accounts.len() + 1);
+    groups.push(AccountFolderStats {
+        scope: None,
+        folders: idx.folder_stats(None)?,
+    });
+    let mut names: Vec<&str> = accounts.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort();
+    for name in names {
+        groups.push(AccountFolderStats {
+            scope: Some(name.to_string()),
+            folders: idx.folder_stats(Some(name))?,
+        });
+    }
+    Ok(groups)
 }
 
 pub fn scan_account(account: &str, root: &Path, index: &mut Index) -> Result<ScanReport> {
@@ -75,19 +118,19 @@ pub fn scan_account(account: &str, root: &Path, index: &mut Index) -> Result<Sca
 
 /// Re-walk only the dirty (account, folder) pairs, prune the index for
 /// each one, and return a fresh `ScanData` whose `threads` reflects the
-/// current view (`list_folder`) and whose `folder_stats` aggregates
-/// across all folders. Disk I/O is restricted to the dirty folders'
-/// `cur/` and `new/`; everything else is pure SQL.
+/// current scope (`current_scope`) and whose `groups` rebuilds the
+/// multi-account sidebar stats. Disk I/O is restricted to the dirty
+/// folders' `cur/` and `new/`; everything else is pure SQL.
 pub fn rescan_folders(
     cache_path: PathBuf,
     accounts: HashMap<String, PathBuf>,
     dirty: HashSet<(String, String)>,
-    list_folder: String,
+    current_scope: (Option<String>, String),
 ) -> Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result =
-            rescan_run(&cache_path, &accounts, &dirty, &list_folder).map_err(|e| format!("{e:#}"));
+        let result = rescan_run(&cache_path, &accounts, &dirty, &current_scope)
+            .map_err(|e| format!("{e:#}"));
         let _ = tx.send(result);
     });
     rx
@@ -97,7 +140,7 @@ fn rescan_run(
     cache_path: &Path,
     accounts: &HashMap<String, PathBuf>,
     dirty: &HashSet<(String, String)>,
-    list_folder: &str,
+    current_scope: &(Option<String>, String),
 ) -> Result<ScanData> {
     let mut idx = Index::open(cache_path)?;
     let mut report = ScanReport::default();
@@ -119,11 +162,16 @@ fn rescan_run(
         let found = scan_folder(account, &folder_root, folder, &mut idx, &mut report)?;
         idx.prune_folder(account, folder, &found)?;
     }
-    let rows = idx.list_folder(list_folder)?;
-    let folder_stats = idx.folder_stats()?;
+    let (scope_account, scope_folder) = current_scope;
+    let rows = idx.list_folder(scope_account.as_deref(), scope_folder)?;
+    let acc_vec: Vec<(String, PathBuf)> = accounts
+        .iter()
+        .map(|(n, p)| (n.clone(), p.clone()))
+        .collect();
+    let groups = build_groups(&idx, &acc_vec)?;
     Ok(ScanData {
         threads: build_threads(rows),
-        folder_stats,
+        groups,
     })
 }
 
@@ -257,14 +305,10 @@ mod tests {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             cache.clone(),
+            (None, "INBOX".to_string()),
         );
         let initial = rx.recv().unwrap().unwrap();
-        let inbox_count_initial = initial
-            .folder_stats
-            .iter()
-            .find(|s| s.folder == "INBOX")
-            .map(|s| s.total)
-            .unwrap_or(0);
+        let inbox_count_initial = group_total(&initial.groups, None, "INBOX");
         assert_eq!(inbox_count_initial, 2);
 
         // Delete one INBOX file, add another to Archive — but mark only
@@ -274,25 +318,96 @@ mod tests {
 
         let mut dirty = HashSet::new();
         dirty.insert(("dev".to_string(), "INBOX".to_string()));
-        let rx = rescan_folders(cache.clone(), accounts.clone(), dirty, "INBOX".to_string());
+        let rx = rescan_folders(
+            cache.clone(),
+            accounts.clone(),
+            dirty,
+            (None, "INBOX".to_string()),
+        );
         let data = rx.recv().unwrap().unwrap();
 
         // INBOX dropped to 1 (pruned <a>).
-        let inbox = data
-            .folder_stats
-            .iter()
-            .find(|s| s.folder == "INBOX")
-            .map(|s| s.total)
-            .unwrap_or(99);
-        assert_eq!(inbox, 1, "INBOX should reflect the deletion");
+        assert_eq!(
+            group_total(&data.groups, None, "INBOX"),
+            1,
+            "INBOX should reflect the deletion"
+        );
         // Archive unchanged because not dirty (<d> not picked up).
-        let archive = data
-            .folder_stats
+        assert_eq!(
+            group_total(&data.groups, None, "Archive"),
+            1,
+            "Archive must NOT be re-walked"
+        );
+    }
+
+    /// Look up `total` for a `(scope, folder)` across the grouped sidebar
+    /// stats; 99 sentinel when missing so a failing assertion is obvious.
+    fn group_total(groups: &[AccountFolderStats], scope: Option<&str>, folder: &str) -> u64 {
+        groups
             .iter()
-            .find(|s| s.folder == "Archive")
+            .find(|g| g.scope.as_deref() == scope)
+            .and_then(|g| g.folders.iter().find(|s| s.folder == folder))
             .map(|s| s.total)
-            .unwrap_or(99);
-        assert_eq!(archive, 1, "Archive must NOT be re-walked");
+            .unwrap_or(99)
+    }
+
+    #[test]
+    fn rescan_with_two_accounts_returns_grouped_stats() {
+        use std::fs;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("idx.sqlite");
+        let root_a = tmp.path().join("personal");
+        let root_b = tmp.path().join("work");
+        for sub in ["cur", "new", "tmp"] {
+            fs::create_dir_all(root_a.join(sub)).unwrap();
+            fs::create_dir_all(root_b.join(sub)).unwrap();
+        }
+        let write_eml = |p: &Path, mid: &str| {
+            let mut f = fs::File::create(p).unwrap();
+            writeln!(f, "Message-ID: <{mid}>").unwrap();
+            writeln!(f, "Date: Thu, 1 Jan 1970 00:00:00 +0000").unwrap();
+            writeln!(f, "From: a@b").unwrap();
+            writeln!(f, "Subject: t").unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "body").unwrap();
+        };
+        write_eml(&root_a.join("cur").join("p1:2,S"), "p1");
+        write_eml(&root_a.join("cur").join("p2:2,S"), "p2");
+        write_eml(&root_b.join("cur").join("w1:2,S"), "w1");
+
+        let mut accounts: HashMap<String, PathBuf> = HashMap::new();
+        accounts.insert("personal".into(), root_a.clone());
+        accounts.insert("work".into(), root_b.clone());
+
+        let rx = start_worker(
+            accounts
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            cache.clone(),
+            (None, "INBOX".to_string()),
+        );
+        let data = rx.recv().unwrap().unwrap();
+
+        // [all] INBOX = 3, personal INBOX = 2, work INBOX = 1.
+        assert_eq!(group_total(&data.groups, None, "INBOX"), 3);
+        assert_eq!(group_total(&data.groups, Some("personal"), "INBOX"), 2);
+        assert_eq!(group_total(&data.groups, Some("work"), "INBOX"), 1);
+
+        // Groups must include both accounts plus the unified [all].
+        let mut scopes: Vec<Option<String>> = data.groups.iter().map(|g| g.scope.clone()).collect();
+        scopes.sort_by(|a, b| match (a, b) {
+            (None, _) => std::cmp::Ordering::Less,
+            (_, None) => std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => x.cmp(y),
+        });
+        assert_eq!(
+            scopes,
+            vec![None, Some("personal".to_string()), Some("work".to_string())]
+        );
     }
 
     #[test]
@@ -304,9 +419,9 @@ mod tests {
         }
         let report = scan_account("dev", root, &mut idx).unwrap();
         assert!(report.scanned >= 6, "scanned: {}", report.scanned);
-        let inbox = idx.list_folder("INBOX").unwrap();
+        let inbox = idx.list_folder(None, "INBOX").unwrap();
         assert!(!inbox.is_empty(), "inbox empty");
-        let sent = idx.list_folder("Sent").unwrap();
+        let sent = idx.list_folder(None, "Sent").unwrap();
         assert!(!sent.is_empty(), "sent empty");
     }
 }

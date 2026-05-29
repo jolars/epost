@@ -13,7 +13,7 @@ use crate::mail::flags::{self, FlagOp};
 use crate::mail::html::{self, Block};
 use crate::mail::parse;
 use crate::store::index::{FolderStat, Index, MessageRow};
-use crate::store::scan::{self, ScanResult};
+use crate::store::scan::{self, AccountFolderStats, ScanResult};
 use crate::store::thread::{ThreadedRow, build_threads};
 use crate::store::watch::{self, SelfWrites, Watcher, WatcherConfig, WatcherEvent};
 use crate::ui::compose::{ComposeScreen, ComposeStatus};
@@ -130,14 +130,21 @@ pub struct InboxScreen {
     /// Set by `ensure_body` when the body changed this tick; reader
     /// consumes it to drive the Clear pass.
     pub body_changed_this_tick: bool,
-    /// Per-folder (total, unread) roll-up surfaced to the sidebar.
-    /// Populated from the scan result and patched locally on flag
-    /// flips and cross-folder moves so the counts stay live without
-    /// a re-scan.
-    pub folder_stats: Vec<FolderStat>,
+    /// Per-scope, per-folder (total, unread) roll-up surfaced to the
+    /// sidebar. The first group is always the unified "[all]" view
+    /// (`scope = None`); subsequent groups are one per configured account
+    /// in alphabetical order. Populated from the scan result and patched
+    /// locally on flag flips and cross-folder moves so the counts stay
+    /// live without a re-scan.
+    pub folder_stats: Vec<AccountFolderStats>,
+    /// Which account the list pane is currently filtered by. `None` =
+    /// "[all]" (unified across accounts, today's default); `Some(name)`
+    /// scopes the list to that account.
+    pub current_account: Option<String>,
     /// Which folder the list pane is currently rendering. `INBOX` is
-    /// the unified default; `Alt-j`/`Alt-k` (and `j`/`k` in the Folders
-    /// pane) cycle through `folder_stats` and re-fetch from the index.
+    /// the default; `Alt-j`/`Alt-k` (and `j`/`k` in the Folders pane)
+    /// walk the flat sidebar entries (`[all]` group first, then one
+    /// `[account]` group per account) and re-fetch from the index.
     pub current_folder: String,
     scan_rx: Option<Receiver<ScanResult>>,
     /// `notify`-backed maildir watcher. `None` when `[watch].enabled =
@@ -404,6 +411,21 @@ impl App {
         self.inbox_mut().cycle_focus(forward);
     }
 
+    /// Switch the inbox to render `(account, folder)`. `account = None`
+    /// is the unified `[all]` view. Drives `:account` from cmdline.
+    pub fn switch_to_scope(&mut self, account: Option<String>, folder: &str) {
+        let Self {
+            screens,
+            cache_path,
+            status_error,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        inbox.switch_to_scope(account, folder, cache_path, status_error);
+    }
+
     pub fn focus_left(&mut self) {
         self.inbox_mut().focus_left();
     }
@@ -428,11 +450,12 @@ impl App {
         self.inbox_mut().select_prev();
     }
 
-    /// Advance / retreat through the sidebar's folder list and switch
-    /// the list pane to the new folder. Order mirrors what `folders::draw`
-    /// renders (INBOX pinned, rest alphabetical). Wraps at the ends so
-    /// holding Alt-j cycles indefinitely. No-op when no folders are
-    /// known yet (initial scan still pending).
+    /// Advance / retreat through the sidebar's flat list of selectable
+    /// `(scope, folder)` entries, skipping non-selectable group headers
+    /// (`[all]`, `[<account>]`). Order mirrors what `folders::draw`
+    /// renders: `[all]` group first, then accounts alphabetically; within
+    /// each group INBOX is pinned first, the rest alphabetical. Wraps at
+    /// the ends. No-op when no folders are known yet.
     pub fn cycle_folder(&mut self, forward: bool) {
         let Self {
             screens,
@@ -443,27 +466,25 @@ impl App {
         let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
             unreachable!("inbox is pinned at index 0")
         };
-        let mut order: Vec<String> = inbox
-            .folder_stats
-            .iter()
-            .map(|s| s.folder.clone())
-            .collect();
-        order.sort_by_key(|n| crate::ui::folders::folder_sort_key(n));
+        let order = crate::ui::folders::selectable_entries(&inbox.folder_stats);
         if order.is_empty() {
             return;
         }
         let n = order.len();
         let current_idx = order
             .iter()
-            .position(|f| f == &inbox.current_folder)
+            .position(|(scope, folder)| {
+                scope.as_deref() == inbox.current_account.as_deref()
+                    && folder == &inbox.current_folder
+            })
             .unwrap_or(0);
-        let next = if forward {
+        let next_idx = if forward {
             (current_idx + 1) % n
         } else {
             (current_idx + n - 1) % n
         };
-        let target = order[next].clone();
-        inbox.switch_to_folder(&target, cache_path, status_error);
+        let (target_scope, target_folder) = order[next_idx].clone();
+        inbox.switch_to_scope(target_scope, &target_folder, cache_path, status_error);
     }
 }
 
@@ -490,6 +511,7 @@ impl InboxScreen {
             Some(scan::start_worker(
                 accounts.clone(),
                 cache_path.to_path_buf(),
+                (None, "INBOX".to_string()),
             ))
         };
         let scan = if scan_rx.is_some() {
@@ -539,6 +561,7 @@ impl InboxScreen {
             last_image_rects: Vec::new(),
             body_changed_this_tick: false,
             folder_stats: Vec::new(),
+            current_account: None,
             current_folder: "INBOX".to_string(),
             scan_rx,
             watcher,
@@ -747,6 +770,7 @@ impl InboxScreen {
             };
             let mut snapshot = rows[i].row.clone();
             let src_folder = snapshot.folder.clone();
+            let account = snapshot.account.clone();
             let was_unread = !snapshot.flags.contains('S');
             snapshot.folder = target_folder.to_string();
             snapshot.path = new_path.to_path_buf();
@@ -756,11 +780,11 @@ impl InboxScreen {
             } else if self.selected >= rows.len() {
                 self.selected = rows.len() - 1;
             }
-            adjust_total(&mut self.folder_stats, &src_folder, -1);
-            adjust_total(&mut self.folder_stats, target_folder, 1);
+            adjust_total(&mut self.folder_stats, &account, &src_folder, -1);
+            adjust_total(&mut self.folder_stats, &account, target_folder, 1);
             if was_unread {
-                adjust_unread(&mut self.folder_stats, &src_folder, -1);
-                adjust_unread(&mut self.folder_stats, target_folder, 1);
+                adjust_unread(&mut self.folder_stats, &account, &src_folder, -1);
+                adjust_unread(&mut self.folder_stats, &account, target_folder, 1);
             }
             snapshot
         };
@@ -805,7 +829,12 @@ impl InboxScreen {
             t.row.path = new_path.to_path_buf();
             t.row.flags = new_flags.to_string();
             if unread_delta != 0 {
-                adjust_unread(&mut self.folder_stats, &t.row.folder, unread_delta);
+                adjust_unread(
+                    &mut self.folder_stats,
+                    &t.row.account,
+                    &t.row.folder,
+                    unread_delta,
+                );
             }
             t.row.clone()
         };
@@ -903,35 +932,38 @@ impl InboxScreen {
         self.selected_row().map(|r| r.row.path.clone())
     }
 
-    /// Switch the list pane to render `target` folder. Re-reads the
-    /// rows from the sqlite index (cheap — no maildir rescan) and
-    /// resets per-message state so the reader doesn't show stale body
-    /// content for the old selection. No-op when already on `target`.
-    pub fn switch_to_folder(
+    /// Switch the list pane to render `(account, folder)`. Re-reads the
+    /// rows from the sqlite index (cheap — no maildir rescan) and resets
+    /// per-message state so the reader doesn't show stale body content
+    /// for the old selection. `account = None` means the unified `[all]`
+    /// view. No-op when already on `(account, folder)`.
+    pub fn switch_to_scope(
         &mut self,
-        target: &str,
+        account: Option<String>,
+        folder: &str,
         cache_path: &Path,
         status_error: &mut Option<String>,
     ) {
-        if target == self.current_folder {
+        if account.as_deref() == self.current_account.as_deref() && folder == self.current_folder {
             return;
         }
         let idx = match Index::open(cache_path) {
             Ok(i) => i,
             Err(e) => {
-                *status_error = Some(format!("switch folder: open index: {e:#}"));
+                *status_error = Some(format!("switch scope: open index: {e:#}"));
                 return;
             }
         };
-        let rows = match idx.list_folder(target) {
+        let rows = match idx.list_folder(account.as_deref(), folder) {
             Ok(r) => r,
             Err(e) => {
-                *status_error = Some(format!("switch folder: list {target}: {e:#}"));
+                *status_error = Some(format!("switch scope: list {folder}: {e:#}"));
                 return;
             }
         };
         self.scan = ScanState::Ready(build_threads(rows));
-        self.current_folder = target.to_string();
+        self.current_account = account;
+        self.current_folder = folder.to_string();
         self.selected = 0;
         self.reader_scroll = 0;
         self.parsed = None;
@@ -940,7 +972,7 @@ impl InboxScreen {
         self.image_cache.clear();
         // Drives the reader's next-frame Clear pass so kitty/iTerm
         // image placements from the previous body don't ghost over
-        // the new folder's first message.
+        // the new scope's first message.
         self.body_changed_this_tick = true;
     }
 
@@ -951,7 +983,7 @@ impl InboxScreen {
         match rx.try_recv() {
             Ok(Ok(data)) => {
                 self.scan = ScanState::Ready(data.threads);
-                self.folder_stats = data.folder_stats;
+                self.folder_stats = data.groups;
                 self.selected = 0;
                 self.scan_rx = None;
             }
@@ -1022,23 +1054,28 @@ impl InboxScreen {
                 cache_path.to_path_buf(),
                 accounts,
                 dirty,
-                self.current_folder.clone(),
+                (self.current_account.clone(), self.current_folder.clone()),
             ));
         }
     }
 
     /// Apply a per-folder rescan payload. `folder_stats` is always
-    /// replaced (counts may have shifted). The list `scan` is replaced
-    /// only when the currently-viewed folder was actually re-walked
-    /// (i.e. `current_folder` is in `dirty`); otherwise the rescan
-    /// affected other folders and we leave the visible rows alone.
-    /// Selection is preserved by `msgid` when possible, snapping to row
-    /// 0 when the previously-selected message is no longer present.
+    /// replaced (counts may have shifted across both `[all]` and per-
+    /// account groups). The list `scan` is replaced only when the
+    /// current scope's folder was actually re-walked under an account
+    /// that intersects the scope; otherwise the rescan affected other
+    /// scopes and we leave the visible rows alone. Selection is
+    /// preserved by `msgid` when possible, snapping to row 0 when the
+    /// previously-selected message is no longer present.
     fn apply_rescan(&mut self, data: scan::ScanData, dirty: &HashSet<(String, String)>) {
-        self.folder_stats = data.folder_stats;
-        let view_touched = dirty
-            .iter()
-            .any(|(_, folder)| folder == &self.current_folder);
+        self.folder_stats = data.groups;
+        let view_touched = dirty.iter().any(|(account, folder)| {
+            folder == &self.current_folder
+                && match &self.current_account {
+                    None => true,
+                    Some(scope) => scope == account,
+                }
+        });
         if !view_touched {
             return;
         }
@@ -1138,27 +1175,53 @@ fn mirror_to_index(cache_path: &Path, row: &MessageRow) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn adjust_unread(stats: &mut Vec<FolderStat>, folder: &str, delta: i64) {
-    let entry = ensure_folder_entry(stats, folder);
-    entry.unread = apply_delta(entry.unread, delta);
-}
-
-fn adjust_total(stats: &mut Vec<FolderStat>, folder: &str, delta: i64) {
-    let entry = ensure_folder_entry(stats, folder);
-    entry.total = apply_delta(entry.total, delta);
-}
-
-fn ensure_folder_entry<'a>(stats: &'a mut Vec<FolderStat>, folder: &str) -> &'a mut FolderStat {
-    let pos = stats.iter().position(|s| s.folder == folder);
-    if let Some(i) = pos {
-        return &mut stats[i];
+/// Patch the unread count for `(account, folder)` in both the unified
+/// `[all]` group and the per-account group. Every per-account change is
+/// also a unified-view change, so we always touch both.
+fn adjust_unread(groups: &mut Vec<AccountFolderStats>, account: &str, folder: &str, delta: i64) {
+    for scope in [None, Some(account)] {
+        let entry = ensure_folder_entry(groups, scope, folder);
+        entry.unread = apply_delta(entry.unread, delta);
     }
-    stats.push(FolderStat {
-        folder: folder.to_string(),
-        total: 0,
-        unread: 0,
-    });
-    stats.last_mut().unwrap()
+}
+
+/// Patch the total count for `(account, folder)` in both the unified
+/// `[all]` group and the per-account group.
+fn adjust_total(groups: &mut Vec<AccountFolderStats>, account: &str, folder: &str, delta: i64) {
+    for scope in [None, Some(account)] {
+        let entry = ensure_folder_entry(groups, scope, folder);
+        entry.total = apply_delta(entry.total, delta);
+    }
+}
+
+fn ensure_folder_entry<'a>(
+    groups: &'a mut Vec<AccountFolderStats>,
+    scope: Option<&str>,
+    folder: &str,
+) -> &'a mut FolderStat {
+    let gi = match groups.iter().position(|g| g.scope.as_deref() == scope) {
+        Some(i) => i,
+        None => {
+            groups.push(AccountFolderStats {
+                scope: scope.map(str::to_string),
+                folders: Vec::new(),
+            });
+            groups.len() - 1
+        }
+    };
+    let group = &mut groups[gi];
+    let fi = match group.folders.iter().position(|s| s.folder == folder) {
+        Some(i) => i,
+        None => {
+            group.folders.push(FolderStat {
+                folder: folder.to_string(),
+                total: 0,
+                unread: 0,
+            });
+            group.folders.len() - 1
+        }
+    };
+    &mut group.folders[fi]
 }
 
 fn apply_delta(value: u64, delta: i64) -> u64 {
@@ -1427,6 +1490,40 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 smtp: None,
             },
         );
+        cfg
+    }
+
+    /// Two-account fixture: personal + work, each with an INBOX. Used by
+    /// the multi-account UI tests below. Drops one message into each
+    /// account's INBOX so scan results are non-empty.
+    fn two_account_config(tmp: &TempDir) -> Config {
+        let mut cfg = Config::default();
+        for name in ["personal", "work"] {
+            cfg.accounts.insert(
+                name.into(),
+                Account {
+                    maildir: tmp.path().join("Mail").join(name),
+                    from: format!("Tester <{name}@example.invalid>"),
+                    sent_folder: None,
+                    archive_folder: None,
+                    spam_folder: None,
+                    trash_folder: None,
+                    smtp: None,
+                },
+            );
+            let inbox = tmp.path().join("Mail").join(name);
+            fs::create_dir_all(inbox.join("cur")).unwrap();
+            fs::create_dir_all(inbox.join("new")).unwrap();
+            let body = format!(
+                "Message-ID: <{name}-1@x>\r\n\
+                 Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
+                 From: a@b\r\n\
+                 Subject: hi\r\n\
+                 \r\n\
+                 body\r\n"
+            );
+            fs::write(inbox.join("cur").join(format!("{name}-1:2,")), body).unwrap();
+        }
         cfg
     }
 
@@ -1854,11 +1951,13 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         drain_scan(&mut app);
 
         assert_eq!(app.inbox().current_folder, "INBOX");
+        // Flatten across groups: the `[all]` group should contain both
+        // folder rows.
         let folders: Vec<&str> = app
             .inbox()
             .folder_stats
             .iter()
-            .map(|s| s.folder.as_str())
+            .flat_map(|g| g.folders.iter().map(|s| s.folder.as_str()))
             .collect();
         assert!(folders.contains(&"INBOX"));
         assert!(folders.contains(&"Sent"));
@@ -1888,6 +1987,141 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let mut app = App::new(&cfg, cache, None, None);
         app.cycle_folder(true);
         assert_eq!(app.inbox().current_folder, "INBOX");
+    }
+
+    #[test]
+    fn cycle_folder_walks_groups_across_accounts() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = two_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app);
+
+        // Initial: [all] INBOX selected (None scope).
+        assert_eq!(app.inbox().current_account, None);
+        assert_eq!(app.inbox().current_folder, "INBOX");
+
+        // [all] INBOX → [personal] INBOX → [work] INBOX → wrap [all].
+        app.cycle_folder(true);
+        assert_eq!(app.inbox().current_account.as_deref(), Some("personal"));
+        assert_eq!(app.inbox().current_folder, "INBOX");
+
+        app.cycle_folder(true);
+        assert_eq!(app.inbox().current_account.as_deref(), Some("work"));
+        assert_eq!(app.inbox().current_folder, "INBOX");
+
+        app.cycle_folder(true);
+        assert_eq!(app.inbox().current_account, None);
+        assert_eq!(app.inbox().current_folder, "INBOX");
+    }
+
+    #[test]
+    fn account_scope_filters_list_view() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = two_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app);
+
+        // [all] sees 2 INBOX rows (one per account).
+        assert_eq!(app.inbox().threaded().len(), 2);
+
+        // Scope to personal — only the personal INBOX row remains.
+        app.switch_to_scope(Some("personal".into()), "INBOX");
+        assert_eq!(app.inbox().current_account.as_deref(), Some("personal"));
+        assert_eq!(app.inbox().threaded().len(), 1);
+        let mid = app.inbox().selected_msgid().unwrap();
+        assert_eq!(mid, "personal-1@x");
+
+        // Scope to work.
+        app.switch_to_scope(Some("work".into()), "INBOX");
+        assert_eq!(app.inbox().threaded().len(), 1);
+        assert_eq!(app.inbox().selected_msgid().as_deref(), Some("work-1@x"));
+
+        // Back to all.
+        app.switch_to_scope(None, "INBOX");
+        assert_eq!(app.inbox().current_account, None);
+        assert_eq!(app.inbox().threaded().len(), 2);
+    }
+
+    #[test]
+    fn flag_flip_updates_both_all_and_per_account_groups() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = two_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app);
+
+        // Pick whichever row is on top (date order), mark it read.
+        app.ensure_body_for_selection();
+
+        let groups = &app.inbox().folder_stats;
+        let all_inbox_unread = groups
+            .iter()
+            .find(|g| g.scope.is_none())
+            .and_then(|g| g.folders.iter().find(|f| f.folder == "INBOX"))
+            .map(|f| f.unread)
+            .unwrap();
+        // Both INBOXes started unread; one is now Seen → all-unread is 1.
+        assert_eq!(all_inbox_unread, 1);
+
+        // The owning account's per-account group also shows 1 unread
+        // (because each account had exactly one INBOX message that
+        // started unread, and the selected one belongs to one of them).
+        let selected_account = app
+            .inbox()
+            .selected_row()
+            .map(|r| r.row.account.clone())
+            .unwrap();
+        let other = if selected_account == "personal" {
+            "work"
+        } else {
+            "personal"
+        };
+        let read_acc_unread = groups
+            .iter()
+            .find(|g| g.scope.as_deref() == Some(selected_account.as_str()))
+            .and_then(|g| g.folders.iter().find(|f| f.folder == "INBOX"))
+            .map(|f| f.unread)
+            .unwrap();
+        let other_unread = groups
+            .iter()
+            .find(|g| g.scope.as_deref() == Some(other))
+            .and_then(|g| g.folders.iter().find(|f| f.folder == "INBOX"))
+            .map(|f| f.unread)
+            .unwrap();
+        assert_eq!(read_acc_unread, 0, "marking-read account drops to 0");
+        assert_eq!(other_unread, 1, "other account unchanged");
+    }
+
+    #[test]
+    fn account_command_switches_scope() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = two_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app);
+
+        cmdline::dispatch("account work", &mut app, &cfg);
+        assert_eq!(app.inbox().current_account.as_deref(), Some("work"));
+        assert_eq!(app.inbox().current_folder, "INBOX");
+
+        cmdline::dispatch("account all", &mut app, &cfg);
+        assert_eq!(app.inbox().current_account, None);
+
+        cmdline::dispatch("account bogus", &mut app, &cfg);
+        assert!(
+            app.status_error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("account: unknown")
+        );
+        // Scope unchanged on unknown.
+        assert_eq!(app.inbox().current_account, None);
     }
 
     #[test]

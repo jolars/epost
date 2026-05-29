@@ -6,11 +6,23 @@ use ratatui::widgets::Paragraph;
 
 use crate::ui::app::{App, Mode, Screen};
 
-/// Render the top-row tab strip: one tagged region per screen on the
-/// left, sync indicator + mode tag right-aligned. The active tab is
-/// inverted; dirty (compose) tabs eventually get a trailing `*`.
+/// Maximum width of the left-anchored `account · folder` badge before
+/// truncating with an ellipsis. Sized for `personal · INBOX` / `work ·
+/// SomeLongFolder` etc. and matched against the layout constraint.
+const BADGE_WIDTH: usize = 28;
+
+/// Render the top-row strip: `[account · folder]` badge on the left,
+/// tab strip in the middle, sync indicator + mode tag right-aligned.
+/// The active tab is inverted; dirty (compose) tabs get a trailing `*`.
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
-    let parts = Layout::horizontal([Constraint::Min(0), Constraint::Length(12)]).split(area);
+    let parts = Layout::horizontal([
+        Constraint::Length(BADGE_WIDTH as u16),
+        Constraint::Min(0),
+        Constraint::Length(12),
+    ])
+    .split(area);
+
+    let badge = badge_line(app);
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(app.screens.len() * 2 + 1);
     spans.push(Span::raw(" "));
@@ -33,8 +45,50 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(mode_tag(app.mode), Style::default().fg(Color::Yellow)),
     ]);
 
-    f.render_widget(Paragraph::new(Line::from(spans)), parts[0]);
-    f.render_widget(Paragraph::new(right), parts[1]);
+    f.render_widget(Paragraph::new(badge), parts[0]);
+    f.render_widget(Paragraph::new(Line::from(spans)), parts[1]);
+    f.render_widget(Paragraph::new(right), parts[2]);
+}
+
+/// `[account · folder]` badge. Account defaults to `all` when no scope
+/// is selected. Overflow truncates with an ellipsis on the folder side
+/// so the account label stays legible.
+fn badge_line(app: &App) -> Line<'static> {
+    let inbox = app.inbox();
+    let account = inbox.current_account.as_deref().unwrap_or("all");
+    let text = format_badge(account, &inbox.current_folder, BADGE_WIDTH);
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+}
+
+fn format_badge(account: &str, folder: &str, max_width: usize) -> String {
+    // " {account} · {folder} " is the target; budget so the whole
+    // thing fits in `max_width` cells.
+    let prefix_chars = 1 + account.chars().count() + 3; // " {account} · "
+    let suffix_pad = 1; // trailing " "
+    if prefix_chars + suffix_pad >= max_width {
+        // Account name alone already overflows; truncate that.
+        let allowed = max_width.saturating_sub(2); // leading + trailing " "
+        let acc = truncate_to(account, allowed);
+        return format!(" {acc} ");
+    }
+    let folder_budget = max_width - prefix_chars - suffix_pad;
+    let folder_t = truncate_to(folder, folder_budget);
+    format!(" {account} · {folder_t} ")
+}
+
+fn truncate_to(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in s.chars().enumerate() {
+        if count + 1 > max_chars {
+            if max_chars >= 1 {
+                out.pop();
+                out.push('…');
+            }
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn tab_label(screen: &Screen) -> String {
@@ -52,5 +106,40 @@ fn mode_tag(mode: Mode) -> &'static str {
         Mode::Normal => "NORMAL  ",
         Mode::Command => "COMMAND ",
         Mode::LinkPick => "LINKPICK",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn badge_fits_within_width() {
+        let text = format_badge("personal", "INBOX", BADGE_WIDTH);
+        assert!(text.chars().count() <= BADGE_WIDTH);
+        assert_eq!(text, " personal · INBOX ");
+    }
+
+    #[test]
+    fn badge_defaults_to_all() {
+        // The `app` branch can't be tested without an App; format_badge
+        // does the heavy lifting and the "all" string is wired in
+        // badge_line.
+        let text = format_badge("all", "INBOX", BADGE_WIDTH);
+        assert_eq!(text, " all · INBOX ");
+    }
+
+    #[test]
+    fn badge_truncates_long_folder() {
+        let text = format_badge("work", "ReallyLongFolderNameHere", BADGE_WIDTH);
+        assert!(text.chars().count() <= BADGE_WIDTH);
+        assert!(text.ends_with("… "));
+    }
+
+    #[test]
+    fn badge_truncates_long_account_when_alone() {
+        let text = format_badge("verylongaccountname-overflowing", "INBOX", 16);
+        assert!(text.chars().count() <= 16);
+        assert!(text.contains('…'));
     }
 }
