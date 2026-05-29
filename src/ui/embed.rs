@@ -14,6 +14,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Minimum gap between redraw nudges from the pty reader. The parser
+/// is still fed every byte; this only throttles the `Wake` sent to the
+/// main loop so a burst of pty output (e.g. the screen-clearing flurry
+/// nvim emits on exit) doesn't queue a redraw per chunk and starve the
+/// waiter's exit Wake behind tens of `terminal.draw()` calls.
+const WAKE_THROTTLE: Duration = Duration::from_millis(16);
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,10 +29,68 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 
 use crate::ui::events::AppEvent;
 
+/// vt100 callback impl that answers terminal-capability queries the
+/// hosted editor (notably nvim) sends at startup. Without these replies,
+/// nvim waits for per-query timeouts (~200ms–1s each) before falling
+/// back to terminfo defaults — that's where the multi-second startup
+/// tax we were seeing inside the embedded pty came from. Real terminals
+/// answer these; the vt100 crate's default parser silently drops them.
+///
+/// We don't try to be a faithful vt500; the goal is "reply *something*
+/// well-formed fast enough that nvim doesn't sit on a timeout."
+#[derive(Default)]
+struct ReplyCallbacks {
+    /// Bytes the parser wants written back to the child. The reader
+    /// thread drains this after each `parser.process()` call and forwards
+    /// to the pty master writer.
+    pending: Vec<u8>,
+}
+
+impl vt100::Callbacks for ReplyCallbacks {
+    fn unhandled_csi(
+        &mut self,
+        _: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let first_param = || {
+            params
+                .iter()
+                .next()
+                .and_then(|p| p.first().copied())
+                .unwrap_or(0)
+        };
+        match (i1, i2, c) {
+            // DA1: "what kind of terminal are you?" — claim VT220-class.
+            (None, _, 'c') => self.pending.extend_from_slice(b"\x1b[?62;c"),
+            // DA2: secondary device attributes — claim xterm-like.
+            (Some(b'>'), _, 'c') => self.pending.extend_from_slice(b"\x1b[>0;276;0c"),
+            // DSR (device status report).
+            (None, _, 'n') => match first_param() {
+                5 => self.pending.extend_from_slice(b"\x1b[0n"), // terminal OK
+                6 => self.pending.extend_from_slice(b"\x1b[1;1R"), // cursor pos (we don't actually know)
+                _ => {}
+            },
+            // DECRQM: "is mode N set?" — reply "not recognized" for any
+            // mode. We don't currently support synchronized output,
+            // bracketed paste, etc. at this layer; answering 0 lets nvim
+            // know immediately and pick its fallback path without waiting.
+            (Some(b'?'), Some(b'$'), 'p') => {
+                let mode = first_param();
+                let reply = format!("\x1b[?{mode};0$y");
+                self.pending.extend_from_slice(reply.as_bytes());
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct EditorSession {
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<ReplyCallbacks>>>,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     done_rx: Receiver<()>,
     /// Set by the reader thread on first byte read from the pty.
     /// Until then the UI keeps showing the form preview, so the
@@ -67,6 +133,17 @@ impl EditorSession {
             cmd.arg(arg);
         }
         cmd.arg(path);
+        // portable_pty's CommandBuilder calls env_clear() internally
+        // and only re-adds what we set here, so without this pass-through
+        // nvim/vim would launch with essentially $SHELL + $TERM and
+        // nothing else — no HOME, PATH, LANG, COLORTERM, XDG_*, etc.
+        // That breaks the user's config + plugins, falls back to 256
+        // colors, and forces a getpwuid() lookup for home, all of which
+        // make the embedded editor feel sluggish vs the same editor
+        // launched from a normal shell.
+        for (k, v) in std::env::vars_os() {
+            cmd.env(k, v);
+        }
         cmd.env("TERM", "xterm-256color");
 
         let mut child = pair
@@ -77,12 +154,21 @@ impl EditorSession {
         // only reference; otherwise EOF on the master never fires.
         drop(pair.slave);
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            0,
+            ReplyCallbacks::default(),
+        )));
         let primed = Arc::new(AtomicBool::new(false));
 
+        let raw_writer = pair.master.take_writer().context("taking pty writer")?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(raw_writer));
+
         // Reader thread: pull bytes from the pty master, feed the
-        // parser, and wake the main loop so it redraws. `primed`
-        // flips on first byte so the UI knows when to swap the
+        // parser, write any capability-query replies the callbacks
+        // queued back to the pty, and wake the main loop so it redraws.
+        // `primed` flips on first byte so the UI knows when to swap the
         // "starting $EDITOR…" placeholder for the pty grid.
         let mut reader = pair
             .master
@@ -92,17 +178,34 @@ impl EditorSession {
             let parser = parser.clone();
             let primed = primed.clone();
             let wake = wake.clone();
+            let writer = writer.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
+                let mut last_wake: Option<Instant> = None;
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            let mut replies: Vec<u8> = Vec::new();
                             if let Ok(mut p) = parser.lock() {
                                 p.process(&buf[..n]);
+                                replies = std::mem::take(&mut p.callbacks_mut().pending);
+                            }
+                            if !replies.is_empty()
+                                && let Ok(mut w) = writer.lock()
+                            {
+                                let _ = w.write_all(&replies);
+                                let _ = w.flush();
                             }
                             primed.store(true, Ordering::Release);
-                            let _ = wake.send(AppEvent::Wake);
+                            let now = Instant::now();
+                            let elapsed = last_wake
+                                .map(|t| now.duration_since(t))
+                                .unwrap_or(WAKE_THROTTLE);
+                            if elapsed >= WAKE_THROTTLE {
+                                last_wake = Some(now);
+                                let _ = wake.send(AppEvent::Wake);
+                            }
                         }
                         Err(_) => break,
                     }
@@ -120,8 +223,6 @@ impl EditorSession {
             let _ = done_tx.send(());
             let _ = wake_for_wait.send(AppEvent::Wake);
         });
-
-        let writer = pair.master.take_writer().context("taking pty writer")?;
 
         Ok(Self {
             parser,
@@ -192,8 +293,10 @@ impl EditorSession {
         if bytes.is_empty() {
             return false;
         }
-        let _ = self.writer.write_all(&bytes);
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(&bytes);
+            let _ = w.flush();
+        }
         true
     }
 }

@@ -1,4 +1,4 @@
-use std::io::{self, Stdout};
+use std::io::{self, BufWriter, Stdout, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{RecvTimeoutError, Sender};
@@ -87,7 +87,7 @@ fn main() -> ExitCode {
 }
 
 fn run(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     cfg: &Config,
     cache_path: PathBuf,
     picker: Option<ratatui_image::picker::Picker>,
@@ -141,7 +141,7 @@ fn process_event(app: &mut App, cfg: &Config, ev: AppEvent) {
 }
 
 fn tick(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     app: &mut App,
     cfg: &Config,
     event_tx: &Sender<AppEvent>,
@@ -156,9 +156,27 @@ fn tick(
         .unwrap_or(ratatui::layout::Size::new(80, 24));
     spawn_pending_editors(app, &cfg.compose, term_size, event_tx);
 
-    terminal
-        .draw(|f| ui::app::draw(f, app))
-        .context("drawing frame")?;
+    // DEC Synchronized Output (mode 2026): tell the host terminal to
+    // buffer everything between BSU and ESU and apply it as one atomic
+    // frame instead of painting cell-by-cell. Terminals that don't
+    // support it silently ignore the DEC private modes, so this is safe
+    // to emit unconditionally. Major win on dense redraws (closing the
+    // embedded editor, scrolling a truecolor-highlighted buffer, etc.)
+    // because the host terminal does one composite update per frame
+    // instead of many partial paints. Modelled after vaxis's writer.go.
+    {
+        let backend = terminal.backend_mut();
+        let _ = backend.write_all(b"\x1b[?2026h");
+    }
+    // Drop the CompletedFrame here so terminal isn't still borrowed when
+    // we reach for backend_mut() again to emit the ESU.
+    let draw_res = terminal.draw(|f| ui::app::draw(f, app)).map(|_| ());
+    {
+        let backend = terminal.backend_mut();
+        let _ = backend.write_all(b"\x1b[?2026l");
+        let _ = backend.flush();
+    }
+    draw_res.context("drawing frame")?;
     Ok(())
 }
 
