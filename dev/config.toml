@@ -19,6 +19,10 @@ prefer = "html"
 # the target path/URL as the final argument. Pointed at the in-repo stub
 # so dev runs and tests don't fire a real browser.
 browser = ["./dev/browser-stub"]
+# Reader yanks (`Y` / `yp` / `yl`) emit OSC 52 by default — uncomment to
+# pipe the selected text to this command's stdin instead, for tmux or
+# terminals where OSC 52 is disabled.
+# clipboard = ["wl-copy"]
 
 [search]
 # Folders covered by `g/` (global) search, in priority order. Empty list

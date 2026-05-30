@@ -151,6 +151,7 @@ fn tick(
     app.poll_watch(cfg);
     app.poll_compose_sends();
     app.poll_sync();
+    app.poll_clipboard();
     app.ensure_body_for_selection();
 
     finalize_finished_editors(app);

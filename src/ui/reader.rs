@@ -19,12 +19,76 @@ const IMAGE_MARKER_PREFIX: &str = "\u{E000}img:";
 /// Reader-pane layout output. `lines` is what gets rendered into ratatui
 /// cells; `links` is the link-picker table; `images` is the list of
 /// rects that need a `SlicedImage` painted over them after the paragraph
-/// has drawn.
+/// has drawn. `line_block_idx` is a parallel vec the same length as
+/// `lines`: each entry records which top-level input `Block` produced
+/// that line, so reader yanks can resolve a cursor row back to the
+/// source IR.
 #[derive(Debug, Default)]
 pub struct LaidOutBody {
     pub lines: Vec<Line<'static>>,
     pub links: Vec<LinkSlot>,
     pub images: Vec<ImageSlot>,
+    pub line_block_idx: Vec<Option<usize>>,
+}
+
+impl LaidOutBody {
+    /// Top-level input Block index responsible for the wrapped line
+    /// `line`. Lines in trailing whitespace (e.g. the empty separator
+    /// emitted after a paragraph) inherit the preceding block, so a
+    /// cursor parked on a blank-line gap still resolves to a real
+    /// paragraph rather than `None`.
+    pub fn block_at(&self, line: u16) -> Option<usize> {
+        if self.line_block_idx.is_empty() {
+            return None;
+        }
+        let mut idx = (line as usize).min(self.line_block_idx.len() - 1);
+        loop {
+            if let Some(b) = self.line_block_idx[idx] {
+                return Some(b);
+            }
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+        }
+    }
+
+    /// First link whose earliest segment lies on or after `line`.
+    /// Falls back to the first link in the body when nothing matches —
+    /// `yl` from above a single off-screen link still copies it.
+    pub fn first_link_at_or_after(&self, line: u16) -> Option<&LinkSlot> {
+        let line = line as usize;
+        let mut best: Option<(&LinkSlot, usize)> = None;
+        for slot in &self.links {
+            let Some(min_line) = slot.segments.iter().map(|s| s.line).min() else {
+                continue;
+            };
+            if min_line < line {
+                continue;
+            }
+            best = Some(match best {
+                Some((cur, cur_min)) if cur_min <= min_line => (cur, cur_min),
+                _ => (slot, min_line),
+            });
+        }
+        best.map(|(s, _)| s).or_else(|| self.links.first())
+    }
+
+    /// Count of links with at least one segment inside the
+    /// `[scroll, scroll + height)` viewport. Drives the "yanked link 1
+    /// of N" status hint when more than one link is visible.
+    pub fn visible_link_count(&self, scroll: u16, height: u16) -> usize {
+        let top = scroll as usize;
+        let bot = top + height as usize;
+        self.links
+            .iter()
+            .filter(|s| {
+                s.segments
+                    .iter()
+                    .any(|seg| seg.line >= top && seg.line < bot)
+            })
+            .count()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +151,8 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
 
     let mut laid: Option<LaidOutBody> = None;
     let header_lines: Vec<Line<'static>>;
+    let mut header_offset_this_frame: u16 = 0;
+    let mut body_only_lines_this_frame: u16 = 0;
 
     // Gate on the search-aware selected row, not raw `inbox.scan`: a
     // global-search result may live in a folder whose scan isn't the
@@ -111,6 +177,8 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                 for slot in &mut body.images {
                     slot.line += offset;
                 }
+                header_offset_this_frame = offset.min(u16::MAX as usize) as u16;
+                body_only_lines_this_frame = body.lines.len().min(u16::MAX as usize) as u16;
                 header_lines = out;
                 let mut combined: Vec<Line<'static>> =
                     Vec::with_capacity(header_lines.len() + body.lines.len() + 4);
@@ -148,6 +216,30 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     // but `j` from there is fine.
     inbox.last_reader_body_lines = lines.len().min(u16::MAX as usize) as u16;
     inbox.last_reader_inner_height = area.height.saturating_sub(2);
+    inbox.last_reader_inner_width = inner_width;
+    inbox.last_reader_header_offset = header_offset_this_frame;
+    inbox.last_reader_body_only_lines = body_only_lines_this_frame;
+    // Clamp the body-relative cursor into the visible viewport so it
+    // tracks "topmost visible body line" until visual mode introduces
+    // independent movement. Scroll above the body (cursor below
+    // viewport top) → snap cursor up; scroll past the cursor (cursor
+    // above viewport bottom) → snap cursor down. Also clamp into the
+    // body's actual length so `yp` never indexes off the end.
+    let inner_h = inbox.last_reader_inner_height;
+    let header = inbox.last_reader_header_offset;
+    let body_top = inbox.reader_scroll.saturating_sub(header);
+    if inner_h > 0 && body_only_lines_this_frame > 0 {
+        let body_bot_excl = body_top.saturating_add(inner_h);
+        if inbox.reader_cursor_line < body_top {
+            inbox.reader_cursor_line = body_top;
+        }
+        if inbox.reader_cursor_line >= body_bot_excl {
+            inbox.reader_cursor_line = body_bot_excl - 1;
+        }
+        if inbox.reader_cursor_line >= body_only_lines_this_frame {
+            inbox.reader_cursor_line = body_only_lines_this_frame - 1;
+        }
+    }
 
     let widget = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -307,25 +399,44 @@ where
     R: FnMut(&ImageKey) -> Option<&'r crate::ui::images::ResolvedImage>,
 {
     let mut ctx = LayoutCtx::new(width, link_pick);
-    for block in blocks {
+    // Tag each newly-pushed line with its top-level block index. The
+    // catch-up pattern (extend after the block emits) means we don't
+    // have to thread block-index through every `self.lines.push` and
+    // `LineBuilder::flush_line` site — every line landing in `ctx.lines`
+    // between `before` and `after` gets the same tag, including nested
+    // pushes from `Block::Quote` / `Block::List` walkers that don't know
+    // which top-level block they belong to.
+    for (idx, block) in blocks.iter().enumerate() {
         ctx.emit_block(block, 0);
+        while ctx.line_block_idx.len() < ctx.lines.len() {
+            ctx.line_block_idx.push(Some(idx));
+        }
     }
     // Pass 2: expand sentinel marker lines into reserved blanks and
     // record absolute image slots. Doing the expansion here (rather than
     // inside `emit_block`) keeps the blockquote `> ` prefix and list
     // bullet prefix on the marker line only — the reserved blanks below
     // stay clean for the overlay to paint over.
-    let mut out_lines: Vec<Line<'static>> = Vec::with_capacity(ctx.lines.len());
+    let LayoutCtx {
+        width: ctx_width,
+        lines,
+        line_block_idx,
+        links,
+        ..
+    } = ctx;
+    let mut out_lines: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     let mut out_images: Vec<ImageSlot> = Vec::new();
-    for line in ctx.lines.into_iter() {
+    let mut out_block_idx: Vec<Option<usize>> = Vec::with_capacity(line_block_idx.len());
+    for (line, block_idx) in lines.into_iter().zip(line_block_idx) {
         if let Some((key, indent_cols)) = sentinel_key(&line) {
             if let Some(resolved) = resolve(&key) {
-                let usable_w = ctx.width.saturating_sub(indent_cols);
+                let usable_w = ctx_width.saturating_sub(indent_cols);
                 let cells_w = resolved.width_cells.min(usable_w).max(1);
                 let cells_h = resolved.height_cells.max(1);
                 let slot_line = out_lines.len();
                 for _ in 0..cells_h {
                     out_lines.push(reserved_blank_line(indent_cols, cells_w));
+                    out_block_idx.push(block_idx);
                 }
                 out_images.push(ImageSlot {
                     key,
@@ -336,15 +447,18 @@ where
                 });
             } else {
                 out_lines.push(placeholder_from_sentinel(line, indent_cols));
+                out_block_idx.push(block_idx);
             }
         } else {
             out_lines.push(line);
+            out_block_idx.push(block_idx);
         }
     }
     LaidOutBody {
         lines: out_lines,
-        links: ctx.links,
+        links,
         images: out_images,
+        line_block_idx: out_block_idx,
     }
 }
 
@@ -410,6 +524,10 @@ struct LayoutCtx<'a> {
     width: u16,
     next_link_id: u32,
     lines: Vec<Line<'static>>,
+    /// Parallel to `lines` during pass-1, extended after each top-level
+    /// block emits via the catch-up loop in `layout_with_images`. Pass-2
+    /// rebuilds it alongside the expanded `lines` vec.
+    line_block_idx: Vec<Option<usize>>,
     links: Vec<LinkSlot>,
     link_pick: Option<&'a str>,
 }
@@ -420,6 +538,7 @@ impl<'a> LayoutCtx<'a> {
             width: width.max(8),
             next_link_id: 1,
             lines: Vec::new(),
+            line_block_idx: Vec::new(),
             links: Vec::new(),
             link_pick,
         }
@@ -1274,6 +1393,123 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("[remote image: pixel]"), "{joined}");
+    }
+
+    #[test]
+    fn line_block_idx_aligns_with_lines() {
+        let blocks = html::parse("<p>one</p><p>two</p><h2>three</h2>");
+        let laid = layout(&blocks, 40, None);
+        assert_eq!(
+            laid.line_block_idx.len(),
+            laid.lines.len(),
+            "parallel vec must mirror lines length"
+        );
+        // Each non-empty rendered line should resolve to a real block.
+        for (i, line) in laid.lines.iter().enumerate() {
+            let text = line_text(line);
+            if text.trim().is_empty() {
+                continue;
+            }
+            assert!(
+                laid.line_block_idx[i].is_some(),
+                "line {i} ({text:?}) had no block tag"
+            );
+        }
+        // The line containing "one" must be tagged with block 0;
+        // "three" with block 2.
+        let one = laid
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("one"))
+            .unwrap();
+        assert_eq!(laid.line_block_idx[one], Some(0));
+        let three = laid
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("three"))
+            .unwrap();
+        assert_eq!(laid.line_block_idx[three], Some(2));
+    }
+
+    #[test]
+    fn block_at_resolves_cursor_to_top_level_block() {
+        let blocks = html::parse("<p>one</p><blockquote><p>quoted</p></blockquote><p>tail</p>");
+        let laid = layout(&blocks, 40, None);
+        let quoted_line = laid
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("quoted"))
+            .expect("quoted line");
+        // The quote is the second top-level block (index 1) and a
+        // cursor on the quoted line must resolve to it.
+        assert_eq!(laid.block_at(quoted_line as u16), Some(1));
+    }
+
+    #[test]
+    fn first_link_at_or_after_skips_earlier_links() {
+        // Three links on three separate paragraphs so they're on
+        // distinct lines without wrapping.
+        let html_src = r#"<p><a href="https://a">A</a></p>
+            <p><a href="https://b">B</a></p>
+            <p><a href="https://c">C</a></p>"#;
+        let blocks = html::parse(html_src);
+        let laid = layout(&blocks, 40, None);
+        // Cursor above the first link: first match is link A.
+        let first = laid.first_link_at_or_after(0).expect("any link");
+        assert_eq!(first.href, "https://a");
+        // Cursor on the line of link B: jumps to B, not A.
+        let b_line = laid.links[1].segments.first().expect("b segment").line as u16;
+        let second = laid.first_link_at_or_after(b_line).expect("any link");
+        assert_eq!(second.href, "https://b");
+    }
+
+    #[test]
+    fn first_link_at_or_after_falls_back_when_cursor_past_last() {
+        let blocks = html::parse(r#"<p><a href="https://only">only</a></p>"#);
+        let laid = layout(&blocks, 40, None);
+        // Cursor below the only link: still yanks it (the fallback that
+        // makes `yl` "just work" when the user is scrolled past the
+        // single link in the body).
+        let s = laid.first_link_at_or_after(9999).expect("fallback link");
+        assert_eq!(s.href, "https://only");
+    }
+
+    #[test]
+    fn visible_link_count_filters_by_viewport() {
+        let html_src = r#"<p><a href="https://a">A</a></p>
+            <p><a href="https://b">B</a></p>"#;
+        let blocks = html::parse(html_src);
+        let laid = layout(&blocks, 40, None);
+        let a_line = laid.links[0].segments[0].line as u16;
+        let b_line = laid.links[1].segments[0].line as u16;
+        // Viewport tight enough to include only A.
+        assert_eq!(laid.visible_link_count(a_line, 1), 1);
+        // Wide enough to cover both.
+        assert_eq!(laid.visible_link_count(a_line, b_line - a_line + 1), 2);
+        // Past both links.
+        assert_eq!(laid.visible_link_count(b_line + 5, 5), 0);
+    }
+
+    #[test]
+    fn line_block_idx_survives_image_expansion() {
+        let blocks = html::parse(r#"<p>before</p><img src="cid:x" alt="L"><p>after</p>"#);
+        let resolved = fake_resolved(4, 3);
+        let key = ImageKey::Cid("x".to_string());
+        let laid = layout_with_images(&blocks, 40, None, |k| {
+            if *k == key { Some(&resolved) } else { None }
+        });
+        assert_eq!(laid.line_block_idx.len(), laid.lines.len());
+        // Image is block 1 (zero-indexed). All reserved blank lines
+        // from its expansion must carry block_idx = Some(1) so a yp
+        // there resolves back to the image's alt text.
+        let slot = laid.images.first().expect("image slot");
+        for i in 0..slot.height as usize {
+            assert_eq!(
+                laid.line_block_idx[slot.line + i],
+                Some(1),
+                "reserved blank line {i} lost its block tag"
+            );
+        }
     }
 
     #[test]

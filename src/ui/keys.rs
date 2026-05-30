@@ -1,7 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::Config;
+use crate::mail::text;
 use crate::ui::app::{App, Mode, Pane, Screen};
+use crate::ui::clipboard::{self, YankOutcome};
 use crate::ui::{cmdline, compose};
 
 pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
@@ -200,40 +202,66 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             }
             _ => {}
         },
-        Pane::Reader => match k.code {
-            KeyCode::Char('j') => {
-                let inbox = app.inbox_mut();
-                inbox.reader_scroll = inbox.reader_scroll.saturating_add(1);
+        Pane::Reader => {
+            // `y` prefix in Reader: `yp` yank-paragraph, `yl` yank-link.
+            // Mirrors `pending_g` — armed on `y`, cleared on the next
+            // key. Anything we don't recognise clears the prefix and
+            // falls through to the rest of the Reader keymap so e.g.
+            // `y` then `j` still scrolls.
+            if app.pending_y {
+                app.pending_y = false;
+                match k.code {
+                    KeyCode::Char('p') => {
+                        yank_paragraph(app, cfg);
+                        return;
+                    }
+                    KeyCode::Char('l') => {
+                        yank_link(app, cfg);
+                        return;
+                    }
+                    KeyCode::Esc => return,
+                    _ => { /* fall through */ }
+                }
             }
-            KeyCode::Char('k') => {
-                let inbox = app.inbox_mut();
-                inbox.reader_scroll = inbox.reader_scroll.saturating_sub(1);
+            match k.code {
+                KeyCode::Char('j') => {
+                    let inbox = app.inbox_mut();
+                    inbox.reader_scroll = inbox.reader_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') => {
+                    let inbox = app.inbox_mut();
+                    inbox.reader_scroll = inbox.reader_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('G') => {
+                    let inbox = app.inbox_mut();
+                    inbox.reader_scroll = inbox
+                        .last_reader_body_lines
+                        .saturating_sub(inbox.last_reader_inner_height);
+                }
+                KeyCode::Char('f') => {
+                    app.link_pick_buf.clear();
+                    app.mode = Mode::LinkPick;
+                }
+                KeyCode::Char('y') => {
+                    app.pending_y = true;
+                }
+                KeyCode::Char('Y') => yank_body(app, cfg),
+                KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
+                KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
+                KeyCode::Char('F') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Forward),
+                KeyCode::Esc => {
+                    let inbox = app.inbox_mut();
+                    inbox.focus = if inbox.list_visible {
+                        Pane::List
+                    } else if inbox.sidebar_visible {
+                        Pane::Folders
+                    } else {
+                        Pane::Reader
+                    };
+                }
+                _ => {}
             }
-            KeyCode::Char('G') => {
-                let inbox = app.inbox_mut();
-                inbox.reader_scroll = inbox
-                    .last_reader_body_lines
-                    .saturating_sub(inbox.last_reader_inner_height);
-            }
-            KeyCode::Char('f') => {
-                app.link_pick_buf.clear();
-                app.mode = Mode::LinkPick;
-            }
-            KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
-            KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
-            KeyCode::Char('F') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Forward),
-            KeyCode::Esc => {
-                let inbox = app.inbox_mut();
-                inbox.focus = if inbox.list_visible {
-                    Pane::List
-                } else if inbox.sidebar_visible {
-                    Pane::Folders
-                } else {
-                    Pane::Reader
-                };
-            }
-            _ => {}
-        },
+        }
         Pane::Folders => match k.code {
             KeyCode::Char('j') => app.cycle_folder(true),
             KeyCode::Char('k') => app.cycle_folder(false),
@@ -326,6 +354,107 @@ fn enter_command(app: &mut App) {
 fn exit_command(app: &mut App) {
     app.cmdline.clear();
     app.mode = Mode::Normal;
+}
+
+/// Yank the entire parsed body. `Y` in Reader pane.
+fn yank_body(app: &mut App, cfg: &Config) {
+    let text = match app.inbox_parsed() {
+        Some(p) => text::extract_body(&p.blocks),
+        None => {
+            app.status_error = Some("yank: no parsed body".into());
+            return;
+        }
+    };
+    if text.is_empty() {
+        app.status_error = Some("yank: empty body".into());
+        return;
+    }
+    dispatch_yank(app, cfg, text, "yanked body".to_string());
+}
+
+/// Yank the top-level block at the reader cursor. `yp` in Reader pane.
+/// Cursor lives in body-relative coords (clamped into viewport each
+/// draw), so this effectively yanks the topmost visible block until
+/// visual mode introduces independent cursor movement.
+fn yank_paragraph(app: &mut App, cfg: &Config) {
+    let inbox = app.inbox();
+    let width = inbox.last_reader_inner_width.max(8);
+    let cursor = inbox.reader_cursor_line;
+    let text = match app.inbox_parsed() {
+        Some(p) if !p.blocks.is_empty() => {
+            let laid = crate::ui::reader::layout(&p.blocks, width, None);
+            match laid.block_at(cursor) {
+                Some(idx) => text::extract_block(&p.blocks[idx]),
+                None => String::new(),
+            }
+        }
+        Some(_) => String::new(),
+        None => {
+            app.status_error = Some("yp: no parsed body".into());
+            return;
+        }
+    };
+    if text.is_empty() {
+        app.status_error = Some("yp: no paragraph at cursor".into());
+        return;
+    }
+    dispatch_yank(app, cfg, text, "yanked paragraph".to_string());
+}
+
+/// Yank the URL of the first link at or after the reader cursor. `yl`
+/// in Reader pane. Falls back to the first link in the body so a
+/// scrolled-past-the-only-link cursor still copies it.
+fn yank_link(app: &mut App, cfg: &Config) {
+    let inbox = app.inbox();
+    let width = inbox.last_reader_inner_width.max(8);
+    let cursor = inbox.reader_cursor_line;
+    let scroll_body = inbox
+        .reader_scroll
+        .saturating_sub(inbox.last_reader_header_offset);
+    let viewport_h = inbox.last_reader_inner_height;
+    let (href, visible) = match app.inbox_parsed() {
+        Some(p) => {
+            let laid = crate::ui::reader::layout(&p.blocks, width, None);
+            let visible = laid.visible_link_count(scroll_body, viewport_h);
+            match laid.first_link_at_or_after(cursor) {
+                Some(slot) => (slot.href.clone(), visible),
+                None => (String::new(), visible),
+            }
+        }
+        None => {
+            app.status_error = Some("yl: no parsed body".into());
+            return;
+        }
+    };
+    if href.is_empty() {
+        app.status_error = Some("yl: no link in body".into());
+        return;
+    }
+    let status = if visible > 1 {
+        format!("yanked link (1 of {visible} visible)")
+    } else {
+        "yanked link".to_string()
+    };
+    dispatch_yank(app, cfg, href, status);
+}
+
+/// Shared sink for the three yank entry points. Routes to OSC 52 vs
+/// the configured `[reader].clipboard` fallback through `clipboard::yank`
+/// and surfaces a one-shot status message in the cmdline row.
+fn dispatch_yank(app: &mut App, cfg: &Config, text: String, ok_status: String) {
+    let event_tx = app.event_tx.clone();
+    match clipboard::yank(&text, cfg, event_tx.as_ref()) {
+        YankOutcome::Sent => {
+            app.status_error = Some(ok_status);
+        }
+        YankOutcome::Spawned(rx) => {
+            app.clipboard_rx = Some(rx);
+            app.status_error = Some(format!("{ok_status} (via fallback)"));
+        }
+        YankOutcome::Failed(e) => {
+            app.status_error = Some(format!("yank: {e}"));
+        }
+    }
 }
 
 fn follow_link(app: &mut App, cfg: &Config, buf: &str) {

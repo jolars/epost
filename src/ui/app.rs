@@ -17,6 +17,7 @@ use crate::store::scan::{self, AccountFolderStats, ScanResult};
 use crate::store::sync::SyncResult;
 use crate::store::thread::{ThreadedRow, build_threads};
 use crate::store::watch::{self, SelfWrites, Watcher, WatcherConfig, WatcherEvent};
+use crate::ui::clipboard::ClipboardResult;
 use crate::ui::compose::{ComposeScreen, ComposeStatus};
 use crate::ui::events::AppEvent;
 use crate::ui::images::{self, ImageKey, ResolvedImage};
@@ -77,6 +78,10 @@ pub struct App {
     /// next key decides what it composes — today only `/` for global
     /// search, future room for `gg`/`G` etc.
     pub pending_g: bool,
+    /// Pending `y` prefix in Normal mode (Reader focus only). Mirrors
+    /// `pending_g`: `y` arms it; the next key decides — `p` for paragraph,
+    /// `l` for link. Any other key clears it and falls through.
+    pub pending_y: bool,
     /// Transient status / error displayed in the cmdline row. Cleared
     /// when the user enters a new command or moves selection.
     pub status_error: Option<String>,
@@ -105,6 +110,11 @@ pub struct App {
     /// `[sync].command` is running; cleared on completion. A second
     /// `:sync` while one is in flight errors out rather than queueing.
     pub sync_rx: Option<Receiver<SyncResult>>,
+    /// In-flight clipboard-fallback worker. `Some` while a yank pipe is
+    /// running; cleared on completion. Concurrent yanks pile up
+    /// receivers and the most recent one wins for status display —
+    /// fine because real fallback commands return in milliseconds.
+    pub clipboard_rx: Option<Receiver<ClipboardResult>>,
     /// Clone of the unified event channel so the sync worker (and any
     /// future workers spawned from cmdline dispatch) can push
     /// `AppEvent::Wake` events. `None` in tests where no event loop is
@@ -129,9 +139,33 @@ pub struct InboxScreen {
     pub list_visible: bool,
     pub reader_visible: bool,
     pub reader_scroll: u16,
+    /// Body-relative cursor used by reader yanks (`yp` / `yl`). Indexes
+    /// into `LaidOutBody.lines` (i.e. excludes the header rows the
+    /// reader prepends). Invariant for the current session: clamped
+    /// into the visible viewport on every render, so it effectively
+    /// tracks "topmost visible body line" until visual mode adds
+    /// independent movement.
+    pub reader_cursor_line: u16,
+    /// Header-row count (From/Subject/Folder/Flags + the blank
+    /// separator) from the last reader draw. Stashed so the yank
+    /// helpers can translate the absolute viewport scroll into body
+    /// coordinates without recomputing the header block.
+    pub last_reader_header_offset: u16,
+    /// Body-line count (excluding headers) from the last reader draw.
+    /// Used to clamp `reader_cursor_line` within the body's actual
+    /// range.
+    pub last_reader_body_only_lines: u16,
+    /// Inner reader-pane width (after border) from the last draw.
+    /// Stashed so yank helpers can re-run layout at the same width
+    /// the cursor was clamped against — otherwise `line_block_idx`
+    /// indexing would drift when the keymap doesn't know the live
+    /// pane width.
+    pub last_reader_inner_width: u16,
     pub scan: ScanState,
     pub selected: usize,
-    pub parsed: Option<ParsedBody>,
+    /// Boxed so its size doesn't bloat `Screen::Inbox` past the
+    /// `large_enum_variant` threshold (same reason `search` is boxed).
+    pub parsed: Option<Box<ParsedBody>>,
     /// Last-known msgid we tried to parse a body for, so a parse failure
     /// doesn't loop forever.
     last_parsed_msgid: Option<String>,
@@ -222,6 +256,7 @@ impl App {
             cmdline: TextInput::new(),
             link_pick_buf: String::new(),
             pending_g: false,
+            pending_y: false,
             status_error: watcher_warning,
             quit: false,
             screens: vec![Screen::Inbox(inbox)],
@@ -231,6 +266,7 @@ impl App {
             cache_path,
             self_writes,
             sync_rx: None,
+            clipboard_rx: None,
             event_tx,
         }
     }
@@ -348,10 +384,34 @@ impl App {
         }
     }
 
+    /// Drain the in-flight clipboard fallback worker (when a yank chose
+    /// the shell-out path). Mirrors `poll_sync`: on completion clears
+    /// `clipboard_rx` and writes a one-shot message to the cmdline row.
+    pub fn poll_clipboard(&mut self) {
+        let Some(rx) = self.clipboard_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(bytes)) => {
+                self.clipboard_rx = None;
+                self.status_error = Some(format!("yanked {bytes} bytes"));
+            }
+            Ok(Err(e)) => {
+                self.clipboard_rx = None;
+                self.status_error = Some(format!("clipboard failed: {e}"));
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.clipboard_rx = None;
+                self.status_error = Some("clipboard: worker died".into());
+            }
+        }
+    }
+
     /// Cmdline / status helpers that reach into the inbox screen — kept
     /// on App so `cmdline::dispatch` doesn't have to know about screens.
     pub fn inbox_parsed(&self) -> Option<&ParsedBody> {
-        self.inbox().parsed.as_ref()
+        self.inbox().parsed.as_deref()
     }
 
     pub fn poll_scan(&mut self) {
@@ -679,6 +739,10 @@ impl InboxScreen {
             list_visible,
             reader_visible,
             reader_scroll: 0,
+            reader_cursor_line: 0,
+            last_reader_header_offset: 0,
+            last_reader_body_only_lines: 0,
+            last_reader_inner_width: 0,
             scan,
             selected: 0,
             parsed: None,
@@ -734,6 +798,13 @@ impl InboxScreen {
         let old_msgid = self.last_parsed_msgid.take();
         self.last_parsed_msgid = Some(msgid.clone());
         self.body_changed_this_tick = true;
+        // New body means the old cursor position is meaningless — reset
+        // so `yp`/`yl` operate on the new message's first content.
+        // `reader_scroll` is intentionally left alone here: the
+        // selection-change flow elsewhere already preserves scroll
+        // semantics, and changing that is out of scope for the yank
+        // work.
+        self.reader_cursor_line = 0;
         let Some(path) = self.selected_path() else {
             self.parsed = None;
             self.evict_image_cache(old_msgid.as_deref(), &msgid);
@@ -750,13 +821,13 @@ impl InboxScreen {
                     max_height,
                     status_error,
                 );
-                self.parsed = Some(ParsedBody {
+                self.parsed = Some(Box::new(ParsedBody {
                     msgid: msgid.clone(),
                     blocks,
                     raw_html: body.html,
                     plain_fallback: body.plain,
                     cid_parts: body.cid_parts,
-                });
+                }));
                 self.evict_image_cache(old_msgid.as_deref(), &msgid);
                 self.try_mark_seen(&msgid, cache_path, self_writes, status_error);
             }
@@ -1164,6 +1235,7 @@ impl InboxScreen {
         self.current_folder = folder.to_string();
         self.selected = 0;
         self.reader_scroll = 0;
+        self.reader_cursor_line = 0;
         self.parsed = None;
         self.last_parsed_msgid = None;
         self.prev_parsed_msgid = None;

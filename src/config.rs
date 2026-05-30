@@ -80,6 +80,12 @@ pub struct Reader {
     pub prefer: ReaderPrefer,
     #[serde(default = "default_browser")]
     pub browser: Vec<String>,
+    /// Optional shell-out fallback for yank/copy. When set, reader yanks
+    /// pipe the selected text to this command's stdin instead of
+    /// emitting OSC 52. Use for tmux setups or terminals where OSC 52 is
+    /// disabled, e.g. `["wl-copy"]` or `["xclip", "-selection", "clipboard"]`.
+    #[serde(default)]
+    pub clipboard: Option<Vec<String>>,
 }
 
 impl Default for Reader {
@@ -87,6 +93,7 @@ impl Default for Reader {
         Self {
             prefer: ReaderPrefer::default(),
             browser: default_browser(),
+            clipboard: None,
         }
     }
 }
@@ -354,6 +361,22 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.reader.prefer, ReaderPrefer::Html);
         assert_eq!(cfg.reader.browser, vec!["xdg-open".to_string()]);
+        assert!(cfg.reader.clipboard.is_none());
+    }
+
+    #[test]
+    fn parses_reader_clipboard_fallback() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [reader]
+            clipboard = ["wl-copy"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.reader.clipboard.as_deref(),
+            Some(["wl-copy".to_string()].as_slice())
+        );
     }
 
     #[test]

@@ -195,6 +195,13 @@ prefer = "html"               # "html" | "plain"
 # Browser fallback for ":open". Receives the rewritten HTML file path as
 # the final argument. Override to e.g. firefox / qutebrowser / lynx.
 browser = ["xdg-open"]
+# Reader yanks (`Y` / `yp` / `yl`) emit OSC 52 to the host terminal by
+# default. Set `clipboard` to a command vec to pipe the selected text
+# to that command's stdin instead — for tmux setups or terminals where
+# OSC 52 is disabled. E.g. `["wl-copy"]` or `["xclip", "-selection",
+# "clipboard"]`. OSC 52 is suppressed when this is set; the two paths
+# are exclusive to avoid double-paste.
+# clipboard = ["wl-copy"]
 
 [images]
 # Auto-detect by default. Override with one of:
@@ -236,6 +243,9 @@ smtp.command  = ["msmtp", "-t", "-a", "work"]    # per-account override
 "f"        = "link-pick"          # Vimium-style: numbers each link, type to follow
 "<Enter>"  = "link-follow"        # follow the currently-hovered link
 "o"        = "open-browser"       # pipe message to [reader].browser
+"Y"        = "yank-body"          # whole body to clipboard (OSC 52 / fallback)
+"yp"       = "yank-paragraph"     # top-level block at the reader cursor
+"yl"       = "yank-link"          # first link at or after the reader cursor
 "<Esc>"    = "pane-focus list"
 ```
 
