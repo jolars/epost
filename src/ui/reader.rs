@@ -31,14 +31,21 @@ pub struct LaidOutBody {
 pub struct LinkSlot {
     pub id: u32,
     pub href: String,
-    // line + col_start/end are populated for the overlay-tag rendering
-    // path that step 4 will use; the step-3 picker resolves links by id
-    // alone and re-runs layout to dereference the href.
-    #[allow(dead_code)]
+    /// Cell ranges the link's text occupies in the laid-out buffer. A
+    /// single link wraps onto multiple lines as separate segments; words
+    /// on the same line that belong to the same link (and the single
+    /// space between them) are merged into one segment. Driven by the
+    /// OSC 8 hyperlink wrapper in `draw`.
+    pub segments: Vec<LinkSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSegment {
     pub line: usize,
-    #[allow(dead_code)]
+    /// Column of the first cell of the segment, relative to the laid-out
+    /// line (i.e. after any indent / list lead / blockquote `> ` prefix).
     pub col_start: u16,
-    #[allow(dead_code)]
+    /// One past the last cell of the segment.
     pub col_end: u16,
 }
 
@@ -159,6 +166,7 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     };
     if let Some(laid) = laid {
         let scroll = inbox.reader_scroll as i32;
+        emit_osc8_hyperlinks(f.buffer_mut(), inner, &laid.links, scroll);
         let mut drawn: Vec<Rect> = Vec::new();
         for slot in &laid.images {
             let Some(resolved) = inbox.resolved_image(&slot.key) else {
@@ -194,6 +202,57 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
             drawn.push(rect);
         }
         inbox.last_image_rects = drawn;
+    }
+}
+
+/// Wrap each visible link segment with the OSC 8 hyperlink anchor by
+/// patching the rendered buffer cells. The start sequence
+/// `ESC ] 8 ; ; URL ESC \` is prepended to the first cell of the
+/// segment and the close `ESC ] 8 ; ; ESC \` is appended to the last
+/// cell, so the terminal sees the bytes between as part of the anchor
+/// without the buffer's normal control-char stripping (which would
+/// otherwise drop the escapes if we tried to embed them in a `Span`).
+///
+/// Capable terminals (kitty, wezterm, foot, iTerm2, recent gnome-terminal)
+/// render this as a clickable / copyable hyperlink; others ignore the
+/// OSC 8 anchor harmlessly and the underlined link text remains.
+fn emit_osc8_hyperlinks(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    links: &[LinkSlot],
+    scroll: i32,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let inner_right = inner.x.saturating_add(inner.width);
+    let inner_bottom = inner.y.saturating_add(inner.height);
+    for slot in links {
+        if slot.href.is_empty() {
+            continue;
+        }
+        let start_seq = format!("\x1b]8;;{}\x1b\\", slot.href);
+        for seg in &slot.segments {
+            let row_signed = inner.y as i32 + seg.line as i32 - scroll;
+            if row_signed < inner.y as i32 || row_signed >= inner_bottom as i32 {
+                continue;
+            }
+            let row = row_signed as u16;
+            let abs_start = inner.x.saturating_add(seg.col_start).min(inner_right);
+            let abs_end = inner.x.saturating_add(seg.col_end).min(inner_right);
+            if abs_start >= abs_end {
+                continue;
+            }
+            let last_col = abs_end - 1;
+            if let Some(cell) = buf.cell_mut((abs_start, row)) {
+                let symbol = cell.symbol().to_string();
+                cell.set_symbol(&format!("{start_seq}{symbol}"));
+            }
+            if let Some(cell) = buf.cell_mut((last_col, row)) {
+                let symbol = cell.symbol().to_string();
+                cell.set_symbol(&format!("{symbol}\x1b]8;;\x1b\\"));
+            }
+        }
     }
 }
 
@@ -397,6 +456,20 @@ impl<'a> LayoutCtx<'a> {
                 for b in inner {
                     let before = self.lines.len();
                     self.emit_block(b, indent);
+                    let after = self.lines.len();
+                    // The `> ` insertion below adds two cells at column
+                    // zero of each affected line. Link segments recorded
+                    // by `push_word` use pre-prefix columns, so shift any
+                    // segment that landed on a quoted line by 2 to keep
+                    // OSC 8 anchors aligned with their rendered cells.
+                    for slot in &mut self.links {
+                        for seg in &mut slot.segments {
+                            if seg.line >= before && seg.line < after {
+                                seg.col_start = seg.col_start.saturating_add(2);
+                                seg.col_end = seg.col_end.saturating_add(2);
+                            }
+                        }
+                    }
                     for ln in self.lines.iter_mut().skip(before) {
                         ln.spans
                             .insert(0, Span::styled("> ", Style::default().fg(Color::DarkGray)));
@@ -544,8 +617,19 @@ impl<'a> LayoutCtx<'a> {
         );
         for tok in tokens {
             match tok {
-                Token::Word { text, style } => {
-                    wrapper.push_word(&text, style, inner_w, &mut self.lines);
+                Token::Word {
+                    text,
+                    style,
+                    link_id,
+                } => {
+                    wrapper.push_word(
+                        &text,
+                        style,
+                        link_id,
+                        inner_w,
+                        &mut self.lines,
+                        &mut self.links,
+                    );
                 }
                 Token::Space => {
                     wrapper.push_space();
@@ -561,7 +645,11 @@ impl<'a> LayoutCtx<'a> {
 
 #[derive(Debug)]
 enum Token {
-    Word { text: String, style: Style },
+    Word {
+        text: String,
+        style: Style,
+        link_id: Option<u32>,
+    },
     Space,
     LineBreak,
 }
@@ -595,6 +683,7 @@ fn flatten_inlines(
                             out.push(Token::Word {
                                 text: std::mem::take(&mut buf),
                                 style: s,
+                                link_id: in_link,
                             });
                         }
                         out.push(Token::Space);
@@ -606,6 +695,7 @@ fn flatten_inlines(
                     out.push(Token::Word {
                         text: buf,
                         style: s,
+                        link_id: in_link,
                     });
                 }
             }
@@ -615,9 +705,7 @@ fn flatten_inlines(
                 links.push(LinkSlot {
                     id,
                     href: href.clone(),
-                    line: 0,
-                    col_start: 0,
-                    col_end: 0,
+                    segments: Vec::new(),
                 });
                 if let Some(prefix) = pick {
                     let dim = !prefix.is_empty() && !id.to_string().starts_with(prefix);
@@ -632,6 +720,7 @@ fn flatten_inlines(
                     out.push(Token::Word {
                         text: format!("[{id}]"),
                         style: tag_style,
+                        link_id: None,
                     });
                 }
                 let inner_style = base.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
@@ -701,8 +790,10 @@ impl LineBuilder {
         &mut self,
         text: &str,
         style: Style,
+        link_id: Option<u32>,
         max_w: usize,
         out_lines: &mut Vec<Line<'static>>,
+        links: &mut [LinkSlot],
     ) {
         let word_w = text.chars().count();
         let head_w = self.indent as usize + self.lead.chars().count();
@@ -715,8 +806,31 @@ impl LineBuilder {
             self.line_width += 1;
             self.pending_space = false;
         }
+        let col_start = self.line_width as u16;
         self.line_spans.push(Span::styled(text.to_string(), style));
         self.line_width += word_w;
+        let col_end = self.line_width as u16;
+        if let Some(id) = link_id {
+            let current_line = out_lines.len();
+            if let Some(slot) = links.iter_mut().find(|s| s.id == id) {
+                // Merge with the prior segment on the same line if it's
+                // adjacent (the only gap LineBuilder ever leaves between
+                // two link words is a single space cell).
+                let merged = slot.segments.last_mut().is_some_and(|seg| {
+                    seg.line == current_line && seg.col_end.saturating_add(1) >= col_start
+                });
+                if merged {
+                    let seg = slot.segments.last_mut().unwrap();
+                    seg.col_end = col_end;
+                } else {
+                    slot.segments.push(LinkSegment {
+                        line: current_line,
+                        col_start,
+                        col_end,
+                    });
+                }
+            }
+        }
     }
 
     fn flush_line(&mut self, out: &mut Vec<Line<'static>>) {
@@ -871,6 +985,165 @@ mod tests {
         let laid = layout(&blocks, 80, None);
         assert!(!laid.links.is_empty(), "expected at least one link");
         assert_eq!(laid.links[0].href, "https://x");
+    }
+
+    #[test]
+    fn link_segment_tracks_columns_on_single_line() {
+        // "see this please" — link "this" occupies cells 4..8.
+        let blocks = html::parse(r#"<p>see <a href="https://x">this</a> please</p>"#);
+        let laid = layout(&blocks, 80, None);
+        let slot = laid.links.first().expect("link slot");
+        assert_eq!(slot.segments.len(), 1, "{:?}", slot.segments);
+        let seg = &slot.segments[0];
+        assert_eq!(seg.line, 0);
+        assert_eq!(seg.col_start, 4);
+        assert_eq!(seg.col_end, 8);
+    }
+
+    #[test]
+    fn link_segment_merges_multi_word_link_with_space() {
+        // Link spans two words on the same line; segments should merge
+        // across the connecting space cell.
+        let blocks = html::parse(r#"<p><a href="https://x">foo bar</a></p>"#);
+        let laid = layout(&blocks, 80, None);
+        let slot = laid.links.first().expect("link slot");
+        assert_eq!(slot.segments.len(), 1, "{:?}", slot.segments);
+        let seg = &slot.segments[0];
+        assert_eq!(seg.col_start, 0);
+        // "foo" (3) + " " (1) + "bar" (3) = 7 cells.
+        assert_eq!(seg.col_end, 7);
+    }
+
+    #[test]
+    fn link_segment_splits_across_wrapped_lines() {
+        // Force the link to wrap by giving it a narrow inner width.
+        let blocks = html::parse(r#"<p><a href="https://x">foo bar baz</a></p>"#);
+        let laid = layout(&blocks, 4, None);
+        let slot = laid.links.first().expect("link slot");
+        assert!(
+            slot.segments.len() >= 2,
+            "expected wrap into multiple segments: {:?}",
+            slot.segments
+        );
+        // All segments must point at the same link id and never share a line.
+        let mut lines: Vec<usize> = slot.segments.iter().map(|s| s.line).collect();
+        lines.sort();
+        lines.dedup();
+        assert_eq!(lines.len(), slot.segments.len(), "{:?}", slot.segments);
+    }
+
+    #[test]
+    fn osc8_wraps_link_cells_in_buffer() {
+        use ratatui::buffer::Buffer;
+        // Lay out a paragraph with one link, render it into a Buffer the
+        // same way `draw` would, then run the OSC 8 patch and check that
+        // the first / last link cells carry the expected escape bytes.
+        let html_src = r#"<p>see <a href="https://x.example/p">click</a> done</p>"#;
+        let blocks = html::parse(html_src);
+        let laid = layout(&blocks, 40, None);
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(inner);
+        // Paint the layout into the buffer cell by cell so the test
+        // doesn't depend on Paragraph's wrap behavior — segment columns
+        // are inner-relative, which is the contract we care about.
+        for (row, line) in laid.lines.iter().enumerate() {
+            if row >= inner.height as usize {
+                break;
+            }
+            let mut col: u16 = 0;
+            for span in &line.spans {
+                for ch in span.content.chars() {
+                    if col >= inner.width {
+                        break;
+                    }
+                    if let Some(cell) = buf.cell_mut((col, row as u16)) {
+                        cell.set_symbol(&ch.to_string());
+                    }
+                    col += 1;
+                }
+            }
+        }
+        super::emit_osc8_hyperlinks(&mut buf, inner, &laid.links, 0);
+        // Link "click" starts at column 4 (after "see ").
+        let first_cell = buf.cell((4, 0)).expect("first link cell");
+        let first_sym = first_cell.symbol();
+        assert!(
+            first_sym.starts_with("\x1b]8;;https://x.example/p\x1b\\"),
+            "first link cell symbol was {first_sym:?}"
+        );
+        assert!(first_sym.ends_with('c'), "{first_sym:?}");
+        // Last cell of the link is column 8 ("click" cells 4..9, last = 8).
+        let last_cell = buf.cell((8, 0)).expect("last link cell");
+        let last_sym = last_cell.symbol();
+        assert!(
+            last_sym.ends_with("\x1b]8;;\x1b\\"),
+            "last link cell symbol was {last_sym:?}"
+        );
+        assert!(last_sym.starts_with('k'), "{last_sym:?}");
+        // Non-link cells must not carry any OSC 8 bytes.
+        let outside = buf.cell((0, 0)).expect("first cell");
+        assert!(!outside.symbol().contains('\x1b'), "{:?}", outside.symbol());
+    }
+
+    #[test]
+    fn osc8_skips_scrolled_off_segments() {
+        use ratatui::buffer::Buffer;
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 2,
+        };
+        let mut buf = Buffer::empty(inner);
+        let links = vec![LinkSlot {
+            id: 1,
+            href: "https://x".to_string(),
+            segments: vec![LinkSegment {
+                line: 0,
+                col_start: 0,
+                col_end: 3,
+            }],
+        }];
+        // scroll past the segment's line — patch must be a no-op.
+        super::emit_osc8_hyperlinks(&mut buf, inner, &links, 5);
+        for x in 0..inner.width {
+            for y in 0..inner.height {
+                let sym = buf.cell((x, y)).unwrap().symbol();
+                assert!(!sym.contains('\x1b'), "leaked OSC 8 at ({x},{y}): {sym:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn link_segment_inside_blockquote_shifts_by_two() {
+        // The `> ` prefix is inserted after layout; segment columns must
+        // be bumped so they line up with the rendered cells.
+        let blocks =
+            html::parse(r#"<blockquote><p><a href="https://x">click</a></p></blockquote>"#);
+        let laid = layout(&blocks, 80, None);
+        let slot = laid.links.first().expect("link slot");
+        let seg = slot.segments.first().expect("segment");
+        // Without quote shift this would be 0; with the `> ` prefix the
+        // link starts at column 2 of the rendered line.
+        assert_eq!(seg.col_start, 2);
+        assert_eq!(seg.col_end, 7); // "click" is 5 cells, so 2..7.
+        // The rendered line genuinely begins with `> `.
+        let first_line = laid
+            .lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("click")))
+            .expect("rendered line with link");
+        let rendered: String = first_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.starts_with("> "), "{rendered:?}");
     }
 
     fn fake_resolved(width: u16, height: u16) -> crate::ui::images::ResolvedImage {

@@ -9,10 +9,6 @@ are the v1.x finish, not the original v1 spec.
 
 ## Near-term
 
-- **OSC 8 hyperlinks in the reader.** Wrap link runs with
-  `ESC ] 8 ; ; URL ESC \` in `src/ui/reader.rs` so capable terminals (kitty,
-  wezterm, foot) get native click/copy. Picker (`f`) keeps working unchanged for
-  the rest. Small.
 - **`:reload`config re-read.** Re-parse the TOML and hot-swap on `App`. No new
   persistence needed; just `Config::load` + assignment. Useful during iteration
   with two accounts now in play.
