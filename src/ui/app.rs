@@ -43,6 +43,32 @@ pub enum Mode {
     Command,
     LinkPick,
     Search,
+    /// Reader-pane vim-style visual mode. The kind (char-wise vs
+    /// line-wise) and the anchor live on `InboxScreen.visual`; the mode
+    /// variant only carries the dispatch flag. Strict pairing: when
+    /// `Mode::Visual` is set, `InboxScreen.visual` is `Some`, and vice
+    /// versa. Entry/exit go through `enter_visual` / `exit_visual` so the
+    /// pair stays consistent.
+    Visual,
+}
+
+/// Vim-style visual sub-kind. Char-wise (`v`) extends cell-by-cell; line-wise
+/// (`V`) snaps both anchor and cursor to whole rendered lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualKind {
+    Char,
+    Line,
+}
+
+/// Anchor pin for visual mode. Cursor coords live on `InboxScreen`
+/// (`reader_cursor_line`, `reader_cursor_col`); selection runs from
+/// anchor → cursor. Both endpoints index into `LaidOutBody.line_text`,
+/// i.e. the body-relative coord space (no header rows).
+#[derive(Debug, Clone, Copy)]
+pub struct VisualState {
+    pub kind: VisualKind,
+    pub anchor_line: u16,
+    pub anchor_col: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +172,18 @@ pub struct InboxScreen {
     /// tracks "topmost visible body line" until visual mode adds
     /// independent movement.
     pub reader_cursor_line: u16,
+    /// Body-relative cursor column. Char index into
+    /// `LaidOutBody.line_text[reader_cursor_line]`. For ASCII this maps
+    /// 1:1 with display columns; CJK / emoji breaks the parity but the
+    /// reader's existing layout already treats one char as one cell
+    /// (see `LineBuilder::line_width`), so visual selection stays
+    /// internally consistent.
+    pub reader_cursor_col: u16,
+    /// Vim-style visual-mode anchor. `Some` iff `Mode::Visual` is the
+    /// active mode (strict pairing — see `Mode::Visual` doc). Char-wise
+    /// vs line-wise lives on `kind`; the cursor end of the selection is
+    /// `(reader_cursor_line, reader_cursor_col)`.
+    pub visual: Option<VisualState>,
     /// Header-row count (From/Subject/Folder/Flags + the blank
     /// separator) from the last reader draw. Stashed so the yank
     /// helpers can translate the absolute viewport scroll into body
@@ -613,6 +651,31 @@ impl App {
         inbox.switch_to_scope(account, folder, cache_path, status_error);
     }
 
+    /// Enter visual mode at the current cursor position. Pairs
+    /// `Mode::Visual` with `InboxScreen.visual = Some(_)` — see the
+    /// invariant note on `Mode::Visual`. No-op when the Reader pane
+    /// isn't focused (visual on a list / sidebar pane is undefined).
+    pub fn enter_visual(&mut self, kind: VisualKind) {
+        let inbox = self.inbox_mut();
+        if inbox.focus != Pane::Reader {
+            return;
+        }
+        inbox.visual = Some(VisualState {
+            kind,
+            anchor_line: inbox.reader_cursor_line,
+            anchor_col: inbox.reader_cursor_col,
+        });
+        self.mode = Mode::Visual;
+    }
+
+    /// Leave visual mode without yanking. Clears the anchor and flips
+    /// back to `Mode::Normal`; the cursor stays where it is so a
+    /// follow-up `yp` lands on the same block.
+    pub fn exit_visual(&mut self) {
+        self.inbox_mut().visual = None;
+        self.mode = Mode::Normal;
+    }
+
     pub fn focus_left(&mut self) {
         self.inbox_mut().focus_left();
     }
@@ -740,6 +803,8 @@ impl InboxScreen {
             reader_visible,
             reader_scroll: 0,
             reader_cursor_line: 0,
+            reader_cursor_col: 0,
+            visual: None,
             last_reader_header_offset: 0,
             last_reader_body_only_lines: 0,
             last_reader_inner_width: 0,
@@ -770,6 +835,76 @@ impl InboxScreen {
     pub fn resolved_image(&self, key: &ImageKey) -> Option<&ResolvedImage> {
         let msgid = self.last_parsed_msgid.as_deref()?;
         self.image_cache.get(msgid)?.get(key)
+    }
+
+    /// Swap the active visual-mode kind in place. Preserves anchor and
+    /// cursor; the next render redraws the highlight in the new shape.
+    /// No-op when not in visual mode.
+    pub fn set_visual_kind(&mut self, kind: VisualKind) {
+        if let Some(v) = self.visual.as_mut() {
+            v.kind = kind;
+        }
+    }
+
+    /// Move the body-relative cursor by `(dy, dx)`. Lines clamp into
+    /// `[0, last_reader_body_only_lines)` immediately; columns are
+    /// allowed to overshoot — `reader::draw` clamps them to the real
+    /// line length once `LaidOutBody.line_text` is in hand. After the
+    /// move, scrolls the reader to bring the cursor back into view.
+    pub fn move_reader_cursor(&mut self, dy: i32, dx: i32) {
+        if self.last_reader_body_only_lines == 0 {
+            return;
+        }
+        let max_line = self.last_reader_body_only_lines.saturating_sub(1) as i32;
+        let new_line = (self.reader_cursor_line as i32 + dy).clamp(0, max_line) as u16;
+        // Columns clamp at the floor only; the ceiling depends on
+        // line_text, which the keymap doesn't have. Draw-time clamp
+        // brings overshoots back in. Saturate add so u16::MAX + N
+        // doesn't wrap to zero.
+        let new_col = if dx >= 0 {
+            self.reader_cursor_col.saturating_add(dx as u16)
+        } else {
+            self.reader_cursor_col
+                .saturating_sub((-dx).min(u16::MAX as i32) as u16)
+        };
+        self.reader_cursor_line = new_line;
+        self.reader_cursor_col = new_col;
+        self.follow_cursor();
+    }
+
+    pub fn move_reader_cursor_to_top(&mut self) {
+        self.reader_cursor_line = 0;
+        self.reader_cursor_col = 0;
+        self.follow_cursor();
+    }
+
+    pub fn move_reader_cursor_to_bottom(&mut self) {
+        let max_line = self.last_reader_body_only_lines.saturating_sub(1);
+        self.reader_cursor_line = max_line;
+        self.reader_cursor_col = u16::MAX;
+        self.follow_cursor();
+    }
+
+    pub fn move_reader_cursor_to_line_start(&mut self) {
+        self.reader_cursor_col = 0;
+    }
+
+    pub fn move_reader_cursor_to_line_end(&mut self) {
+        // Sentinel: clamped to real line end at draw time.
+        self.reader_cursor_col = u16::MAX;
+    }
+
+    /// Adjust `reader_scroll` so the cursor sits inside the body
+    /// viewport. Pure scroll-follow — does not move the cursor.
+    pub fn follow_cursor(&mut self) {
+        let inner_h = self.last_reader_inner_height;
+        let header = self.last_reader_header_offset;
+        let abs_line = header.saturating_add(self.reader_cursor_line);
+        if abs_line < self.reader_scroll {
+            self.reader_scroll = abs_line;
+        } else if inner_h > 0 && abs_line >= self.reader_scroll.saturating_add(inner_h) {
+            self.reader_scroll = abs_line.saturating_add(1).saturating_sub(inner_h);
+        }
     }
 
     /// Re-read and re-parse the body for the currently-selected message
@@ -803,8 +938,11 @@ impl InboxScreen {
         // `reader_scroll` is intentionally left alone here: the
         // selection-change flow elsewhere already preserves scroll
         // semantics, and changing that is out of scope for the yank
-        // work.
+        // work. Visual mode anchors against the old body's coords too,
+        // so drop it.
         self.reader_cursor_line = 0;
+        self.reader_cursor_col = 0;
+        self.visual = None;
         let Some(path) = self.selected_path() else {
             self.parsed = None;
             self.evict_image_cache(old_msgid.as_deref(), &msgid);
@@ -1236,6 +1374,8 @@ impl InboxScreen {
         self.selected = 0;
         self.reader_scroll = 0;
         self.reader_cursor_line = 0;
+        self.reader_cursor_col = 0;
+        self.visual = None;
         self.parsed = None;
         self.last_parsed_msgid = None;
         self.prev_parsed_msgid = None;
@@ -1837,6 +1977,116 @@ mod focus_nav_tests {
         inbox.focus = Pane::Reader;
         inbox.focus_up();
         assert_eq!(inbox.focus, Pane::Reader);
+    }
+
+    #[test]
+    fn move_reader_cursor_clamps_within_body() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_only_lines = 5;
+        inbox.last_reader_inner_height = 10;
+        inbox.last_reader_header_offset = 4;
+        // Up past the top.
+        inbox.reader_cursor_line = 0;
+        inbox.move_reader_cursor(-3, 0);
+        assert_eq!(inbox.reader_cursor_line, 0);
+        // Down past the bottom: clamps to last index (4).
+        inbox.move_reader_cursor(100, 0);
+        assert_eq!(inbox.reader_cursor_line, 4);
+    }
+
+    #[test]
+    fn move_reader_cursor_follows_scroll_down() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_only_lines = 50;
+        inbox.last_reader_inner_height = 5;
+        inbox.last_reader_header_offset = 4;
+        inbox.reader_scroll = 0;
+        // Walk the cursor past the bottom of the viewport. Absolute
+        // row = header + cursor; once it ≥ scroll + height, scroll
+        // bumps to keep cursor visible.
+        inbox.move_reader_cursor(10, 0);
+        assert_eq!(inbox.reader_cursor_line, 10);
+        // Absolute row = 14; viewport height 5 → scroll should be at
+        // least 10 so 14 fits in [10, 15).
+        assert!(
+            inbox.reader_scroll >= 10,
+            "scroll was {}",
+            inbox.reader_scroll
+        );
+    }
+
+    #[test]
+    fn move_reader_cursor_follows_scroll_up() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_only_lines = 50;
+        inbox.last_reader_inner_height = 5;
+        inbox.last_reader_header_offset = 4;
+        // User scrolled down with `j` first; now `k` should bring scroll
+        // back up.
+        inbox.reader_scroll = 20;
+        inbox.reader_cursor_line = 30;
+        inbox.move_reader_cursor(-25, 0);
+        // Cursor at 5, abs row = 9. Scroll should have come down to 9
+        // or lower.
+        assert_eq!(inbox.reader_cursor_line, 5);
+        assert!(
+            inbox.reader_scroll <= 9,
+            "scroll was {}",
+            inbox.reader_scroll
+        );
+    }
+
+    #[test]
+    fn move_reader_cursor_to_bottom_sets_max() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_only_lines = 7;
+        inbox.last_reader_inner_height = 3;
+        inbox.last_reader_header_offset = 0;
+        inbox.move_reader_cursor_to_bottom();
+        assert_eq!(inbox.reader_cursor_line, 6);
+        assert_eq!(inbox.reader_cursor_col, u16::MAX);
+    }
+
+    #[test]
+    fn enter_visual_requires_reader_focus() {
+        let mut cfg = Config::default();
+        cfg.ui.sidebar = true;
+        cfg.ui.list = true;
+        cfg.ui.reader = true;
+        let mut app = App::new(
+            &cfg,
+            std::path::PathBuf::from("/tmp/epost-test.sqlite"),
+            None,
+            None,
+        );
+        app.inbox_mut().focus = Pane::List;
+        app.enter_visual(VisualKind::Char);
+        assert!(app.inbox().visual.is_none(), "should not enter from List");
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.inbox_mut().focus = Pane::Reader;
+        app.enter_visual(VisualKind::Char);
+        assert!(app.inbox().visual.is_some(), "should enter from Reader");
+        assert_eq!(app.mode, Mode::Visual);
+    }
+
+    #[test]
+    fn exit_visual_clears_anchor_and_mode() {
+        let mut cfg = Config::default();
+        cfg.ui.sidebar = true;
+        cfg.ui.list = true;
+        cfg.ui.reader = true;
+        let mut app = App::new(
+            &cfg,
+            std::path::PathBuf::from("/tmp/epost-test.sqlite"),
+            None,
+            None,
+        );
+        app.inbox_mut().focus = Pane::Reader;
+        app.enter_visual(VisualKind::Line);
+        app.exit_visual();
+        assert!(app.inbox().visual.is_none());
+        assert_eq!(app.mode, Mode::Normal);
     }
 }
 

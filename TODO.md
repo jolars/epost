@@ -51,11 +51,13 @@ paste is full of artifacts. The model is in-app, app-rendered selection.
   selection rendering, no cursor logic. Fallback path for terminals without OSC
   52: shell out to `xclip` / `wl-copy` via a configured `[reader].clipboard`
   command.
-- **Visual mode in the reader pane.** `v` enters select, `j`/`k`/`h`/`l` extend,
-  `y` yanks (OSC 52) and exits, `Esc` cancels. Selected cells render with
-  `Style::REVERSED`. The selection engine maps a `(row, col)` cursor back to the
-  wrapped Block-IR so a yank gets the source text, not the cell glyphs. Handles
-  scroll-while-selecting.
+- **Visual mode in the reader pane.** *Done.* `v` / `V` enter char-wise /
+  line-wise visual; `hjkl`, `gg`, `G`, `0`, `$` extend; `y` yanks via the OSC 52
+  path (or fallback) and exits; `Esc` / same-kind toggle exits; opposite-kind
+  swaps. Selection cells render with `Modifier::REVERSED`; cursor cell is also
+  REVERSED so the user can see the extend point. Movement scrolls to follow.
+  Selection text is recovered from `LaidOutBody.line_text` (per-line plain text
+  derived from layout spans, i.e. IR-via-layout, never from the cell buffer).
 - **Mouse-drag selection.** Same engine as visual mode, mouse-driven:
   `crossterm::event::EnableMouseCapture`, press → anchor, drag → extend, release
   → yank. Sits on top of the keyboard path so the engine ships first. Cost:

@@ -149,6 +149,7 @@ fn mode_tag(mode: Mode) -> &'static str {
         Mode::Command => "COMMAND ",
         Mode::LinkPick => "LINKPICK",
         Mode::Search => "SEARCH  ",
+        Mode::Visual => "VISUAL  ",
     }
 }
 

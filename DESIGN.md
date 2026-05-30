@@ -246,7 +246,23 @@ smtp.command  = ["msmtp", "-t", "-a", "work"]    # per-account override
 "Y"        = "yank-body"          # whole body to clipboard (OSC 52 / fallback)
 "yp"       = "yank-paragraph"     # top-level block at the reader cursor
 "yl"       = "yank-link"          # first link at or after the reader cursor
+"v"        = "visual-char"        # enter char-wise visual selection
+"V"        = "visual-line"        # enter line-wise visual selection
 "<Esc>"    = "pane-focus list"
+
+[keys.visual]
+"j"        = "extend-down 1"      # cursor follows; scroll follows cursor
+"k"        = "extend-up 1"
+"h"        = "extend-left 1"      # char-wise only; line-wise highlights whole lines
+"l"        = "extend-right 1"
+"gg"       = "extend-to-top"
+"G"        = "extend-to-bottom"
+"0"        = "extend-to-line-start"
+"$"        = "extend-to-line-end"
+"y"        = "yank-selection"     # copy then exit to Normal
+"v"        = "exit-or-swap-char"  # same kind exits; different kind swaps
+"V"        = "exit-or-swap-line"
+"<Esc>"    = "exit-visual"
 ```
 
 Schema lives in `src/config.rs` as plain `serde::Deserialize` structs with

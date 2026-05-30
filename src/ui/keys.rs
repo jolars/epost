@@ -39,6 +39,7 @@ pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
         Mode::Command => command(app, cfg, k),
         Mode::LinkPick => link_pick(app, cfg, k),
         Mode::Search => search(app, cfg, k),
+        Mode::Visual => visual(app, cfg, k),
     }
 }
 
@@ -246,6 +247,12 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                     app.pending_y = true;
                 }
                 KeyCode::Char('Y') => yank_body(app, cfg),
+                KeyCode::Char('v') => {
+                    app.enter_visual(crate::ui::app::VisualKind::Char);
+                }
+                KeyCode::Char('V') => {
+                    app.enter_visual(crate::ui::app::VisualKind::Line);
+                }
                 KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
                 KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
                 KeyCode::Char('F') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Forward),
@@ -272,6 +279,104 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             _ => {}
         },
     }
+}
+
+/// `Mode::Visual` keymap. Cursor / anchor live on `InboxScreen`; this
+/// just dispatches movement and exit. Char-wise (`v`) and line-wise
+/// (`V`) share the keymap — the kind only affects what gets rendered
+/// and extracted, not which keys do what.
+fn visual(app: &mut App, cfg: &Config, k: KeyEvent) {
+    // Bail out gracefully if the pair invariant got broken somewhere —
+    // mode = Visual but no anchor on the screen. Shouldn't happen.
+    if app.inbox().visual.is_none() {
+        app.mode = Mode::Normal;
+        return;
+    }
+    match k.code {
+        KeyCode::Esc => {
+            app.exit_visual();
+        }
+        KeyCode::Char('v') => {
+            // Same-kind exits; opposite-kind swaps.
+            let cur_kind = app.inbox().visual.as_ref().map(|v| v.kind);
+            if cur_kind == Some(crate::ui::app::VisualKind::Char) {
+                app.exit_visual();
+            } else {
+                app.inbox_mut()
+                    .set_visual_kind(crate::ui::app::VisualKind::Char);
+            }
+        }
+        KeyCode::Char('V') => {
+            let cur_kind = app.inbox().visual.as_ref().map(|v| v.kind);
+            if cur_kind == Some(crate::ui::app::VisualKind::Line) {
+                app.exit_visual();
+            } else {
+                app.inbox_mut()
+                    .set_visual_kind(crate::ui::app::VisualKind::Line);
+            }
+        }
+        KeyCode::Char('y') => {
+            yank_visual(app, cfg);
+        }
+        KeyCode::Char('j') => app.inbox_mut().move_reader_cursor(1, 0),
+        KeyCode::Char('k') => app.inbox_mut().move_reader_cursor(-1, 0),
+        KeyCode::Char('h') => app.inbox_mut().move_reader_cursor(0, -1),
+        KeyCode::Char('l') => app.inbox_mut().move_reader_cursor(0, 1),
+        KeyCode::Char('G') => app.inbox_mut().move_reader_cursor_to_bottom(),
+        KeyCode::Char('g') => {
+            if app.pending_g {
+                app.pending_g = false;
+                app.inbox_mut().move_reader_cursor_to_top();
+            } else {
+                app.pending_g = true;
+            }
+        }
+        KeyCode::Char('0') => app.inbox_mut().move_reader_cursor_to_line_start(),
+        KeyCode::Char('$') => app.inbox_mut().move_reader_cursor_to_line_end(),
+        _ => {
+            // Anything else clears a pending `g` prefix and otherwise is
+            // a no-op — keeps the keymap predictable in visual.
+            app.pending_g = false;
+        }
+    }
+}
+
+/// Extract the current visual selection from the laid-out body and pipe
+/// it through `clipboard::yank`. Exits visual mode whether or not the
+/// yank succeeded — the mode's purpose is delivering the selection,
+/// once it's delivered the user expects to be back in Normal.
+fn yank_visual(app: &mut App, cfg: &Config) {
+    let inbox = app.inbox();
+    let Some(sel) = inbox.visual else {
+        app.exit_visual();
+        return;
+    };
+    let cursor_line = inbox.reader_cursor_line;
+    let cursor_col = inbox.reader_cursor_col;
+    let width = inbox.last_reader_inner_width.max(8);
+    let text = match app.inbox_parsed() {
+        Some(p) => {
+            let laid = crate::ui::reader::layout(&p.blocks, width, None);
+            laid.extract_selection(
+                sel.anchor_line,
+                sel.anchor_col,
+                cursor_line,
+                cursor_col,
+                sel.kind,
+            )
+        }
+        None => String::new(),
+    };
+    app.exit_visual();
+    if text.is_empty() {
+        app.status_error = Some("yank: empty selection".into());
+        return;
+    }
+    let kind = match sel.kind {
+        crate::ui::app::VisualKind::Char => "selection",
+        crate::ui::app::VisualKind::Line => "lines",
+    };
+    dispatch_yank(app, cfg, text, format!("yanked {kind}"));
 }
 
 fn command(app: &mut App, cfg: &Config, k: KeyEvent) {

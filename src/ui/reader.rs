@@ -6,7 +6,7 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 
 use crate::mail::html::{Block, Inline, InlineStyle};
-use crate::ui::app::{InboxScreen, Mode, Pane, ParsedBody, ScanState};
+use crate::ui::app::{InboxScreen, Mode, Pane, ParsedBody, ScanState, VisualKind, VisualState};
 use crate::ui::images::ImageKey;
 use crate::ui::style::pane_block;
 
@@ -29,6 +29,11 @@ pub struct LaidOutBody {
     pub links: Vec<LinkSlot>,
     pub images: Vec<ImageSlot>,
     pub line_block_idx: Vec<Option<usize>>,
+    /// Plain text of each rendered line — derived from the layout's
+    /// own `Span::content` strings (i.e. from the IR via layout, not
+    /// from the cell buffer). Drives visual-mode selection extraction
+    /// without scraping cells. One entry per `lines` row.
+    pub line_text: Vec<String>,
 }
 
 impl LaidOutBody {
@@ -72,6 +77,129 @@ impl LaidOutBody {
             });
         }
         best.map(|(s, _)| s).or_else(|| self.links.first())
+    }
+
+    /// Extract the text spanned by a visual-mode selection. Endpoints
+    /// are body-relative coords (`line` into `line_text`, `col` as a
+    /// char index into the line's string). The endpoints normalize so
+    /// `(anchor) <= (cursor)` doesn't matter — pass them in any order.
+    ///
+    /// * `VisualKind::Line` ignores columns and joins whole lines.
+    /// * `VisualKind::Char` cuts the first line at `start_col`, the
+    ///   last line at `end_col` (inclusive), keeps middles whole.
+    ///
+    /// Returns the empty string when `line_text` is empty (e.g. body
+    /// has no rendered content). Column overshoots are clamped to the
+    /// line's char count, matching the draw-time cursor clamp.
+    pub fn extract_selection(
+        &self,
+        anchor_line: u16,
+        anchor_col: u16,
+        cursor_line: u16,
+        cursor_col: u16,
+        kind: VisualKind,
+    ) -> String {
+        if self.line_text.is_empty() {
+            return String::new();
+        }
+        let n = self.line_text.len();
+        let (start_line, start_col, end_line, end_col) =
+            if (anchor_line, anchor_col) <= (cursor_line, cursor_col) {
+                (anchor_line, anchor_col, cursor_line, cursor_col)
+            } else {
+                (cursor_line, cursor_col, anchor_line, anchor_col)
+            };
+        let start_line = (start_line as usize).min(n - 1);
+        let end_line = (end_line as usize).min(n - 1);
+        match kind {
+            VisualKind::Line => {
+                let slice: Vec<String> = self.line_text[start_line..=end_line].to_vec();
+                slice.join("\n")
+            }
+            VisualKind::Char => {
+                if start_line == end_line {
+                    let line = &self.line_text[start_line];
+                    let n_chars = line.chars().count();
+                    if n_chars == 0 {
+                        return String::new();
+                    }
+                    let s = (start_col as usize).min(n_chars.saturating_sub(1));
+                    // `end_col` is inclusive in vim's char-wise visual.
+                    let e = (end_col as usize).min(n_chars.saturating_sub(1));
+                    line.chars().skip(s).take(e + 1 - s).collect()
+                } else {
+                    let mut out = String::new();
+                    let first = &self.line_text[start_line];
+                    let first_chars = first.chars().count();
+                    let s = (start_col as usize).min(first_chars);
+                    out.extend(first.chars().skip(s));
+                    for middle in &self.line_text[start_line + 1..end_line] {
+                        out.push('\n');
+                        out.push_str(middle);
+                    }
+                    out.push('\n');
+                    let last = &self.line_text[end_line];
+                    let last_chars = last.chars().count();
+                    let e = (end_col as usize).min(last_chars.saturating_sub(1));
+                    out.extend(last.chars().take(e + 1));
+                    out
+                }
+            }
+        }
+    }
+
+    /// Cell-column ranges to highlight for a visual-mode selection on
+    /// each visible line. Returns one `(line, col_start, col_end_excl)`
+    /// per affected line — `col_start..col_end_excl` is the inclusive
+    /// cell range to paint REVERSED. For line-wise, the entire line is
+    /// covered (cell range = `0..line_width_cells`). For char-wise:
+    /// first/last lines cut at the cursor cols; middles span the whole
+    /// line. Columns are char-counts, consistent with `line_text` and
+    /// the existing cell-counting convention in `LineBuilder`.
+    pub fn selection_cell_ranges(
+        &self,
+        sel: &VisualState,
+        cursor_line: u16,
+        cursor_col: u16,
+    ) -> Vec<(u16, u16, u16)> {
+        if self.line_text.is_empty() {
+            return Vec::new();
+        }
+        let n = self.line_text.len();
+        let (sl, sc, el, ec) = if (sel.anchor_line, sel.anchor_col) <= (cursor_line, cursor_col) {
+            (sel.anchor_line, sel.anchor_col, cursor_line, cursor_col)
+        } else {
+            (cursor_line, cursor_col, sel.anchor_line, sel.anchor_col)
+        };
+        let sl = (sl as usize).min(n - 1);
+        let el = (el as usize).min(n - 1);
+        let mut out: Vec<(u16, u16, u16)> = Vec::new();
+        for li in sl..=el {
+            let line_chars = self.line_text[li].chars().count() as u16;
+            let (a, b) = match sel.kind {
+                VisualKind::Line => (0u16, line_chars),
+                VisualKind::Char => {
+                    let start = if li == sl { sc } else { 0 };
+                    // `end` is inclusive in char-wise; convert to exclusive.
+                    let end_incl = if li == el {
+                        ec
+                    } else {
+                        line_chars.saturating_sub(1)
+                    };
+                    let end_excl = end_incl.saturating_add(1).min(line_chars);
+                    (start.min(line_chars), end_excl)
+                }
+            };
+            if a < b {
+                out.push((li as u16, a, b));
+            } else if matches!(sel.kind, VisualKind::Char) && line_chars == 0 {
+                // Empty line under a multi-line selection still gets a
+                // 1-cell highlight so the user sees the line is part of
+                // the range. Same as vim's behavior for empty lines.
+                out.push((li as u16, 0, 1));
+            }
+        }
+        out
     }
 
     /// Count of links with at least one segment inside the
@@ -230,14 +358,34 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     let body_top = inbox.reader_scroll.saturating_sub(header);
     if inner_h > 0 && body_only_lines_this_frame > 0 {
         let body_bot_excl = body_top.saturating_add(inner_h);
-        if inbox.reader_cursor_line < body_top {
-            inbox.reader_cursor_line = body_top;
-        }
-        if inbox.reader_cursor_line >= body_bot_excl {
-            inbox.reader_cursor_line = body_bot_excl - 1;
+        // In Visual mode the cursor is the *driver* — scroll follows it.
+        // Don't clamp the cursor into the viewport; that would silently
+        // walk the selection back when the user scrolled. Visual entry
+        // and `move_reader_cursor` already maintain the scroll-follow
+        // invariant. In Normal mode the cursor is a passive shadow of
+        // viewport-top, so the original clamp still applies.
+        if mode != Mode::Visual {
+            if inbox.reader_cursor_line < body_top {
+                inbox.reader_cursor_line = body_top;
+            }
+            if inbox.reader_cursor_line >= body_bot_excl {
+                inbox.reader_cursor_line = body_bot_excl - 1;
+            }
         }
         if inbox.reader_cursor_line >= body_only_lines_this_frame {
             inbox.reader_cursor_line = body_only_lines_this_frame - 1;
+        }
+    }
+    // Clamp `reader_cursor_col` against the real line length. Movement
+    // helpers (`$`, `move_reader_cursor`) intentionally overshoot since
+    // they don't have the laid-out body in hand; we true them up here.
+    if let Some(laid_ref) = laid.as_ref() {
+        let li = inbox.reader_cursor_line as usize;
+        if let Some(line) = laid_ref.line_text.get(li) {
+            let max_col = line.chars().count().saturating_sub(1) as u16;
+            if inbox.reader_cursor_col > max_col {
+                inbox.reader_cursor_col = max_col;
+            }
         }
     }
 
@@ -259,6 +407,26 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     if let Some(laid) = laid {
         let scroll = inbox.reader_scroll as i32;
         emit_osc8_hyperlinks(f.buffer_mut(), inner, &laid.links, scroll);
+        // Visual-mode selection paint goes on top of the rendered text
+        // (REVERSED modifier on covered cells). Done before the OSC 8
+        // emit would have stripped escapes, but after Paragraph laid
+        // the cells down. Painting cells doesn't disturb the existing
+        // OSC 8 byte injections — those modify symbol strings, this
+        // flips the cell style.
+        if let Some(sel) = inbox.visual.as_ref() {
+            paint_selection(
+                f.buffer_mut(),
+                inner,
+                &laid,
+                sel,
+                PaintView {
+                    header_offset: inbox.last_reader_header_offset,
+                    scroll: inbox.reader_scroll,
+                    cursor_line: inbox.reader_cursor_line,
+                    cursor_col: inbox.reader_cursor_col,
+                },
+            );
+        }
         let mut drawn: Vec<Rect> = Vec::new();
         for slot in &laid.images {
             let Some(resolved) = inbox.resolved_image(&slot.key) else {
@@ -294,6 +462,71 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
             drawn.push(rect);
         }
         inbox.last_image_rects = drawn;
+    }
+}
+
+/// Paint the visual-mode selection by flipping `Modifier::REVERSED` on
+/// every cell covered by the selection's body-relative range. Cells
+/// receive the modifier in addition to whatever style the renderer
+/// already laid down (so colored text stays colored, just inverted),
+/// matching vim's visual look. Coordinates are body-relative
+/// (`line_text` indices + char cols), translated to absolute rows by
+/// adding `view.header_offset` and subtracting `view.scroll`.
+struct PaintView {
+    header_offset: u16,
+    scroll: u16,
+    cursor_line: u16,
+    cursor_col: u16,
+}
+
+fn paint_selection(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    laid: &LaidOutBody,
+    sel: &VisualState,
+    view: PaintView,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let ranges = laid.selection_cell_ranges(sel, view.cursor_line, view.cursor_col);
+    let scroll = view.scroll as i32;
+    for (body_line, c_start, c_end_excl) in ranges {
+        let abs_line = view.header_offset as i32 + body_line as i32;
+        let row_signed = abs_line - scroll;
+        if row_signed < 0 || row_signed >= inner.height as i32 {
+            continue;
+        }
+        let row = inner.y + row_signed as u16;
+        let x_start = inner.x.saturating_add(c_start).min(inner.x + inner.width);
+        let x_end = inner
+            .x
+            .saturating_add(c_end_excl)
+            .min(inner.x + inner.width);
+        for x in x_start..x_end {
+            if let Some(cell) = buf.cell_mut((x, row)) {
+                let mut style = cell.style();
+                style = style.add_modifier(Modifier::REVERSED);
+                cell.set_style(style);
+            }
+        }
+    }
+    // Cursor cell: always REVERSED so the user can see where the
+    // active extend point sits even when (e.g. an empty line) the
+    // selection range above didn't cover it.
+    let abs_line = view.header_offset as i32 + view.cursor_line as i32;
+    let row_signed = abs_line - scroll;
+    if row_signed >= 0 && row_signed < inner.height as i32 {
+        let row = inner.y + row_signed as u16;
+        let x = inner
+            .x
+            .saturating_add(view.cursor_col)
+            .min(inner.x + inner.width.saturating_sub(1));
+        if let Some(cell) = buf.cell_mut((x, row)) {
+            let mut style = cell.style();
+            style = style.add_modifier(Modifier::REVERSED);
+            cell.set_style(style);
+        }
     }
 }
 
@@ -454,11 +687,21 @@ where
             out_block_idx.push(block_idx);
         }
     }
+    // Per-line plain text, derived from final spans. Done here (rather
+    // than during emit) so post-emit fixups — the `> ` blockquote
+    // prefix in particular — are captured automatically. Visual-mode
+    // selection extracts from this; it's IR-derived (via the layout
+    // walker) not cell-scraped.
+    let line_text: Vec<String> = out_lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
     LaidOutBody {
         lines: out_lines,
         links,
         images: out_images,
         line_block_idx: out_block_idx,
+        line_text,
     }
 }
 
@@ -1534,5 +1777,172 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(!joined2.contains("[1]"), "{joined2:?}");
+    }
+
+    #[test]
+    fn line_text_aligns_with_lines() {
+        let blocks = html::parse("<p>one</p><p>two</p>");
+        let laid = layout(&blocks, 40, None);
+        assert_eq!(
+            laid.line_text.len(),
+            laid.lines.len(),
+            "line_text must mirror lines length"
+        );
+        // Plain text for the "one" line must match the line's joined spans.
+        for (i, line) in laid.lines.iter().enumerate() {
+            let expected = line_text(line);
+            assert_eq!(laid.line_text[i], expected, "mismatch at line {i}");
+        }
+    }
+
+    #[test]
+    fn line_text_captures_blockquote_prefix() {
+        // Blockquote `> ` is inserted post-emit; line_text must include
+        // it so visual selection yields the rendered form.
+        let blocks = html::parse("<blockquote><p>hi</p></blockquote>");
+        let laid = layout(&blocks, 40, None);
+        assert!(
+            laid.line_text.iter().any(|s| s.contains("> hi")),
+            "line_text didn't capture quote prefix: {:?}",
+            laid.line_text
+        );
+    }
+
+    #[test]
+    fn extract_selection_line_wise_joins_with_newline() {
+        let blocks = html::parse("<p>alpha</p><p>beta</p><p>gamma</p>");
+        let laid = layout(&blocks, 80, None);
+        // Pick the lines containing each word, line-wise from alpha → gamma.
+        let a = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("alpha"))
+            .unwrap() as u16;
+        let g = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("gamma"))
+            .unwrap() as u16;
+        let s = laid.extract_selection(a, 0, g, 0, VisualKind::Line);
+        // Includes every line between (including the empty separator
+        // lines our paragraph emit leaves behind).
+        assert!(s.contains("alpha"), "{s:?}");
+        assert!(s.contains("beta"), "{s:?}");
+        assert!(s.contains("gamma"), "{s:?}");
+        assert!(s.contains('\n'));
+    }
+
+    #[test]
+    fn extract_selection_char_wise_single_line() {
+        let blocks = html::parse("<p>hello world</p>");
+        let laid = layout(&blocks, 40, None);
+        // Find the line, grab "world" by char index.
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hello"))
+            .unwrap() as u16;
+        let line = &laid.line_text[li as usize];
+        let start = line.find("world").unwrap() as u16;
+        let end = start + "world".chars().count() as u16 - 1;
+        let s = laid.extract_selection(li, start, li, end, VisualKind::Char);
+        assert_eq!(s, "world");
+    }
+
+    #[test]
+    fn extract_selection_char_wise_multi_line() {
+        // Span two paragraphs: from middle of "hello" to middle of "world".
+        let blocks = html::parse("<p>hello</p><p>world</p>");
+        let laid = layout(&blocks, 80, None);
+        let l1 = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hello"))
+            .unwrap() as u16;
+        let l2 = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("world"))
+            .unwrap() as u16;
+        // From "llo" through "wor": col 2 of l1 → col 2 of l2.
+        let s = laid.extract_selection(l1, 2, l2, 2, VisualKind::Char);
+        assert!(s.starts_with("llo"), "{s:?}");
+        assert!(s.ends_with("wor"), "{s:?}");
+        assert!(s.contains('\n'));
+    }
+
+    #[test]
+    fn extract_selection_normalizes_reversed_endpoints() {
+        let blocks = html::parse("<p>hello</p>");
+        let laid = layout(&blocks, 40, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hello"))
+            .unwrap() as u16;
+        // Anchor > cursor: should produce same output as cursor > anchor.
+        let fwd = laid.extract_selection(li, 0, li, 4, VisualKind::Char);
+        let rev = laid.extract_selection(li, 4, li, 0, VisualKind::Char);
+        assert_eq!(fwd, rev);
+        assert_eq!(fwd, "hello");
+    }
+
+    #[test]
+    fn extract_selection_clamps_col_overshoot() {
+        // `$` sets cursor_col = u16::MAX; extraction must clamp.
+        let blocks = html::parse("<p>hi</p>");
+        let laid = layout(&blocks, 40, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hi"))
+            .unwrap() as u16;
+        let s = laid.extract_selection(li, 0, li, u16::MAX, VisualKind::Char);
+        assert_eq!(s, "hi");
+    }
+
+    #[test]
+    fn selection_cell_ranges_line_wise_covers_full_line() {
+        let blocks = html::parse("<p>hello</p>");
+        let laid = layout(&blocks, 40, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hello"))
+            .unwrap() as u16;
+        let sel = VisualState {
+            kind: VisualKind::Line,
+            anchor_line: li,
+            anchor_col: 0,
+        };
+        let ranges = laid.selection_cell_ranges(&sel, li, 0);
+        assert_eq!(ranges.len(), 1);
+        let (l, a, b) = ranges[0];
+        assert_eq!(l, li);
+        assert_eq!(a, 0);
+        // "hello" has 5 chars.
+        assert_eq!(b, 5);
+    }
+
+    #[test]
+    fn selection_cell_ranges_char_wise_clamps_to_cursor() {
+        let blocks = html::parse("<p>abcdef</p>");
+        let laid = layout(&blocks, 40, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("abcdef"))
+            .unwrap() as u16;
+        // Anchor at col 1, cursor at col 3 → covers cols 1, 2, 3 (3 cells).
+        let sel = VisualState {
+            kind: VisualKind::Char,
+            anchor_line: li,
+            anchor_col: 1,
+        };
+        let ranges = laid.selection_cell_ranges(&sel, li, 3);
+        assert_eq!(ranges.len(), 1);
+        let (_, a, b) = ranges[0];
+        assert_eq!(a, 1);
+        assert_eq!(b, 4); // exclusive end
     }
 }

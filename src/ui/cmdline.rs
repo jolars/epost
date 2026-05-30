@@ -59,6 +59,10 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::Command => "-- COMMAND --",
         Mode::LinkPick => "-- LINK PICK --",
         Mode::Search => "-- SEARCH --",
+        // Char-wise vs line-wise lives on `InboxScreen.visual.kind`; the
+        // label is the same shape for both — the user reads the
+        // selection rendering, not the modeline, to tell them apart.
+        Mode::Visual => "-- VISUAL --",
     }
 }
 
