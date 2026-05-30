@@ -69,6 +69,10 @@ pub struct ComposeScreen {
     pub send_rx: Option<Receiver<SendResult>>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// Files queued for `multipart/mixed` attachment. Maintained by
+    /// `:attach <path>` / `:detach <n>`; rendered as a read-only row in
+    /// the compose header when non-empty.
+    pub attachments: Vec<PathBuf>,
 }
 
 impl ComposeScreen {
@@ -102,6 +106,7 @@ impl ComposeScreen {
             send_rx: None,
             in_reply_to: draft.in_reply_to,
             references: draft.references,
+            attachments: draft.attachments,
         })
     }
 
@@ -122,6 +127,7 @@ impl ComposeScreen {
             body,
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
+            attachments: self.attachments.clone(),
         })
     }
 
@@ -193,12 +199,15 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent) {
     }
 }
 
-/// Render the compose screen into `area`. Layout: a 6-line header
-/// block (From / To / Cc / Bcc / Subject), a body-preview pane below,
-/// hint line at the bottom.
+/// Render the compose screen into `area`. Layout: a header block
+/// (From / To / Cc / Bcc / Subject, plus an Attachments row when files
+/// are queued), a body-preview pane below, hint line at the bottom.
 pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
+    let show_attachments = !screen.attachments.is_empty();
+    // 5 fixed rows + 2 border lines = 7; +1 for the Attachments row when shown.
+    let header_height: u16 = if show_attachments { 8 } else { 7 };
     let outer = Layout::vertical([
-        Constraint::Length(7),
+        Constraint::Length(header_height),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
@@ -211,14 +220,11 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     let header_inner = header_block.inner(header_area);
     f.render_widget(header_block, header_area);
 
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(header_inner);
+    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1); 5];
+    if show_attachments {
+        constraints.push(Constraint::Length(1));
+    }
+    let rows = Layout::vertical(constraints).split(header_inner);
     render_field(
         f,
         rows[0],
@@ -254,6 +260,9 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         &screen.subject,
         screen.focused == ComposeField::Subject,
     );
+    if show_attachments {
+        render_attachments_row(f, rows[5], &screen.attachments);
+    }
 
     let editing = screen.editor.is_some();
     let body_block = pane_block(
@@ -347,6 +356,30 @@ fn render_field(f: &mut Frame, area: Rect, label: &str, input: &TextInput, focus
     } else {
         spans.push(Span::raw(buf.to_string()));
     }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Read-only "Attachments:" row. Lists each queued file as
+/// `<1-based-index>: <basename>` so the user can target `:detach <n>`.
+/// Truncation is implicit — ratatui's `Paragraph` clips at the row
+/// edge, which is fine here since the list is informational.
+fn render_attachments_row(f: &mut Frame, area: Rect, attachments: &[PathBuf]) {
+    let label_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let body: String = attachments
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string());
+            format!("{}: {}", i + 1, name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let spans = vec![Span::styled("Attach:  ", label_style), Span::raw(body)];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

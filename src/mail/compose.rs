@@ -39,6 +39,11 @@ pub struct Draft {
     /// Bare msgid (no `<>` wrapping); `mail-builder` adds the brackets.
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// Files to attach as `multipart/mixed` parts. Empty = single-part
+    /// `text/plain`. Bytes are read at `serialize` time, not at attach
+    /// time — a file deleted between `:attach` and `:send` surfaces as
+    /// a send-path error rather than silently shipping stale content.
+    pub attachments: Vec<PathBuf>,
 }
 
 impl Draft {
@@ -53,6 +58,7 @@ impl Draft {
             body: String::new(),
             in_reply_to: None,
             references: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -102,6 +108,7 @@ impl Draft {
             body: quote_reply(h, b),
             in_reply_to: Some(h.msgid.clone()),
             references: refs,
+            attachments: Vec::new(),
         }
     }
 
@@ -119,6 +126,7 @@ impl Draft {
             body: forward_block(h, b),
             in_reply_to: None,
             references: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }
@@ -339,6 +347,15 @@ pub fn serialize(d: &Draft) -> io::Result<Vec<u8>> {
     }
     if !d.references.is_empty() {
         b = b.references(MessageId::new_list(d.references.iter().cloned()));
+    }
+    for path in &d.attachments {
+        let bytes = fs::read(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("attachment {}: {e}", path.display())))?;
+        let filename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".to_string());
+        b = b.attachment("application/octet-stream", filename, bytes);
     }
     b.write_to_vec()
 }
@@ -647,6 +664,7 @@ mod tests {
             body: "Hi all,\n\nQuick note.\n".into(),
             in_reply_to: Some("orig@example.com".into()),
             references: vec!["root@example.com".into(), "orig@example.com".into()],
+            attachments: Vec::new(),
         }
     }
 
@@ -739,5 +757,68 @@ mod tests {
         // Date and Message-ID are auto-generated.
         assert!(mime.contains("Date: "));
         assert!(mime.contains("Message-ID: "));
+    }
+
+    #[test]
+    fn serialize_no_attachments_is_single_part() {
+        let bytes = serialize(&canned_draft()).expect("serialize");
+        let mime = String::from_utf8_lossy(&bytes);
+        assert!(
+            !mime.contains("multipart/"),
+            "expected single-part body, got multipart MIME: {mime}"
+        );
+    }
+
+    #[test]
+    fn serialize_with_attachments_is_multipart_mixed() {
+        use mail_parser::{MessageParser, MimeHeaders};
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut f = NamedTempFile::with_prefix("epost-attach-test-").unwrap();
+        f.write_all(b"hello world\n").unwrap();
+        let path = f.path().to_path_buf();
+        let filename = path.file_name().unwrap().to_string_lossy().into_owned();
+
+        let mut draft = canned_draft();
+        draft.attachments.push(path);
+
+        let bytes = serialize(&draft).expect("serialize");
+        let parsed = MessageParser::default()
+            .parse(&bytes)
+            .expect("parse roundtrip");
+        let ct = parsed
+            .content_type()
+            .expect("outer Content-Type header present");
+        assert_eq!(ct.ctype(), "multipart");
+        assert_eq!(ct.subtype(), Some("mixed"));
+        // Expect at least the text body + the attachment.
+        let attachment_count = parsed.attachment_count();
+        assert!(
+            attachment_count >= 1,
+            "expected >=1 attachment, got {attachment_count}"
+        );
+        // The attachment part should carry the filename we asked for.
+        let names: Vec<String> = parsed
+            .attachments()
+            .filter_map(|p| p.attachment_name().map(|s| s.to_string()))
+            .collect();
+        assert!(
+            names.iter().any(|n| n == &filename),
+            "expected filename {filename:?} in attachments, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn serialize_missing_attachment_errors() {
+        let bogus = PathBuf::from("/tmp/epost-definitely-does-not-exist-xyz123.bin");
+        let mut draft = canned_draft();
+        draft.attachments.push(bogus.clone());
+        let err = serialize(&draft).expect_err("expected error for missing attachment");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&bogus.display().to_string()),
+            "error should mention path; got: {msg}"
+        );
     }
 }

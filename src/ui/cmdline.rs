@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -136,6 +138,8 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
             };
             app.move_selected_to(folder, cfg);
         }
+        "attach" => attach_path(app, cmd),
+        "detach" => detach_index(app, &mut parts),
         "account" => match parts.next() {
             None | Some("all") => app.switch_to_scope(None, "INBOX"),
             Some(name) if cfg.accounts.contains_key(name) => {
@@ -221,6 +225,89 @@ pub fn trash_selected(app: &mut App, cfg: &Config) {
 /// `App::poll_sync` surfaces the outcome on the cmdline row. The
 /// maildir watcher reconciles whatever the sync wrote to disk — we
 /// only report on the command itself.
+/// `:attach <path>` — queue a file for `multipart/mixed` attachment on
+/// the active compose tab. Takes rest-of-line so unquoted spaces are
+/// fine; a leading `~/` or bare `~` expands to `$HOME`. Existence + is-file
+/// is checked at attach time; the bytes are read at serialize time so
+/// the attachment list is just a `Vec<PathBuf>` until `:send`.
+fn attach_path(app: &mut App, full_cmd: &str) {
+    let raw = full_cmd.trim().strip_prefix("attach").unwrap_or("").trim();
+    if raw.is_empty() {
+        app.status_error = Some("attach: missing path".into());
+        return;
+    }
+    let path = expand_tilde(raw);
+    let Some(c) = app.active_compose_mut() else {
+        app.status_error = Some("attach: not on a compose tab".into());
+        return;
+    };
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => {
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            c.attachments.push(path);
+            let n = c.attachments.len();
+            app.status_error = Some(format!("attached: {name} ({n} total)"));
+        }
+        Ok(_) => {
+            app.status_error = Some(format!("attach: {} is not a file", path.display()));
+        }
+        Err(e) => {
+            app.status_error = Some(format!("attach: {}: {e}", path.display()));
+        }
+    }
+}
+
+/// `:detach <n>` — remove the 1-based attachment at index `n` from the
+/// active compose tab.
+fn detach_index(app: &mut App, parts: &mut std::str::SplitWhitespace) {
+    let Some(arg) = parts.next() else {
+        app.status_error = Some("detach: missing index".into());
+        return;
+    };
+    let Ok(n) = arg.parse::<usize>() else {
+        app.status_error = Some(format!("detach: not a number: {arg}"));
+        return;
+    };
+    let Some(c) = app.active_compose_mut() else {
+        app.status_error = Some("detach: not on a compose tab".into());
+        return;
+    };
+    if n == 0 || n > c.attachments.len() {
+        app.status_error = Some(format!(
+            "detach: index {n} out of range (have {})",
+            c.attachments.len()
+        ));
+        return;
+    }
+    let removed = c.attachments.remove(n - 1);
+    let name = removed
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| removed.display().to_string());
+    let rem = c.attachments.len();
+    app.status_error = Some(format!("detached: {name} ({rem} remaining)"));
+}
+
+/// Expand a leading `~/` or a bare `~` to `$HOME`. Anything else passes
+/// through unchanged. Mid-path `~user` is intentionally not supported —
+/// the cmdline isn't a shell.
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    if s == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home);
+    }
+    PathBuf::from(s)
+}
+
 fn dispatch_sync(app: &mut App, cfg: &Config) {
     if app.sync_rx.is_some() {
         app.status_error = Some("sync: already running".into());
