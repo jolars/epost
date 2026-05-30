@@ -23,6 +23,9 @@ browser = ["./dev/browser-stub"]
 # pipe the selected text to this command's stdin instead, for tmux or
 # terminals where OSC 52 is disabled.
 # clipboard = ["wl-copy"]
+# Mouse-drag selection in the reader pane. Default true. Disable to
+# keep the terminal's native drag-select and middle-click paste.
+# mouse = false
 
 [search]
 # Folders covered by `g/` (global) search, in priority order. Empty list

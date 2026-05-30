@@ -58,11 +58,17 @@ paste is full of artifacts. The model is in-app, app-rendered selection.
   REVERSED so the user can see the extend point. Movement scrolls to follow.
   Selection text is recovered from `LaidOutBody.line_text` (per-line plain text
   derived from layout spans, i.e. IR-via-layout, never from the cell buffer).
-- **Mouse-drag selection.** Same engine as visual mode, mouse-driven:
-  `crossterm::event::EnableMouseCapture`, press → anchor, drag → extend, release
-  → yank. Sits on top of the keyboard path so the engine ships first. Cost:
-  middle-click paste and terminal scrollback selection stop reaching the app's
-  panes --- add a config toggle to opt out.
+- **Mouse-drag selection.** *Done.* `crossterm::event::EnableMouseCapture`
+  gated on `[reader].mouse = true` (default). `MouseDown(Left)` inside the
+  reader's inner rect anchors body-relative `(line, col)` on
+  `InboxScreen.mouse_drag_anchor`; the first `Drag` promotes the gesture to
+  `Mode::Visual` (char-wise) at the press cell and updates the cursor;
+  `Up(Left)` yanks via the existing `keys::yank_visual` path (OSC 52 or
+  fallback) and exits. A click (Down/Up at the same cell) leaves the cursor
+  parked without entering visual or yanking. Wheel-over-reader scrolls the
+  body 3 lines per notch. Hit-testing uses `InboxScreen.last_reader_inner`
+  set per-frame by `reader::draw`; `last_reader_inner` is cleared at the
+  top of `app::draw` so a hidden reader pane never returns a stale rect.
 
 ## Dev fixtures
 

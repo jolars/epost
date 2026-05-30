@@ -86,6 +86,14 @@ pub struct Reader {
     /// disabled, e.g. `["wl-copy"]` or `["xclip", "-selection", "clipboard"]`.
     #[serde(default)]
     pub clipboard: Option<Vec<String>>,
+    /// Mouse-drag selection in the reader pane. Default `true`: press
+    /// anchors visual-char mode at the click cell, drag extends, release
+    /// yanks. Cost of enabling: while epost is running the terminal's own
+    /// drag-select / middle-click paste over the app's panes is consumed
+    /// by the app instead of the terminal. Set `false` to keep the
+    /// terminal's native selection.
+    #[serde(default = "yes")]
+    pub mouse: bool,
 }
 
 impl Default for Reader {
@@ -94,6 +102,7 @@ impl Default for Reader {
             prefer: ReaderPrefer::default(),
             browser: default_browser(),
             clipboard: None,
+            mouse: true,
         }
     }
 }
@@ -362,6 +371,19 @@ mod tests {
         assert_eq!(cfg.reader.prefer, ReaderPrefer::Html);
         assert_eq!(cfg.reader.browser, vec!["xdg-open".to_string()]);
         assert!(cfg.reader.clipboard.is_none());
+        assert!(cfg.reader.mouse);
+    }
+
+    #[test]
+    fn reader_mouse_can_be_disabled() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [reader]
+            mouse = false
+            "#,
+        )
+        .unwrap();
+        assert!(!cfg.reader.mouse);
     }
 
     #[test]

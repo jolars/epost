@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{DisableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use ratatui::Terminal;
@@ -59,7 +59,8 @@ fn main() -> ExitCode {
 
     install_panic_hook();
 
-    let mut terminal = match tty::enter() {
+    let mouse = cfg.reader.mouse;
+    let mut terminal = match tty::enter(mouse) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("epost: failed to enter raw mode: {e:#}");
@@ -73,7 +74,7 @@ fn main() -> ExitCode {
     let (picker, picker_warning) = ui::images::build_picker(&cfg.images);
 
     let result = run(&mut terminal, &cfg, cache_path, picker, picker_warning);
-    let restore = tty::leave();
+    let restore = tty::leave(mouse);
 
     if let Err(e) = result {
         eprintln!("epost: {e:#}");
@@ -135,6 +136,9 @@ fn process_event(app: &mut App, cfg: &Config, ev: AppEvent) {
     match ev {
         AppEvent::Input(Event::Key(k)) if k.kind == KeyEventKind::Press => {
             ui::keys::handle(app, cfg, k);
+        }
+        AppEvent::Input(Event::Mouse(m)) => {
+            ui::mouse::handle(app, cfg, m);
         }
         AppEvent::Input(_) => {}
         AppEvent::Wake => {}
@@ -248,7 +252,11 @@ fn compose_body_inner_size(term_size: ratatui::layout::Size) -> (u16, u16) {
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        // Emit DisableMouseCapture unconditionally: terminals that
+        // never saw EnableMouseCapture ignore the corresponding DEC
+        // private-mode resets, so this is safe regardless of the
+        // session's config.
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         original(info);
     }));

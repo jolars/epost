@@ -347,6 +347,12 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     inbox.last_reader_inner_width = inner_width;
     inbox.last_reader_header_offset = header_offset_this_frame;
     inbox.last_reader_body_only_lines = body_only_lines_this_frame;
+    inbox.last_reader_inner = Some(Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    });
     // Clamp the body-relative cursor into the visible viewport so it
     // tracks "topmost visible body line" until visual mode introduces
     // independent movement. Scroll above the body (cursor below
@@ -513,14 +519,26 @@ fn paint_selection(
     }
     // Cursor cell: always REVERSED so the user can see where the
     // active extend point sits even when (e.g. an empty line) the
-    // selection range above didn't cover it.
+    // selection range above didn't cover it. The cursor col is
+    // capped against the line's real text length so an unclamped
+    // sentinel (`move_reader_cursor_to_line_end` sets `u16::MAX`)
+    // can't park the cursor cell at the right edge of an otherwise-
+    // short line — that was the "selection extends to end of screen"
+    // report.
     let abs_line = view.header_offset as i32 + view.cursor_line as i32;
     let row_signed = abs_line - scroll;
     if row_signed >= 0 && row_signed < inner.height as i32 {
         let row = inner.y + row_signed as u16;
+        let line_chars = laid
+            .line_text
+            .get(view.cursor_line as usize)
+            .map(|s| s.chars().count() as u16)
+            .unwrap_or(0);
+        let max_col = line_chars.saturating_sub(1);
+        let capped_col = view.cursor_col.min(max_col);
         let x = inner
             .x
-            .saturating_add(view.cursor_col)
+            .saturating_add(capped_col)
             .min(inner.x + inner.width.saturating_sub(1));
         if let Some(cell) = buf.cell_mut((x, row)) {
             let mut style = cell.style();
@@ -815,6 +833,16 @@ impl<'a> LayoutCtx<'a> {
                 }
             }
             Block::Quote(inner) => {
+                // Reserve 2 cells for the `> ` prefix prepended below.
+                // Without this, content wraps to the full pane width and
+                // the prefix pushes `line_text` past the pane edge —
+                // ratatui then auto-wraps the row to a second visible row
+                // while `paint_selection` paints the first row entirely,
+                // which a user reads as "highlight to end of screen" on
+                // `$` / mouse-EOL. Nests correctly: a quote inside a
+                // quote sees a width already reduced by the outer level.
+                let saved_width = self.width;
+                self.width = self.width.saturating_sub(2).max(8);
                 for b in inner {
                     let before = self.lines.len();
                     self.emit_block(b, indent);
@@ -837,6 +865,7 @@ impl<'a> LayoutCtx<'a> {
                             .insert(0, Span::styled("> ", Style::default().fg(Color::DarkGray)));
                     }
                 }
+                self.width = saved_width;
             }
             Block::Table { rows } => {
                 let mut col_widths = vec![0usize; rows.iter().map(|r| r.len()).max().unwrap_or(0)];
@@ -874,13 +903,26 @@ impl<'a> LayoutCtx<'a> {
                 self.lines.push(Line::raw(""));
             }
             Block::Pre(text) => {
+                // Hard-wrap lines wider than the pane into multiple
+                // laid-out lines so `paint_selection` doesn't see a
+                // single `line_text` longer than `inner_width` (which
+                // would paint the row fully REVERSED to the right edge
+                // while ratatui's Paragraph auto-wraps the rendered
+                // text to the row below). Preformatted whitespace is
+                // preserved within each chunk.
+                let usable = self.width.saturating_sub(indent).max(1) as usize;
+                let style = Style::default().fg(Color::Gray).bg(Color::Reset);
                 for ln in text.lines() {
-                    let mut spans: Vec<Span<'static>> = pad_indent_spans(indent);
-                    spans.push(Span::styled(
-                        ln.to_string(),
-                        Style::default().fg(Color::Gray).bg(Color::Reset),
-                    ));
-                    self.lines.push(Line::from(spans));
+                    let chars: Vec<char> = ln.chars().collect();
+                    if chars.is_empty() {
+                        self.lines.push(Line::from(pad_indent_spans(indent)));
+                        continue;
+                    }
+                    for chunk in chars.chunks(usable) {
+                        let mut spans: Vec<Span<'static>> = pad_indent_spans(indent);
+                        spans.push(Span::styled(chunk.iter().collect::<String>(), style));
+                        self.lines.push(Line::from(spans));
+                    }
                 }
                 self.lines.push(Line::raw(""));
             }
@@ -1944,5 +1986,340 @@ mod tests {
         let (_, a, b) = ranges[0];
         assert_eq!(a, 1);
         assert_eq!(b, 4); // exclusive end
+    }
+
+    #[test]
+    fn selection_with_overshooting_anchor_does_not_extend_past_line_end() {
+        // Repro for the "selection goes to end of screen" report: a press
+        // past the line's text leaves `mouse_drag_anchor` (and the new
+        // `visual.anchor_col`) at a viewport column larger than the line's
+        // actual char count. Dragging back into the line content (or `$`
+        // afterwards) must still cap the highlight at the line's length —
+        // the painter should never light up cells beyond the IR's view of
+        // the line.
+        let blocks = html::parse("<p>hi</p>");
+        let laid = layout(&blocks, 80, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s == "hi")
+            .expect("hi line present");
+        let line_chars = laid.line_text[li].chars().count() as u16;
+        // Anchor far past the line's last char (as the mouse press at
+        // viewport col 50 would do on a 2-char line). Cursor anywhere
+        // inside the line — drag back to col 0.
+        let sel = VisualState {
+            kind: VisualKind::Char,
+            anchor_line: li as u16,
+            anchor_col: 50,
+        };
+        let ranges = laid.selection_cell_ranges(&sel, li as u16, 0);
+        // One range, capped at line length.
+        assert_eq!(ranges.len(), 1);
+        let (_, _, end_excl) = ranges[0];
+        assert!(
+            end_excl <= line_chars,
+            "end_excl ({end_excl}) leaked past line length ({line_chars})"
+        );
+    }
+
+    #[test]
+    fn paint_selection_for_dollar_does_not_reverse_cells_past_text() {
+        // Full-stack repro: layout a short paragraph on a wide pane, run
+        // `paint_selection` with the same args the live draw uses for `v`
+        // + `$`, and inspect the Buffer to confirm cells past the line's
+        // last character don't carry the REVERSED modifier.
+        use ratatui::buffer::Buffer;
+        let blocks = html::parse("<p>hello</p>");
+        let inner_width: u16 = 40;
+        let laid = layout(&blocks, inner_width, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hello"))
+            .expect("hello line present") as u16;
+        let line_chars = laid.line_text[li as usize].chars().count() as u16;
+
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: inner_width,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(inner);
+        let sel = VisualState {
+            kind: VisualKind::Char,
+            anchor_line: li,
+            anchor_col: 0,
+        };
+        // Cursor at the sentinel `$` sets — the draw-time clamp normally
+        // brings this back to `line_chars - 1` before this point, so
+        // simulate post-clamp.
+        let cursor_col_clamped = line_chars.saturating_sub(1);
+        super::paint_selection(
+            &mut buf,
+            inner,
+            &laid,
+            &sel,
+            super::PaintView {
+                header_offset: 0,
+                scroll: 0,
+                cursor_line: li,
+                cursor_col: cursor_col_clamped,
+            },
+        );
+        // Cells [0, line_chars) on the line's row should be REVERSED.
+        // Cells [line_chars, inner_width) should NOT.
+        let row = inner.y + li;
+        for col in 0..line_chars {
+            let cell = buf.cell((inner.x + col, row)).expect("cell in range");
+            assert!(
+                cell.style().add_modifier.contains(Modifier::REVERSED),
+                "col {col} expected REVERSED but wasn't (modifier = {:?})",
+                cell.style().add_modifier
+            );
+        }
+        for col in line_chars..inner_width {
+            let cell = buf.cell((inner.x + col, row)).expect("cell in range");
+            assert!(
+                !cell.style().add_modifier.contains(Modifier::REVERSED),
+                "col {col} REVERSED but should be clean past line end (line_chars={line_chars})"
+            );
+        }
+    }
+
+    #[test]
+    fn paint_selection_with_unclamped_cursor_col_does_not_leak_past_text() {
+        // The cursor-cell paint must not light up cells past the line's
+        // actual text length even when the caller passes an unclamped
+        // `cursor_col` (e.g. straight from `move_reader_cursor_to_line_end`
+        // before the draw-time clamp has run, or any path where the clamp
+        // is skipped). This is the "highlight extends to end of screen"
+        // regression report.
+        use ratatui::buffer::Buffer;
+        let blocks = html::parse("<p>hello</p>");
+        let inner_width: u16 = 40;
+        let laid = layout(&blocks, inner_width, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hello"))
+            .expect("hello line present") as u16;
+        let line_chars = laid.line_text[li as usize].chars().count() as u16;
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: inner_width,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(inner);
+        let sel = VisualState {
+            kind: VisualKind::Char,
+            anchor_line: li,
+            anchor_col: 0,
+        };
+        super::paint_selection(
+            &mut buf,
+            inner,
+            &laid,
+            &sel,
+            super::PaintView {
+                header_offset: 0,
+                scroll: 0,
+                cursor_line: li,
+                cursor_col: u16::MAX,
+            },
+        );
+        let row = inner.y + li;
+        for col in line_chars..inner_width {
+            let cell = buf.cell((inner.x + col, row)).expect("cell in range");
+            assert!(
+                !cell.style().add_modifier.contains(Modifier::REVERSED),
+                "col {col} REVERSED but should be clean past line end with unclamped cursor"
+            );
+        }
+        // The cursor cell itself should land on the last text character,
+        // not the right edge of the pane.
+        let last_char_cell = buf
+            .cell((inner.x + line_chars - 1, row))
+            .expect("last char cell");
+        assert!(
+            last_char_cell
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "cursor cell should be at last text char (col {})",
+            line_chars - 1
+        );
+    }
+
+    #[test]
+    fn blockquote_lines_fit_within_inner_width() {
+        // Blockquoted content used to wrap to the full pane width and
+        // then prepend `> `, pushing `line_text` past the pane edge.
+        // After the fix, the wrap target is reduced by 2 so the post-
+        // prefix line fits exactly. Realistic multi-word content; the
+        // degenerate "single word wider than the pane" case is handled
+        // separately by `LineBuilder`'s overflow rule.
+        let blocks = html::parse(
+            "<blockquote><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p></blockquote>",
+        );
+        let inner_width: u16 = 80;
+        let laid = layout(&blocks, inner_width, None);
+        for (i, t) in laid.line_text.iter().enumerate() {
+            let n = t.chars().count();
+            assert!(
+                n <= inner_width as usize,
+                "blockquote line {i} has {n} chars, wider than pane ({inner_width}): {:?}",
+                t,
+            );
+        }
+    }
+
+    #[test]
+    fn paragraphs_and_pre_line_widths_at_dev_width() {
+        // Diagnostic: enumerate every block type and assert that none
+        // produce `line_text` wider than the inner pane. Lines wider than
+        // `inner_width` cause `paint_selection` (and ratatui's Paragraph
+        // wrap) to paint the body_line's row fully REVERSED to the right
+        // edge — the "highlight extends to end of screen" report. The
+        // failure output identifies the offending block and line.
+        let cases = [
+            (
+                "plain paragraph",
+                "<p>If you can read this in the reader pane, the Block-IR walker is rendering into ratatui cells correctly.</p>",
+            ),
+            (
+                "blockquote that packs tight",
+                "<blockquote><p>alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega plus more text here</p></blockquote>",
+            ),
+            (
+                "pre with a long line",
+                "<pre>fn really_long_function_name_that_exceeds_eighty_columns_for_sure_indeed_yes_it_does() { todo!() }</pre>",
+            ),
+            (
+                "ordered list",
+                "<ol><li>first</li><li>second</li><li>third</li><li>fourth</li><li>fifth</li><li>sixth</li><li>seventh</li><li>eighth</li><li>ninth</li><li>tenth</li></ol>",
+            ),
+        ];
+        let inner_width: u16 = 80;
+        let mut bad: Vec<(String, usize, usize, String)> = Vec::new();
+        for (name, html) in cases {
+            let blocks = html::parse(html);
+            let laid = layout(&blocks, inner_width, None);
+            for (i, t) in laid.line_text.iter().enumerate() {
+                let n = t.chars().count();
+                if n > inner_width as usize {
+                    bad.push((name.to_string(), i, n, t.clone()));
+                }
+            }
+        }
+        if !bad.is_empty() {
+            for (name, i, n, t) in &bad {
+                eprintln!("OVERFLOW in {name} line {i}: {n} chars: {t:?}");
+            }
+            panic!("{} overflowing lines", bad.len());
+        }
+    }
+
+    #[test]
+    fn full_draw_dollar_eol_highlight_matches_text_extent() {
+        // End-to-end repro: render Paragraph the way `draw` does, then
+        // call `paint_selection` with cursor_col = u16::MAX (the sentinel
+        // `$` sets) to mirror the case where the in-draw clamp got
+        // skipped or applied a stale `line_text` length. The test
+        // assertions show exactly which cells get REVERSED so we can see
+        // a regression where the highlight leaks past the line's text.
+        use ratatui::buffer::Buffer;
+        use ratatui::text::Line;
+        use ratatui::widgets::{Paragraph, Wrap};
+        let blocks = html::parse(
+            "<p>If you can read this in the reader pane, the Block-IR walker is rendering into ratatui cells correctly.</p>",
+        );
+        let inner_width: u16 = 80;
+        let laid = layout(&blocks, inner_width, None);
+        // Pick the first wrapped line and find its actual char count.
+        let li_idx = laid
+            .line_text
+            .iter()
+            .position(|s| !s.is_empty())
+            .expect("non-empty line");
+        let line_chars = laid.line_text[li_idx].chars().count() as u16;
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: inner_width,
+            height: 12,
+        };
+        let mut buf = Buffer::empty(inner);
+        // Render the laid-out paragraph the same way the live draw does.
+        let lines: Vec<Line<'static>> = laid.lines.clone();
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        ratatui::widgets::Widget::render(paragraph, inner, &mut buf);
+        // Simulate `$`: enter visual at (li, 0), cursor at (li, u16::MAX).
+        let sel = VisualState {
+            kind: VisualKind::Char,
+            anchor_line: li_idx as u16,
+            anchor_col: 0,
+        };
+        super::paint_selection(
+            &mut buf,
+            inner,
+            &laid,
+            &sel,
+            super::PaintView {
+                header_offset: 0,
+                scroll: 0,
+                cursor_line: li_idx as u16,
+                cursor_col: u16::MAX,
+            },
+        );
+        let row = inner.y + li_idx as u16;
+        // Walk the row: text cells must be REVERSED; cells past line end
+        // must not be.
+        let reversed: Vec<bool> = (0..inner_width)
+            .map(|col| {
+                buf.cell((inner.x + col, row))
+                    .map(|c| c.style().add_modifier.contains(Modifier::REVERSED))
+                    .unwrap_or(false)
+            })
+            .collect();
+        for col in 0..line_chars {
+            assert!(
+                reversed[col as usize],
+                "col {col} should be REVERSED (text cell); line_chars={line_chars}"
+            );
+        }
+        for col in line_chars..inner_width {
+            assert!(
+                !reversed[col as usize],
+                "col {col} REVERSED but should be clean past line end (line_chars={line_chars})"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_at_eol_does_not_extend_past_line_end() {
+        // Direct repro of `$` semantics: cursor_col = u16::MAX (set by
+        // `move_reader_cursor_to_line_end`); the painter must clamp the
+        // highlight to the line's char count, not the pane's inner width.
+        let blocks = html::parse("<p>hello world</p>");
+        let laid = layout(&blocks, 80, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hello"))
+            .expect("hello line present") as u16;
+        let line_chars = laid.line_text[li as usize].chars().count() as u16;
+        let sel = VisualState {
+            kind: VisualKind::Char,
+            anchor_line: li,
+            anchor_col: 0,
+        };
+        let ranges = laid.selection_cell_ranges(&sel, li, u16::MAX);
+        assert_eq!(ranges.len(), 1);
+        let (_, start, end_excl) = ranges[0];
+        assert_eq!(start, 0);
+        assert_eq!(end_excl, line_chars);
     }
 }

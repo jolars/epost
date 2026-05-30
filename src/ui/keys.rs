@@ -345,7 +345,11 @@ fn visual(app: &mut App, cfg: &Config, k: KeyEvent) {
 /// it through `clipboard::yank`. Exits visual mode whether or not the
 /// yank succeeded — the mode's purpose is delivering the selection,
 /// once it's delivered the user expects to be back in Normal.
-fn yank_visual(app: &mut App, cfg: &Config) {
+///
+/// `pub(crate)` because `ui::mouse::release` calls it: a mouse-driven
+/// drag is a different way to enter the same visual state, and the
+/// finalize-and-deliver path is identical.
+pub(crate) fn yank_visual(app: &mut App, cfg: &Config) {
     let inbox = app.inbox();
     let Some(sel) = inbox.visual else {
         app.exit_visual();

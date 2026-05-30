@@ -202,6 +202,11 @@ browser = ["xdg-open"]
 # "clipboard"]`. OSC 52 is suppressed when this is set; the two paths
 # are exclusive to avoid double-paste.
 # clipboard = ["wl-copy"]
+# Mouse-drag selection in the reader pane. Default true: press anchors
+# visual-char mode, drag extends, release yanks (OSC 52 or fallback);
+# scroll-wheel scrolls the reader. Disable to keep the terminal's
+# native drag-select and middle-click paste over the app's panes.
+# mouse = false
 
 [images]
 # Auto-detect by default. Override with one of:
@@ -263,6 +268,20 @@ smtp.command  = ["msmtp", "-t", "-a", "work"]    # per-account override
 "v"        = "exit-or-swap-char"  # same kind exits; different kind swaps
 "V"        = "exit-or-swap-line"
 "<Esc>"    = "exit-visual"
+
+[keys.mouse]
+# Reader-pane only. Press anchors at the cell, drag promotes the gesture
+# to a visual-char selection and extends, release yanks and exits to
+# Normal. A plain click (Down/Up at the same cell) leaves the cursor at
+# the click and stays in Normal — no yank, no visual flash. Wheel events
+# over the reader scroll the body by 3 lines per notch. Disable with
+# `[reader].mouse = false` (default true) to keep the terminal's native
+# drag-select and middle-click-paste.
+"<LeftPress>"   = "mouse-anchor"
+"<LeftDrag>"    = "mouse-extend"
+"<LeftRelease>" = "mouse-yank"
+"<ScrollUp>"    = "scroll-up 3"
+"<ScrollDown>"  = "scroll-down 3"
 ```
 
 Schema lives in `src/config.rs` as plain `serde::Deserialize` structs with

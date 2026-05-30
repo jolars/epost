@@ -199,6 +199,17 @@ pub struct InboxScreen {
     /// indexing would drift when the keymap doesn't know the live
     /// pane width.
     pub last_reader_inner_width: u16,
+    /// Inner reader-pane rect (after the pane border) from the last
+    /// frame the reader actually drew. `None` when the reader pane is
+    /// hidden this frame. Used by the mouse handler to translate
+    /// terminal-cell coordinates into body-relative (line, col) for
+    /// drag-selection.
+    pub last_reader_inner: Option<Rect>,
+    /// Anchor for an in-progress mouse drag in the reader. Set on
+    /// `MouseDown(Left)` inside the reader's inner area; promoted to a
+    /// visual-char selection on the first `Drag`; cleared on `Up`.
+    /// `None` between gestures. Body-relative (line, col).
+    pub mouse_drag_anchor: Option<(u16, u16)>,
     pub scan: ScanState,
     pub selected: usize,
     /// Boxed so its size doesn't bloat `Screen::Inbox` past the
@@ -808,6 +819,8 @@ impl InboxScreen {
             last_reader_header_offset: 0,
             last_reader_body_only_lines: 0,
             last_reader_inner_width: 0,
+            last_reader_inner: None,
+            mouse_drag_anchor: None,
             scan,
             selected: 0,
             parsed: None,
@@ -943,6 +956,7 @@ impl InboxScreen {
         self.reader_cursor_line = 0;
         self.reader_cursor_col = 0;
         self.visual = None;
+        self.mouse_drag_anchor = None;
         let Some(path) = self.selected_path() else {
             self.parsed = None;
             self.evict_image_cache(old_msgid.as_deref(), &msgid);
@@ -1376,6 +1390,7 @@ impl InboxScreen {
         self.reader_cursor_line = 0;
         self.reader_cursor_col = 0;
         self.visual = None;
+        self.mouse_drag_anchor = None;
         self.parsed = None;
         self.last_parsed_msgid = None;
         self.prev_parsed_msgid = None;
@@ -1840,6 +1855,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } = app;
     match screens.get_mut(*active) {
         Some(Screen::Inbox(inbox)) => {
+            // Clear last frame's reader rect up-front; reader::draw will
+            // set it again iff the reader pane actually renders. That
+            // way a frame with the reader hidden leaves `None` for the
+            // mouse handler to see, and stale rects can't sneak through.
+            inbox.last_reader_inner = None;
             let (sidebar_area, right_area) = split_body(body, inbox.sidebar_visible);
             let (list_area, reader_area) =
                 split_right(right_area, inbox.list_visible, inbox.reader_visible);
