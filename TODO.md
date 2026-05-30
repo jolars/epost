@@ -52,19 +52,19 @@ paste is full of artifacts. The model is in-app, app-rendered selection.
 - **OSC 52 structural yanks.** Cheapest 80%-case first, before the selection
   engine: `Y` (whole body), `yp` (paragraph under reader cursor), `yl` (link
   under reader cursor). Emits `ESC ] 52 ; c ; <base64> ESC \` to stdout. No
-  selection rendering, no cursor logic. Fallback path for terminals without
-  OSC 52: shell out to `xclip` / `wl-copy` via a configured `[reader].clipboard`
+  selection rendering, no cursor logic. Fallback path for terminals without OSC
+  52: shell out to `xclip` / `wl-copy` via a configured `[reader].clipboard`
   command.
-- **Visual mode in the reader pane.** `v` enters select, `j`/`k`/`h`/`l`
-  extend, `y` yanks (OSC 52) and exits, `Esc` cancels. Selected cells render
-  with `Style::REVERSED`. The selection engine maps a `(row, col)` cursor back
-  to the wrapped Block-IR so a yank gets the source text, not the cell glyphs.
-  Handles scroll-while-selecting.
+- **Visual mode in the reader pane.** `v` enters select, `j`/`k`/`h`/`l` extend,
+  `y` yanks (OSC 52) and exits, `Esc` cancels. Selected cells render with
+  `Style::REVERSED`. The selection engine maps a `(row, col)` cursor back to the
+  wrapped Block-IR so a yank gets the source text, not the cell glyphs. Handles
+  scroll-while-selecting.
 - **Mouse-drag selection.** Same engine as visual mode, mouse-driven:
-  `crossterm::event::EnableMouseCapture`, press → anchor, drag → extend,
-  release → yank. Sits on top of the keyboard path so the engine ships first.
-  Cost: middle-click paste and terminal scrollback selection stop reaching the
-  app's panes — add a config toggle to opt out.
+  `crossterm::event::EnableMouseCapture`, press → anchor, drag → extend, release
+  → yank. Sits on top of the keyboard path so the engine ships first. Cost:
+  middle-click paste and terminal scrollback selection stop reaching the app's
+  panes --- add a config toggle to opt out.
 
 ## Dev fixtures
 
