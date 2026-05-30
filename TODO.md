@@ -18,10 +18,6 @@ are the v1.x finish, not the original v1 spec.
 Carry-over from `AGENTS.md` Step 6 --- none of these block v1 but each is a real
 usability gap.
 
-- **Attachments (multipart/mixed).** Add `attachments: Vec<PathBuf>` to `Draft`
-  in `src/mail/compose.rs`; wrap body in `multipart/mixed` when non-empty via
-  `mail-builder`'s `MultipartBuilder`. Surface through a `:attach <path>`
-  cmdline command (no UI field yet).
 - **Drafts/cur persistence across restart.** Serialize `Draft` into
   `Drafts/cur/<unique>:2,` on editor exit; restore on `:compose`. Wipe on
   successful `:send`.

@@ -26,6 +26,7 @@ portable-pty = "0.9.0"
 vt100 = "0.16.2"
 notify = "8"
 nucleo-matcher = "0.3"
+mime_guess = { version = "2", default-features = false }
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }
