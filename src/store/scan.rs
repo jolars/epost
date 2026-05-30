@@ -5,7 +5,9 @@ use std::sync::mpsc::{self, Receiver};
 use anyhow::{Context, Result};
 
 use crate::mail::flags;
+use crate::mail::layout::Layout;
 use crate::mail::parse;
+use crate::store::AccountSpec;
 use crate::store::index::{FolderStat, Index, MessageRow};
 use crate::store::thread::{ThreadedRow, build_threads};
 
@@ -34,7 +36,7 @@ pub type ScanResult = std::result::Result<ScanData, String>;
 /// returned by the worker always cover every configured account plus
 /// the "[all]" group regardless of scope.
 pub fn start_worker(
-    accounts: Vec<(String, PathBuf)>,
+    accounts: Vec<AccountSpec>,
     cache_path: PathBuf,
     current_scope: (Option<String>, String),
 ) -> Receiver<ScanResult> {
@@ -48,12 +50,12 @@ pub fn start_worker(
 
 fn run(
     cache_path: &Path,
-    accounts: &[(String, PathBuf)],
+    accounts: &[AccountSpec],
     current_scope: &(Option<String>, String),
 ) -> Result<ScanData> {
     let mut idx = Index::open(cache_path)?;
-    for (name, root) in accounts {
-        scan_account(name, root, &mut idx)?;
+    for spec in accounts {
+        scan_account(&spec.name, &spec.root, spec.layout, &mut idx)?;
     }
     let (scope_account, scope_folder) = current_scope;
     let rows = idx.list_folder(scope_account.as_deref(), scope_folder)?;
@@ -67,13 +69,13 @@ fn run(
 /// One `folder_stats(None)` for the "[all]" group, then one
 /// `folder_stats(Some(account))` per configured account, sorted by name.
 /// Order matches what the sidebar renders top-to-bottom.
-fn build_groups(idx: &Index, accounts: &[(String, PathBuf)]) -> Result<Vec<AccountFolderStats>> {
+fn build_groups(idx: &Index, accounts: &[AccountSpec]) -> Result<Vec<AccountFolderStats>> {
     let mut groups = Vec::with_capacity(accounts.len() + 1);
     groups.push(AccountFolderStats {
         scope: None,
         folders: idx.folder_stats(None)?,
     });
-    let mut names: Vec<&str> = accounts.iter().map(|(n, _)| n.as_str()).collect();
+    let mut names: Vec<&str> = accounts.iter().map(|s| s.name.as_str()).collect();
     names.sort();
     for name in names {
         groups.push(AccountFolderStats {
@@ -84,33 +86,21 @@ fn build_groups(idx: &Index, accounts: &[(String, PathBuf)]) -> Result<Vec<Accou
     Ok(groups)
 }
 
-pub fn scan_account(account: &str, root: &Path, index: &mut Index) -> Result<ScanReport> {
+pub fn scan_account(
+    account: &str,
+    root: &Path,
+    layout: Layout,
+    index: &mut Index,
+) -> Result<ScanReport> {
     let mut report = ScanReport::default();
     let found = scan_folder(account, root, "INBOX", index, &mut report)?;
     index.prune_folder(account, "INBOX", &found)?;
 
-    let entries = std::fs::read_dir(root)
-        .with_context(|| format!("listing maildir root {}", root.display()))?;
-    let mut subdirs: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with('.') && n != "." && n != "..")
-                .unwrap_or(false)
-        })
-        .collect();
-    subdirs.sort();
-
-    for sub in subdirs {
-        let label = sub
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(folder_label)
-            .unwrap_or_else(|| "?".to_string());
-        let found = scan_folder(account, &sub, &label, index, &mut report)?;
+    if !root.is_dir() {
+        return Ok(report);
+    }
+    for (label, folder_root) in layout.discover_folders(root) {
+        let found = scan_folder(account, &folder_root, &label, index, &mut report)?;
         index.prune_folder(account, &label, &found)?;
     }
     Ok(report)
@@ -123,7 +113,7 @@ pub fn scan_account(account: &str, root: &Path, index: &mut Index) -> Result<Sca
 /// folders' `cur/` and `new/`; everything else is pure SQL.
 pub fn rescan_folders(
     cache_path: PathBuf,
-    accounts: HashMap<String, PathBuf>,
+    accounts: HashMap<String, AccountSpec>,
     dirty: HashSet<(String, String)>,
     current_scope: (Option<String>, String),
 ) -> Receiver<ScanResult> {
@@ -138,21 +128,17 @@ pub fn rescan_folders(
 
 fn rescan_run(
     cache_path: &Path,
-    accounts: &HashMap<String, PathBuf>,
+    accounts: &HashMap<String, AccountSpec>,
     dirty: &HashSet<(String, String)>,
     current_scope: &(Option<String>, String),
 ) -> Result<ScanData> {
     let mut idx = Index::open(cache_path)?;
     let mut report = ScanReport::default();
     for (account, folder) in dirty {
-        let Some(root) = accounts.get(account) else {
+        let Some(spec) = accounts.get(account) else {
             continue;
         };
-        let folder_root = if folder == "INBOX" {
-            root.clone()
-        } else {
-            root.join(format!(".{folder}"))
-        };
+        let folder_root = spec.layout.folder_path(&spec.root, folder);
         if !folder_root.is_dir() {
             // The folder vanished entirely — drop every row we have for
             // it (empty keep-set) and move on.
@@ -164,10 +150,7 @@ fn rescan_run(
     }
     let (scope_account, scope_folder) = current_scope;
     let rows = idx.list_folder(scope_account.as_deref(), scope_folder)?;
-    let acc_vec: Vec<(String, PathBuf)> = accounts
-        .iter()
-        .map(|(n, p)| (n.clone(), p.clone()))
-        .collect();
+    let acc_vec: Vec<AccountSpec> = accounts.values().cloned().collect();
     let groups = build_groups(&idx, &acc_vec)?;
     Ok(ScanData {
         threads: build_threads(rows),
@@ -228,10 +211,6 @@ fn scan_folder(
     Ok(found)
 }
 
-pub fn folder_label(subdir: &str) -> String {
-    subdir.strip_prefix('.').unwrap_or(subdir).to_string()
-}
-
 pub fn extract_flags(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -242,13 +221,6 @@ pub fn extract_flags(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn folder_label_strips_leading_dot() {
-        assert_eq!(folder_label(".Sent"), "Sent");
-        assert_eq!(folder_label(".Sent.Drafts"), "Sent.Drafts");
-        assert_eq!(folder_label("cur"), "cur");
-    }
 
     #[test]
     fn extract_flags_reads_suffix() {
@@ -297,13 +269,17 @@ mod tests {
         write_eml(&root.join(".Archive").join("cur").join("3.M0.h:2,S"), "c");
 
         // Seed the index via full scan.
-        let mut accounts = HashMap::new();
-        accounts.insert("dev".to_string(), root.clone());
+        let mut accounts: HashMap<String, AccountSpec> = HashMap::new();
+        accounts.insert(
+            "dev".to_string(),
+            AccountSpec {
+                name: "dev".to_string(),
+                root: root.clone(),
+                layout: Layout::Maildirpp,
+            },
+        );
         let rx = start_worker(
-            accounts
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            accounts.values().cloned().collect(),
             cache.clone(),
             (None, "INBOX".to_string()),
         );
@@ -378,15 +354,26 @@ mod tests {
         write_eml(&root_a.join("cur").join("p2:2,S"), "p2");
         write_eml(&root_b.join("cur").join("w1:2,S"), "w1");
 
-        let mut accounts: HashMap<String, PathBuf> = HashMap::new();
-        accounts.insert("personal".into(), root_a.clone());
-        accounts.insert("work".into(), root_b.clone());
+        let mut accounts: HashMap<String, AccountSpec> = HashMap::new();
+        accounts.insert(
+            "personal".into(),
+            AccountSpec {
+                name: "personal".into(),
+                root: root_a.clone(),
+                layout: Layout::Maildirpp,
+            },
+        );
+        accounts.insert(
+            "work".into(),
+            AccountSpec {
+                name: "work".into(),
+                root: root_b.clone(),
+                layout: Layout::Maildirpp,
+            },
+        );
 
         let rx = start_worker(
-            accounts
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            accounts.values().cloned().collect(),
             cache.clone(),
             (None, "INBOX".to_string()),
         );
@@ -417,7 +404,7 @@ mod tests {
         if !root.exists() {
             return;
         }
-        let report = scan_account("dev", root, &mut idx).unwrap();
+        let report = scan_account("dev", root, Layout::Maildirpp, &mut idx).unwrap();
         assert!(report.scanned >= 6, "scanned: {}", report.scanned);
         let inbox = idx.list_folder(None, "INBOX").unwrap();
         assert!(!inbox.is_empty(), "inbox empty");

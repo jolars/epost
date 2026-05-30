@@ -247,6 +247,8 @@ pub struct Account {
     pub maildir: PathBuf,
     pub from: String,
     #[serde(default)]
+    pub layout: crate::mail::layout::Layout,
+    #[serde(default)]
     pub sent_folder: Option<String>,
     #[serde(default)]
     pub archive_folder: Option<String>,
@@ -326,6 +328,36 @@ mod tests {
         assert_eq!(dev.archive_folder.as_deref(), Some("Archive"));
         assert_eq!(dev.spam_folder.as_deref(), Some("Spam"));
         assert_eq!(dev.trash_folder.as_deref(), Some("Trash"));
+    }
+
+    #[test]
+    fn account_layout_defaults_to_maildirpp() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [accounts.dev]
+            maildir = "./dev/maildir"
+            from = "Dev <dev@example.invalid>"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.accounts["dev"].layout,
+            crate::mail::layout::Layout::Maildirpp
+        );
+    }
+
+    #[test]
+    fn account_layout_fs_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [accounts.work]
+            maildir = "./dev/maildir-fs"
+            from = "Work <w@example.invalid>"
+            layout = "fs"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.accounts["work"].layout, crate::mail::layout::Layout::Fs);
     }
 
     #[test]

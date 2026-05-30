@@ -1,0 +1,12 @@
+Return-Path: <ops@example.com>
+Delivered-To: fs@example.invalid
+Message-ID: <fs-inbox-001@example.com>
+From: Ops <ops@example.com>
+To: FS <fs@example.invalid>
+Subject: nested-layout test inbox
+Date: Mon, 25 May 2026 12:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+This message lives in the INBOX of an fs-layout maildir — subfolders are
+real subdirectories, not dot-prefixed siblings.

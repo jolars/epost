@@ -106,8 +106,12 @@ messages where a cell-grid rendering would lose important information.
 - `mail-parser` --- MIME parsing (headers, multipart, text/plain + text/html
   alternatives, embedded parts for `cid:` resolution)
 - `mail-builder` --- building outgoing MIME
-- `maildirpp` (or `maildir`) --- maildir cur/new/tmp + info flags; prefer the
-  maildir++ subfolder convention since we have multiple folders per account
+- `maildirpp` (or `maildir`) --- maildir cur/new/tmp + info flags. Supports
+  both subfolder conventions, picked per account via `[accounts.<name>].layout`:
+  `"maildir++"` (the default — dot-prefixed flat siblings: `.Sent`,
+  `.Sent.2024`) and `"fs"` (real nested subdirectories: `Sent/`, `Sent/2024/`).
+  The walker lives in `mail/layout.rs`; the index stores per-layout folder
+  labels as opaque strings (no cross-layout normalization).
 - `notify` --- inotify file watching to mark folders dirty
 - `anyhow` + `thiserror` --- errors
 - `serde` + `toml` --- config (strict-parsed)

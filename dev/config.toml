@@ -41,12 +41,15 @@ global_folders = ["INBOX", "Archive", "Sent"]
 protocol = "auto"
 max_height_cells = 24
 
-# Two dev accounts pointing at scratch maildirs. `dev/maildir/` and
-# `dev/maildir-work/` are the tracked, immutable fixtures; `task dev`
-# / `task run` mirror them into `dev/scratch/maildir{,-work}/` on first
-# use so interactive flag flips and folder moves stay out of git. Run
-# `task maildir:reset` to rebuild both scratch trees from the tracked
-# sources.
+# Three dev accounts pointing at scratch maildirs. `dev/maildir/`,
+# `dev/maildir-work/`, and `dev/maildir-fs/` are the tracked, immutable
+# fixtures; `task dev` / `task run` mirror them into
+# `dev/scratch/maildir{,-work,-fs}/` on first use so interactive flag
+# flips and folder moves stay out of git. Run `task maildir:reset` to
+# rebuild every scratch tree from the tracked sources.
+#
+# `layout` defaults to "maildir++"; the `fs` account exercises the real-
+# subdirectory layout so both code paths stay live under `task dev`.
 
 [accounts.dev]
 maildir = "./dev/scratch/maildir"
@@ -59,6 +62,15 @@ trash_folder = "Trash"
 [accounts.work]
 maildir = "./dev/scratch/maildir-work"
 from = "Dev <dev@work.example>"
+sent_folder = "Sent"
+archive_folder = "Archive"
+spam_folder = "Spam"
+trash_folder = "Trash"
+
+[accounts.fs]
+maildir = "./dev/scratch/maildir-fs"
+from = "FS <fs@example.invalid>"
+layout = "fs"
 sent_folder = "Sent"
 archive_folder = "Archive"
 spam_folder = "Spam"

@@ -7,6 +7,8 @@ vars:
   DEV_MAILDIR_SCRATCH: '{{.ROOT_DIR}}/dev/scratch/maildir'
   DEV_MAILDIR_WORK_SRC: '{{.ROOT_DIR}}/dev/maildir-work'
   DEV_MAILDIR_WORK_SCRATCH: '{{.ROOT_DIR}}/dev/scratch/maildir-work'
+  DEV_MAILDIR_FS_SRC: '{{.ROOT_DIR}}/dev/maildir-fs'
+  DEV_MAILDIR_FS_SCRATCH: '{{.ROOT_DIR}}/dev/scratch/maildir-fs'
   SENT_STUB_DIR: '/tmp/epost-sent'
 
 env:
@@ -22,19 +24,19 @@ tasks:
 
   dev:
     desc: Auto-rebuild + restart on file change (main loop)
-    deps: [_maildir:ensure, _maildir:ensure:work]
+    deps: [_maildir:ensure, _maildir:ensure:work, _maildir:ensure:fs]
     cmds:
       - bacon run -- -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
   run:
     desc: One-shot debug run against dev/config.toml
-    deps: [_maildir:ensure, _maildir:ensure:work]
+    deps: [_maildir:ensure, _maildir:ensure:work, _maildir:ensure:fs]
     cmds:
       - cargo run -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
   run:release:
     desc: One-shot release run
-    deps: [_maildir:ensure, _maildir:ensure:work]
+    deps: [_maildir:ensure, _maildir:ensure:work, _maildir:ensure:fs]
     cmds:
       - cargo run --release -- --config {{.DEV_CONFIG}} --cache {{.DEV_CACHE}}
 
@@ -119,14 +121,25 @@ tasks:
       - mkdir -p {{.DEV_MAILDIR_WORK_SCRATCH}}
       - cp -a {{.DEV_MAILDIR_WORK_SRC}}/. {{.DEV_MAILDIR_WORK_SCRATCH}}/
 
+  _maildir:ensure:fs:
+    desc: Bootstrap dev/scratch/maildir-fs from dev/maildir-fs if missing
+    internal: true
+    status:
+      - test -d {{.DEV_MAILDIR_FS_SCRATCH}}
+    cmds:
+      - mkdir -p {{.DEV_MAILDIR_FS_SCRATCH}}
+      - cp -a {{.DEV_MAILDIR_FS_SRC}}/. {{.DEV_MAILDIR_FS_SCRATCH}}/
+
   maildir:reset:
     desc: Wipe dev/scratch/maildir* and re-mirror from tracked sources (also clears index cache)
     cmds:
       - rm -rf {{.DEV_MAILDIR_SCRATCH}}
       - rm -rf {{.DEV_MAILDIR_WORK_SCRATCH}}
+      - rm -rf {{.DEV_MAILDIR_FS_SCRATCH}}
       - rm -f {{.DEV_CACHE}}
       - task: _maildir:ensure
       - task: _maildir:ensure:work
+      - task: _maildir:ensure:fs
 
   doctor:
     desc: Smoke-check the devshell and fixtures

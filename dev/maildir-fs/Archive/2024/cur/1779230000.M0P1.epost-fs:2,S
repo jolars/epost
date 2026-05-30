@@ -1,0 +1,11 @@
+Return-Path: <legacy@example.com>
+Message-ID: <fs-archive-2024-001@example.com>
+From: Legacy <legacy@example.com>
+To: FS <fs@example.invalid>
+Subject: nested fs sub-folder (Archive/2024)
+Date: Tue, 02 Jan 2024 10:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+This message exercises a two-level nested fs sub-folder. The folder label
+should be "Archive/2024" with `/` as the separator.
