@@ -398,7 +398,6 @@ impl App {
                 Ok(Ok(SendOutcome::Sent)) => {
                     c.status = ComposeStatus::Sent;
                     c.send_rx = None;
-                    *status_error = Some("sent".into());
                 }
                 Ok(Ok(SendOutcome::SentNoCopy(msg))) => {
                     c.status = ComposeStatus::Sent;

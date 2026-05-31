@@ -372,7 +372,6 @@ fn send_active(app: &mut App, cfg: &Config) {
         c.send_rx = Some(rx);
         c.status = ComposeStatus::Sending;
     }
-    app.status_error = Some("sending…".into());
 }
 
 /// Pub re-export of the cmdline `:compose` handler so the `c`
