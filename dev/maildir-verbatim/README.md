@@ -1,14 +1,15 @@
-# Dev fixture maildir — fs layout
+# Dev fixture maildir — verbatim layout
 
 Third in-tree fixture, alongside `dev/maildir/` and `dev/maildir-work/`.
-This one exercises the **fs / nested** Maildir layout (real
-subdirectories, `/`-joined folder labels) as opposed to the Maildir++
-dot-prefix flat encoding that the other two fixtures use. Backs
-`accounts.fs` in `dev/config.toml`.
+This one exercises the **verbatim / nested** Maildir layout (real
+subdirectories, `/`-joined folder labels — what mbsync produces under
+`SubFolders Verbatim`) as opposed to the Maildir++ dot-prefix flat
+encoding that the other two fixtures use. Backs `accounts.verbatim` in
+`dev/config.toml`.
 
-## Layout (fs / nested)
+## Layout (verbatim / nested)
 
-    dev/maildir-fs/
+    dev/maildir-verbatim/
       cur/  new/  tmp/         # INBOX (just like maildir++)
       Sent/
         cur/  new/  tmp/       # folder label: "Sent"
@@ -30,8 +31,8 @@ reserved at every depth.
 
 ## Cases worth adding later
 
-- [ ] Nested sub-folder created at runtime (verifies the fs watcher's
-      re-discovery path under `Create(Folder)` on a folder root, not just
-      the account root)
+- [ ] Nested sub-folder created at runtime (verifies the verbatim
+      watcher's re-discovery path under `Create(Folder)` on a folder
+      root, not just the account root)
 - [ ] Empty container dir with no `cur/` but folder children (verifies
       the walker descends through pure containers)

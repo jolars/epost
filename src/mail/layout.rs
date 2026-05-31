@@ -1,12 +1,13 @@
 //! Maildir folder layout: switch between Maildir++ (dot-prefixed flat
-//! subfolders — `.Sent`, `.Sent.2024`) and fs / nested (real
-//! subdirectories — `Sent/`, `Sent/2024/`). Picked per account in config.
+//! subfolders — `.Sent`, `.Sent.2024`) and verbatim / nested (real
+//! subdirectories — `Sent/`, `Sent/2024/`). Picked per account in
+//! config. Name matches mbsync's `SubFolders Verbatim`.
 //!
 //! Folder labels are stored as opaque strings in the index. The natural
 //! form is per-layout: Maildir++ strips the leading dot but keeps inner
-//! dots (`.Sent.2024` → `Sent.2024`); fs uses the `/`-joined relative
-//! path from the account root (`Sent/2024`). The two namespaces never
-//! mix — a given account is one or the other.
+//! dots (`.Sent.2024` → `Sent.2024`); verbatim uses the `/`-joined
+//! relative path from the account root (`Sent/2024`). The two
+//! namespaces never mix — a given account is one or the other.
 
 use std::path::{Path, PathBuf};
 
@@ -14,11 +15,11 @@ use serde::Deserialize;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum Layout {
-    #[default]
     #[serde(rename = "maildir++")]
     Maildirpp,
-    #[serde(rename = "fs")]
-    Fs,
+    #[default]
+    #[serde(rename = "verbatim")]
+    Verbatim,
 }
 
 impl Layout {
@@ -30,7 +31,7 @@ impl Layout {
         }
         match self {
             Layout::Maildirpp => root.join(format!(".{label}")),
-            Layout::Fs => {
+            Layout::Verbatim => {
                 let mut p = root.to_path_buf();
                 for seg in label.split('/').filter(|s| !s.is_empty()) {
                     p.push(seg);
@@ -47,7 +48,7 @@ impl Layout {
         let mut out = Vec::new();
         match self {
             Layout::Maildirpp => discover_maildirpp(root, &mut out),
-            Layout::Fs => discover_fs(root, "", &mut out),
+            Layout::Verbatim => discover_verbatim(root, "", &mut out),
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -75,7 +76,7 @@ fn discover_maildirpp(root: &Path, out: &mut Vec<(String, PathBuf)>) {
     }
 }
 
-fn discover_fs(root: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+fn discover_verbatim(root: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -103,7 +104,7 @@ fn discover_fs(root: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
         if path.join("cur").is_dir() {
             out.push((label.clone(), path.clone()));
         }
-        discover_fs(&path, &label, out);
+        discover_verbatim(&path, &label, out);
     }
 }
 
@@ -134,8 +135,8 @@ mod tests {
     }
 
     #[test]
-    fn fs_folder_path_uses_slashes() {
-        let l = Layout::Fs;
+    fn verbatim_folder_path_uses_slashes() {
+        let l = Layout::Verbatim;
         assert_eq!(l.folder_path(Path::new("/m"), "INBOX"), PathBuf::from("/m"));
         assert_eq!(
             l.folder_path(Path::new("/m"), "Sent"),
@@ -164,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_discover_recurses_and_uses_slash_labels() {
+    fn verbatim_discover_recurses_and_uses_slash_labels() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         mkmaildir(root);
@@ -178,7 +179,7 @@ mod tests {
         // Dotfile dirs and dot-prefixed entries are skipped.
         fs::create_dir_all(root.join(".notmuch")).unwrap();
 
-        let folders = Layout::Fs.discover_folders(root);
+        let folders = Layout::Verbatim.discover_folders(root);
         let labels: Vec<&str> = folders.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(
             labels,
@@ -197,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_discover_skips_maildir_internals_at_every_depth() {
+    fn verbatim_discover_skips_maildir_internals_at_every_depth() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         mkmaildir(root);
@@ -205,7 +206,7 @@ mod tests {
         // A nested folder literally named like an internal would be a
         // spec violation; cur/new/tmp are reserved at every depth.
         assert_eq!(
-            Layout::Fs
+            Layout::Verbatim
                 .discover_folders(root)
                 .into_iter()
                 .map(|(l, _)| l)
@@ -221,8 +222,8 @@ mod tests {
             layout: Layout,
         }
         let a: W = toml::from_str("layout = \"maildir++\"\n").unwrap();
-        let b: W = toml::from_str("layout = \"fs\"\n").unwrap();
+        let b: W = toml::from_str("layout = \"verbatim\"\n").unwrap();
         assert_eq!(a.layout, Layout::Maildirpp);
-        assert_eq!(b.layout, Layout::Fs);
+        assert_eq!(b.layout, Layout::Verbatim);
     }
 }

@@ -9,8 +9,8 @@
 //! 2. `Watcher` — wraps `notify::RecommendedWatcher`. It watches every
 //!    account maildir's `INBOX` (`{cur,new}`) plus each discovered
 //!    sub-folder's `{cur,new}` and every "discovery root" (the account
-//!    root, plus — under the fs layout — each folder root that may
-//!    contain nested sub-folders). Events are mapped to `(account,
+//!    root, plus — under the verbatim layout — each folder root that
+//!    may contain nested sub-folders). Events are mapped to `(account,
 //!    folder)` dirty marks, accumulated over a debounce window
 //!    (`config.watch.debounce_ms`), and emitted as one
 //!    `WatcherEvent::FoldersDirty(set)` per quiet period.
@@ -69,8 +69,8 @@ impl SelfWrites {
 
 /// `(account_name, folder_label)`. `folder_label` is `"INBOX"` for the
 /// root maildir; otherwise the per-layout label form (Maildir++ strips
-/// the leading dot from `.Sent`; fs uses the `/`-joined relative path
-/// like `Sent/2024`).
+/// the leading dot from `.Sent`; verbatim uses the `/`-joined relative
+/// path like `Sent/2024`).
 pub type FolderKey = (String, String);
 
 #[derive(Debug)]
@@ -108,8 +108,8 @@ pub struct Watcher {
 
 enum RegisterMsg {
     /// Install watches for a specific folder root's `{cur,new}` and (in
-    /// fs layout) add the folder root to the discovery-roots map so new
-    /// nested sub-folders get detected.
+    /// verbatim layout) add the folder root to the discovery-roots map
+    /// so new nested sub-folders get detected.
     AddFolder {
         account: String,
         label: String,
@@ -140,18 +140,18 @@ struct AccountInfo {
 }
 type Accounts = HashMap<String, AccountInfo>;
 
-/// Map from a watched directory (account root, or — under fs — a folder
-/// root) to the account it belongs to. Used in `handle_event` to map a
-/// `Create(Folder)` event back to (a) its account and (b) the right
-/// reaction: Maildir++ folder events under the account root strip the
-/// dot and register the new folder directly; fs events anywhere queue a
-/// full re-discovery for the account.
+/// Map from a watched directory (account root, or — under verbatim — a
+/// folder root) to the account it belongs to. Used in `handle_event` to
+/// map a `Create(Folder)` event back to (a) its account and (b) the
+/// right reaction: Maildir++ folder events under the account root strip
+/// the dot and register the new folder directly; verbatim events
+/// anywhere queue a full re-discovery for the account.
 type DiscoveryRoots = HashMap<PathBuf, String>;
 
 impl Watcher {
     /// Register a freshly-created subfolder (e.g. one the app just
     /// created via `:mv NewFolder`). Adds watches on `{folder_root}/cur`
-    /// and `{folder_root}/new` and (in fs layout) the folder root
+    /// and `{folder_root}/new` and (in verbatim layout) the folder root
     /// itself, and marks the folder dirty so any pre-existing files get
     /// picked up on the next rescan. Idempotent — re-registering an
     /// already-watched folder is a no-op.
@@ -289,7 +289,7 @@ fn register_initial(
             continue;
         }
         // Account root, non-recursive: catches new top-level sub-folder
-        // creation (both `.Sub` under maildir++ and `Sub/` under fs).
+        // creation (both `.Sub` under maildir++ and `Sub/` under verbatim).
         w.watch(&spec.root, RecursiveMode::NonRecursive)
             .with_context(|| format!("watching maildir root {}", spec.root.display()))?;
         dr.insert(spec.root.clone(), spec.name.clone());
@@ -320,10 +320,10 @@ fn register_initial(
 }
 
 /// Install non-recursive watches on `folder_root/{cur,new}`, populate
-/// `lookup` for both, and — under the fs layout — add `folder_root` to
-/// `discovery_roots` so nested sub-folder creation events get picked up.
-/// Best-effort: a stale `.lock` or unusual permission shouldn't fail
-/// the whole watcher.
+/// `lookup` for both, and — under the verbatim layout — add
+/// `folder_root` to `discovery_roots` so nested sub-folder creation
+/// events get picked up. Best-effort: a stale `.lock` or unusual
+/// permission shouldn't fail the whole watcher.
 fn install_folder_watches(
     w: &mut RecommendedWatcher,
     lk: &mut LookupMap,
@@ -339,7 +339,7 @@ fn install_folder_watches(
             lk.insert(dir, (account.to_string(), label.to_string()));
         }
     }
-    if matches!(layout, Layout::Fs)
+    if matches!(layout, Layout::Verbatim)
         && folder_root.is_dir()
         && w.watch(folder_root, RecursiveMode::NonRecursive).is_ok()
     {
@@ -383,7 +383,7 @@ fn handle_event(
         }
 
         // Folder event under a known discovery root (account root, or —
-        // under fs — an existing folder root). Queue re-discovery for
+        // under verbatim — an existing folder root). Queue re-discovery for
         // that account; the debounce thread will diff against already-
         // registered folder roots and add only the new ones.
         if let Some(parent) = path.parent() {
@@ -723,13 +723,13 @@ mod tests {
     }
 
     #[test]
-    fn handle_event_new_nested_folder_under_fs_folder_root_queues_rediscovery() {
+    fn handle_event_new_nested_folder_under_verbatim_folder_root_queues_rediscovery() {
         let lookup = Arc::new(Mutex::new(HashMap::new()));
         let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
         let sw = SelfWrites::new();
         let dr = Arc::new(Mutex::new(HashMap::new()));
         // The Sent folder root has been registered as a discovery root
-        // (fs layout); create a 2024 sub-folder under it.
+        // (verbatim layout); create a 2024 sub-folder under it.
         dr.lock()
             .unwrap()
             .insert(PathBuf::from("/m/dev/Sent"), "dev".to_string());
@@ -800,12 +800,12 @@ mod tests {
     }
 
     #[test]
-    fn register_initial_fs_walks_nested_and_marks_folder_roots_as_discovery() {
+    fn register_initial_verbatim_walks_nested_and_marks_folder_roots_as_discovery() {
         use std::fs;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("fs");
+        let root = tmp.path().join("verbatim");
         for sub in ["cur", "new", "tmp"] {
             fs::create_dir_all(root.join(sub)).unwrap();
         }
@@ -821,9 +821,9 @@ mod tests {
         let lookup = Arc::new(Mutex::new(HashMap::new()));
         let discovery_roots = Arc::new(Mutex::new(HashMap::new()));
         let accounts = vec![AccountSpec {
-            name: "fs".to_string(),
+            name: "verbatim".to_string(),
             root: root.clone(),
-            layout: Layout::Fs,
+            layout: Layout::Verbatim,
         }];
         register_initial(&watcher_arc, &lookup, &discovery_roots, &accounts).unwrap();
 
@@ -831,30 +831,30 @@ mod tests {
         // INBOX.
         assert_eq!(
             lk.get(&root.join("cur")),
-            Some(&("fs".into(), "INBOX".into()))
+            Some(&("verbatim".into(), "INBOX".into()))
         );
         // Real-subdir sub-folder with /-joined label.
         assert_eq!(
             lk.get(&root.join("Sent").join("cur")),
-            Some(&("fs".into(), "Sent".into()))
+            Some(&("verbatim".into(), "Sent".into()))
         );
         assert_eq!(
             lk.get(&root.join("Sent").join("2024").join("cur")),
-            Some(&("fs".into(), "Sent/2024".into()))
+            Some(&("verbatim".into(), "Sent/2024".into()))
         );
         assert_eq!(
             lk.get(&root.join("Archive").join("new")),
-            Some(&("fs".into(), "Archive".into()))
+            Some(&("verbatim".into(), "Archive".into()))
         );
-        // Under fs: every folder root is a discovery root so nested
-        // sub-folder creates get caught.
+        // Under verbatim: every folder root is a discovery root so
+        // nested sub-folder creates get caught.
         let dr = discovery_roots.lock().unwrap();
-        assert_eq!(dr.get(&root), Some(&"fs".to_string()));
-        assert_eq!(dr.get(&root.join("Sent")), Some(&"fs".to_string()));
+        assert_eq!(dr.get(&root), Some(&"verbatim".to_string()));
+        assert_eq!(dr.get(&root.join("Sent")), Some(&"verbatim".to_string()));
         assert_eq!(
             dr.get(&root.join("Sent").join("2024")),
-            Some(&"fs".to_string())
+            Some(&"verbatim".to_string())
         );
-        assert_eq!(dr.get(&root.join("Archive")), Some(&"fs".to_string()));
+        assert_eq!(dr.get(&root.join("Archive")), Some(&"verbatim".to_string()));
     }
 }

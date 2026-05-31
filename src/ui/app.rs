@@ -2158,7 +2158,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
             Account {
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
-                layout: Default::default(),
+                layout: crate::mail::layout::Layout::Maildirpp,
                 sent_folder: None,
                 archive_folder: None,
                 spam_folder: None,
@@ -2180,7 +2180,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 Account {
                     maildir: tmp.path().join("Mail").join(name),
                     from: format!("Tester <{name}@example.invalid>"),
-                    layout: Default::default(),
+                    layout: crate::mail::layout::Layout::Maildirpp,
                     sent_folder: None,
                     archive_folder: None,
                     spam_folder: None,
@@ -2409,7 +2409,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
             Account {
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
-                layout: Default::default(),
+                layout: crate::mail::layout::Layout::Maildirpp,
                 sent_folder: None,
                 archive_folder: archive.map(str::to_string),
                 spam_folder: None,

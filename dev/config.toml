@@ -42,18 +42,20 @@ protocol = "auto"
 max_height_cells = 24
 
 # Three dev accounts pointing at scratch maildirs. `dev/maildir/`,
-# `dev/maildir-work/`, and `dev/maildir-fs/` are the tracked, immutable
-# fixtures; `task dev` / `task run` mirror them into
-# `dev/scratch/maildir{,-work,-fs}/` on first use so interactive flag
-# flips and folder moves stay out of git. Run `task maildir:reset` to
-# rebuild every scratch tree from the tracked sources.
+# `dev/maildir-work/`, and `dev/maildir-verbatim/` are the tracked,
+# immutable fixtures; `task dev` / `task run` mirror them into
+# `dev/scratch/maildir{,-work,-verbatim}/` on first use so interactive
+# flag flips and folder moves stay out of git. Run `task maildir:reset`
+# to rebuild every scratch tree from the tracked sources.
 #
-# `layout` defaults to "maildir++"; the `fs` account exercises the real-
-# subdirectory layout so both code paths stay live under `task dev`.
+# `layout` defaults to "verbatim" (real subdirectories — what mbsync
+# produces under `SubFolders Verbatim`); the dev and work accounts opt
+# back into "maildir++" so both code paths stay live under `task dev`.
 
 [accounts.dev]
 maildir = "./dev/scratch/maildir"
 from = "Dev <dev@example.invalid>"
+layout = "maildir++"
 sent_folder = "Sent"
 archive_folder = "Archive"
 spam_folder = "Spam"
@@ -62,15 +64,15 @@ trash_folder = "Trash"
 [accounts.work]
 maildir = "./dev/scratch/maildir-work"
 from = "Dev <dev@work.example>"
+layout = "maildir++"
 sent_folder = "Sent"
 archive_folder = "Archive"
 spam_folder = "Spam"
 trash_folder = "Trash"
 
-[accounts.fs]
-maildir = "./dev/scratch/maildir-fs"
-from = "FS <fs@example.invalid>"
-layout = "fs"
+[accounts.verbatim]
+maildir = "./dev/scratch/maildir-verbatim"
+from = "Verbatim <verbatim@example.invalid>"
 sent_folder = "Sent"
 archive_folder = "Archive"
 spam_folder = "Spam"

@@ -108,10 +108,11 @@ messages where a cell-grid rendering would lose important information.
 - `mail-builder` --- building outgoing MIME
 - `maildirpp` (or `maildir`) --- maildir cur/new/tmp + info flags. Supports
   both subfolder conventions, picked per account via `[accounts.<name>].layout`:
-  `"maildir++"` (the default — dot-prefixed flat siblings: `.Sent`,
-  `.Sent.2024`) and `"fs"` (real nested subdirectories: `Sent/`, `Sent/2024/`).
-  The walker lives in `mail/layout.rs`; the index stores per-layout folder
-  labels as opaque strings (no cross-layout normalization).
+  `"verbatim"` (the default — real nested subdirectories: `Sent/`,
+  `Sent/2024/`; matches mbsync's `SubFolders Verbatim`) and `"maildir++"`
+  (dot-prefixed flat siblings: `.Sent`, `.Sent.2024`). The walker lives
+  in `mail/layout.rs`; the index stores per-layout folder labels as
+  opaque strings (no cross-layout normalization).
 - `notify` --- inotify file watching to mark folders dirty
 - `anyhow` + `thiserror` --- errors
 - `serde` + `toml` --- config (strict-parsed)

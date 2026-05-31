@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn account_layout_defaults_to_maildirpp() {
+    fn account_layout_defaults_to_verbatim() {
         let cfg: Config = toml::from_str(
             r#"
             [accounts.dev]
@@ -342,22 +342,25 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.accounts["dev"].layout,
-            crate::mail::layout::Layout::Maildirpp
+            crate::mail::layout::Layout::Verbatim
         );
     }
 
     #[test]
-    fn account_layout_fs_parses() {
+    fn account_layout_verbatim_parses() {
         let cfg: Config = toml::from_str(
             r#"
             [accounts.work]
-            maildir = "./dev/maildir-fs"
+            maildir = "./dev/maildir-verbatim"
             from = "Work <w@example.invalid>"
-            layout = "fs"
+            layout = "verbatim"
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.accounts["work"].layout, crate::mail::layout::Layout::Fs);
+        assert_eq!(
+            cfg.accounts["work"].layout,
+            crate::mail::layout::Layout::Verbatim
+        );
     }
 
     #[test]
