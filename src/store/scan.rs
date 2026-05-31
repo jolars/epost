@@ -123,7 +123,7 @@ fn run_inbox_only(
     let mut idx = Index::open(cache_path)?;
     let mut report = ScanReport::default();
     for spec in accounts {
-        let found = scan_folder(&spec.name, &spec.root, "INBOX", &mut idx, &mut report)?;
+        let found = scan_folder(&spec.name, &spec.inbox_root, "INBOX", &mut idx, &mut report)?;
         idx.prune_folder(&spec.name, "INBOX", &found)?;
     }
     let (scope_account, scope_folder) = current_scope;
@@ -146,7 +146,7 @@ fn run_catchup(
         if !spec.root.is_dir() {
             continue;
         }
-        for (label, folder_root) in spec.layout.discover_folders(&spec.root) {
+        for (label, folder_root) in spec.discover_non_inbox_folders() {
             let found = scan_folder(&spec.name, &folder_root, &label, &mut idx, &mut report)?;
             idx.prune_folder(&spec.name, &label, &found)?;
         }
@@ -161,7 +161,7 @@ fn run_catchup(
 }
 
 /// Enumerate every `(account, folder)` the catchup worker would visit
-/// — `INBOX` plus everything `layout.discover_folders` returns per
+/// — `INBOX` plus the non-INBOX folders the layout discovers per
 /// account. Used by `InboxScreen` to populate the "scanned this
 /// session" set without re-walking the filesystem in the apply path.
 pub fn enumerate_folders(accounts: &[AccountSpec]) -> HashSet<(String, String)> {
@@ -171,7 +171,7 @@ pub fn enumerate_folders(accounts: &[AccountSpec]) -> HashSet<(String, String)> 
         if !spec.root.is_dir() {
             continue;
         }
-        for (label, _) in spec.layout.discover_folders(&spec.root) {
+        for (label, _) in spec.discover_non_inbox_folders() {
             out.insert((spec.name.clone(), label));
         }
     }
@@ -251,7 +251,7 @@ fn rescan_run(
         let Some(spec) = accounts.get(account) else {
             continue;
         };
-        let folder_root = spec.layout.folder_path(&spec.root, folder);
+        let folder_root = spec.folder_path(folder);
         if !folder_root.is_dir() {
             // The folder vanished entirely — drop every row we have for
             // it (empty keep-set) and move on.
@@ -389,6 +389,7 @@ mod tests {
                 name: "dev".to_string(),
                 root: root.clone(),
                 layout: Layout::Maildirpp,
+                inbox_root: root.clone(),
             },
         );
         let rx = start_worker(
@@ -474,6 +475,7 @@ mod tests {
                 name: "personal".into(),
                 root: root_a.clone(),
                 layout: Layout::Maildirpp,
+                inbox_root: root_a.clone(),
             },
         );
         accounts.insert(
@@ -482,6 +484,7 @@ mod tests {
                 name: "work".into(),
                 root: root_b.clone(),
                 layout: Layout::Maildirpp,
+                inbox_root: root_b.clone(),
             },
         );
 

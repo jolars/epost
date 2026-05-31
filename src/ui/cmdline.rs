@@ -351,7 +351,7 @@ fn send_active(app: &mut App, cfg: &Config) {
     let sent_cur_dir = cfg.accounts.get(&account_name).and_then(|a| {
         a.sent_folder
             .as_ref()
-            .map(|sf| a.layout.folder_path(&a.maildir, sf).join("cur"))
+            .map(|sf| a.folder_path(sf).join("cur"))
     });
     let bytes = match mail_compose::serialize(&draft) {
         Ok(b) => b,

@@ -783,15 +783,7 @@ impl InboxScreen {
         let reader_visible = cfg.ui.reader;
         let focus = initial_focus(sidebar_visible, list_visible, reader_visible);
 
-        let accounts: Vec<AccountSpec> = cfg
-            .accounts
-            .iter()
-            .map(|(name, a)| AccountSpec {
-                name: name.clone(),
-                root: a.maildir.clone(),
-                layout: a.layout,
-            })
-            .collect();
+        let accounts: Vec<AccountSpec> = account_specs(cfg);
         let scan_rx = if accounts.is_empty() {
             None
         } else {
@@ -1098,7 +1090,7 @@ impl InboxScreen {
             *status_error = Some(format!("move: unknown account {account_name}"));
             return;
         };
-        let folder_root = account.layout.folder_path(&account.maildir, target_folder);
+        let folder_root = account.folder_path(target_folder);
         let target_cur = folder_root.join("cur");
 
         if let Err(e) = flags::ensure_maildir(&folder_root) {
@@ -1627,16 +1619,7 @@ impl InboxScreen {
             let accounts: HashMap<String, AccountSpec> = cfg
                 .accounts
                 .iter()
-                .map(|(n, a)| {
-                    (
-                        n.clone(),
-                        AccountSpec {
-                            name: n.clone(),
-                            root: a.maildir.clone(),
-                            layout: a.layout,
-                        },
-                    )
-                })
+                .map(|(n, a)| (n.clone(), AccountSpec::from_account(n, a)))
                 .collect();
             self.rescan_in_flight = dirty.clone();
             self.rescan_rx = Some(scan::rescan_folders(
@@ -1882,18 +1865,11 @@ impl InboxScreen {
 
 /// Project the in-config accounts into the `AccountSpec` shape the
 /// scan / catch-up workers and `enumerate_folders` consume. Kept as a
-/// single helper so the projection (name + maildir + layout) stays
-/// consistent across the eager scan, the catch-up, and the watcher's
-/// per-folder rescan paths.
+/// single helper so the projection (resolving INBOX path, etc.)
+/// stays consistent across the eager scan, the catch-up, and the
+/// watcher's per-folder rescan paths.
 fn account_specs(cfg: &Config) -> Vec<AccountSpec> {
-    cfg.accounts
-        .iter()
-        .map(|(name, a)| AccountSpec {
-            name: name.clone(),
-            root: a.maildir.clone(),
-            layout: a.layout,
-        })
-        .collect()
+    cfg.accounts.iter().map(AccountSpec::from_pair).collect()
 }
 
 fn mirror_to_index(cache_path: &Path, row: &MessageRow) -> anyhow::Result<()> {
@@ -2326,6 +2302,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
                 layout: crate::mail::layout::Layout::Maildirpp,
+                inbox_folder: None,
                 sent_folder: None,
                 archive_folder: None,
                 spam_folder: None,
@@ -2348,6 +2325,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                     maildir: tmp.path().join("Mail").join(name),
                     from: format!("Tester <{name}@example.invalid>"),
                     layout: crate::mail::layout::Layout::Maildirpp,
+                    inbox_folder: None,
                     sent_folder: None,
                     archive_folder: None,
                     spam_folder: None,
@@ -2581,6 +2559,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
                 layout: crate::mail::layout::Layout::Maildirpp,
+                inbox_folder: None,
                 sent_folder: None,
                 archive_folder: archive.map(str::to_string),
                 spam_folder: None,
@@ -3102,6 +3081,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
                 layout: crate::mail::layout::Layout::Maildirpp,
+                inbox_folder: None,
                 sent_folder: None,
                 archive_folder: None,
                 spam_folder: None,

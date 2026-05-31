@@ -132,11 +132,10 @@ type LookupMap = HashMap<PathBuf, FolderKey>;
 
 /// Owning info for an account, keyed by name. Held alongside the
 /// `lookup` and `discovery_roots` maps so the debounce thread can run
-/// `layout.discover_folders(root)` without bouncing back to the caller.
+/// `discover_non_inbox_folders` without bouncing back to the caller.
 #[derive(Clone)]
 struct AccountInfo {
-    root: PathBuf,
-    layout: Layout,
+    spec: AccountSpec,
 }
 type Accounts = HashMap<String, AccountInfo>;
 
@@ -196,15 +195,7 @@ pub fn start(
     let acc_map: Arc<Mutex<Accounts>> = Arc::new(Mutex::new(
         accounts
             .iter()
-            .map(|s| {
-                (
-                    s.name.clone(),
-                    AccountInfo {
-                        root: s.root.clone(),
-                        layout: s.layout,
-                    },
-                )
-            })
+            .map(|s| (s.name.clone(), AccountInfo { spec: s.clone() }))
             .collect(),
     ));
     let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
@@ -294,9 +285,11 @@ fn register_initial(
             .with_context(|| format!("watching maildir root {}", spec.root.display()))?;
         dr.insert(spec.root.clone(), spec.name.clone());
 
-        // INBOX `cur`/`new`.
+        // INBOX `cur`/`new`. `spec.inbox_root` is the resolved location
+        // (root for the classic maildir convention, or a same-account
+        // subdir like `<root>/Inbox` for mbsync default-pattern setups).
         for sub in ["cur", "new"] {
-            let dir = spec.root.join(sub);
+            let dir = spec.inbox_root.join(sub);
             if dir.is_dir() {
                 w.watch(&dir, RecursiveMode::NonRecursive)
                     .with_context(|| format!("watching {}", dir.display()))?;
@@ -304,7 +297,7 @@ fn register_initial(
             }
         }
 
-        for (label, folder_root) in spec.layout.discover_folders(&spec.root) {
+        for (label, folder_root) in spec.discover_non_inbox_folders() {
             install_folder_watches(
                 &mut w,
                 &mut lk,
@@ -511,7 +504,7 @@ fn apply_register(
                 .get(account)
                 .cloned();
             let Some(info) = info else { return };
-            let folders = info.layout.discover_folders(&info.root);
+            let folders = info.spec.discover_non_inbox_folders();
             let mut new_keys: Vec<FolderKey> = Vec::new();
             {
                 let mut w = watcher.lock().expect("watcher poisoned");
@@ -530,7 +523,7 @@ fn apply_register(
                         account,
                         &label,
                         &folder_root,
-                        info.layout,
+                        info.spec.layout,
                     );
                     new_keys.push((account.clone(), label));
                 }
@@ -773,6 +766,7 @@ mod tests {
             name: "dev".to_string(),
             root: root.clone(),
             layout: Layout::Maildirpp,
+            inbox_root: root.clone(),
         }];
         register_initial(&watcher_arc, &lookup, &discovery_roots, &accounts).unwrap();
 
@@ -824,6 +818,7 @@ mod tests {
             name: "verbatim".to_string(),
             root: root.clone(),
             layout: Layout::Verbatim,
+            inbox_root: root.clone(),
         }];
         register_initial(&watcher_arc, &lookup, &discovery_roots, &accounts).unwrap();
 

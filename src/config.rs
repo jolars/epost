@@ -248,6 +248,17 @@ pub struct Account {
     pub from: String,
     #[serde(default)]
     pub layout: crate::mail::layout::Layout,
+    /// Sub-directory under `maildir` that holds the account's INBOX
+    /// `cur/new/tmp`. mbsync's `Patterns *` default treats INBOX as
+    /// just another folder name and writes it to `<maildir>/Inbox/`
+    /// (or `INBOX/`), which doesn't match the traditional "INBOX at
+    /// the maildir root" convention. When this key is unset the
+    /// scanner auto-detects: if `<maildir>/cur` exists it assumes
+    /// root-INBOX (the legacy convention); otherwise it tries
+    /// `<maildir>/Inbox/` then `<maildir>/INBOX/` and finally falls
+    /// back to the root.
+    #[serde(default)]
+    pub inbox_folder: Option<String>,
     #[serde(default)]
     pub sent_folder: Option<String>,
     #[serde(default)]
@@ -258,6 +269,49 @@ pub struct Account {
     pub trash_folder: Option<String>,
     #[serde(default)]
     pub smtp: Option<Smtp>,
+}
+
+impl Account {
+    /// Resolved on-disk root for the account's INBOX `cur/new/tmp`.
+    /// See `inbox_folder` for the resolution order. Hits the
+    /// filesystem (`is_dir`) so callers should cache the result
+    /// rather than re-resolving in hot paths.
+    pub fn inbox_root(&self) -> PathBuf {
+        resolve_inbox_root(&self.maildir, self.inbox_folder.as_deref())
+    }
+
+    /// Resolve a folder label to its on-disk root, honouring the
+    /// `inbox_folder` override / auto-detect for `"INBOX"` and
+    /// falling through to the layout's regular mapping for every
+    /// other label.
+    pub fn folder_path(&self, label: &str) -> PathBuf {
+        if label == "INBOX" {
+            self.inbox_root()
+        } else {
+            self.layout.folder_path(&self.maildir, label)
+        }
+    }
+}
+
+/// Resolve where INBOX's `cur/new/tmp` actually lives. Order:
+/// explicit `inbox_folder` override → `<root>/cur` exists (root is
+/// itself the INBOX maildir, the traditional layout) → `<root>/Inbox`
+/// → `<root>/INBOX` → fall back to `<root>` so callers still get a
+/// stable path even when INBOX isn't synced yet.
+pub fn resolve_inbox_root(root: &Path, inbox_folder: Option<&str>) -> PathBuf {
+    if let Some(sub) = inbox_folder {
+        return root.join(sub);
+    }
+    if root.join("cur").is_dir() {
+        return root.to_path_buf();
+    }
+    for candidate in ["Inbox", "INBOX"] {
+        let p = root.join(candidate);
+        if p.join("cur").is_dir() {
+            return p;
+        }
+    }
+    root.to_path_buf()
 }
 
 pub fn load(path: &Path) -> Result<Config> {
@@ -561,5 +615,91 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("bogus"));
+    }
+
+    /// Helper: create `<root>/<dir>/{cur,new,tmp}` so `is_dir`
+    /// resolver probes succeed.
+    fn mk_maildir(root: &Path, dir: &str) {
+        for sub in ["cur", "new", "tmp"] {
+            std::fs::create_dir_all(root.join(dir).join(sub)).unwrap();
+        }
+    }
+
+    #[test]
+    fn inbox_resolver_uses_explicit_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        mk_maildir(root, "");
+        mk_maildir(root, "Custom");
+
+        // Override wins even when root has its own cur/.
+        assert_eq!(
+            resolve_inbox_root(root, Some("Custom")),
+            root.join("Custom")
+        );
+    }
+
+    #[test]
+    fn inbox_resolver_prefers_root_when_root_is_maildir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        mk_maildir(root, "");
+
+        assert_eq!(resolve_inbox_root(root, None), root);
+    }
+
+    #[test]
+    fn inbox_resolver_falls_back_to_inbox_subdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // No cur/ at root. mbsync default-pattern layout: Inbox/ subdir.
+        std::fs::create_dir_all(root).unwrap();
+        mk_maildir(root, "Inbox");
+
+        assert_eq!(resolve_inbox_root(root, None), root.join("Inbox"));
+    }
+
+    #[test]
+    fn inbox_resolver_falls_back_to_uppercase_inbox_subdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root).unwrap();
+        mk_maildir(root, "INBOX");
+
+        assert_eq!(resolve_inbox_root(root, None), root.join("INBOX"));
+    }
+
+    #[test]
+    fn inbox_resolver_falls_back_to_root_when_nothing_matches() {
+        // No maildir on disk at all — resolver still returns a stable
+        // path so callers don't have to special-case the empty case.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root).unwrap();
+
+        assert_eq!(resolve_inbox_root(root, None), root);
+    }
+
+    #[test]
+    fn account_folder_path_routes_inbox_through_resolver() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        mk_maildir(root, "Inbox");
+
+        let acc = Account {
+            maildir: root.to_path_buf(),
+            from: "x".into(),
+            layout: crate::mail::layout::Layout::Verbatim,
+            inbox_folder: None,
+            sent_folder: None,
+            archive_folder: None,
+            spam_folder: None,
+            trash_folder: None,
+            smtp: None,
+        };
+        // INBOX routes through the resolver (→ Inbox subdir).
+        assert_eq!(acc.folder_path("INBOX"), root.join("Inbox"));
+        // Non-INBOX labels go through the layout's regular mapping.
+        assert_eq!(acc.folder_path("Archive"), root.join("Archive"));
     }
 }
