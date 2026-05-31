@@ -114,8 +114,8 @@ fn run(
     while !app.quit {
         // Block until something wakes us — input, editor exit, pty
         // bytes, or the idle heartbeat (so initial scan results get
-        // picked up even though `scan::start_worker` doesn't push
-        // to the event channel yet).
+        // picked up even though `scan::start_inbox_worker` and
+        // `start_catchup_worker` don't push to the event channel yet).
         match event_rx.recv_timeout(IDLE_TICK) {
             Ok(ev) => process_event(&mut app, cfg, ev),
             Err(RecvTimeoutError::Timeout) => {}
@@ -151,7 +151,7 @@ fn tick(
     cfg: &Config,
     event_tx: &Sender<AppEvent>,
 ) -> Result<()> {
-    app.poll_scan();
+    app.poll_scan(cfg);
     app.poll_watch(cfg);
     app.poll_compose_sends();
     app.poll_sync();

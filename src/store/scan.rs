@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver};
 use anyhow::{Context, Result};
 
 use crate::mail::flags;
+#[cfg(test)]
 use crate::mail::layout::Layout;
 use crate::mail::parse;
 use crate::store::AccountSpec;
@@ -31,10 +32,19 @@ pub struct ScanData {
 
 pub type ScanResult = std::result::Result<ScanData, String>;
 
+/// Full-scan worker — walks INBOX *and* every discovered sub-folder
+/// for every account, single channel. Test-only utility: production
+/// startup splits this into `start_inbox_worker` (eager) +
+/// `start_catchup_worker` (background) so the user sees INBOX rows
+/// without waiting for the rest of the mailbox. The two-stage path
+/// makes a `drain_scan` helper awkward; keeping this one-shot variant
+/// lets the scan.rs tests assert on combined post-state.
+///
 /// `current_scope` is the `(account, folder)` pair driving the list
 /// pane — `account = None` means the unified view. The grouped stats
 /// returned by the worker always cover every configured account plus
 /// the "[all]" group regardless of scope.
+#[cfg(test)]
 pub fn start_worker(
     accounts: Vec<AccountSpec>,
     cache_path: PathBuf,
@@ -48,6 +58,45 @@ pub fn start_worker(
     rx
 }
 
+/// Eager startup worker: scans only INBOX for each configured account.
+/// The catch-up pass for every other discovered folder is spawned by
+/// `start_catchup_worker` once this result lands, so the user sees
+/// their INBOX threaded list as fast as the INBOX walk alone can run
+/// — independent of how big `Archive`, `Sent`, etc. are.
+pub fn start_inbox_worker(
+    accounts: Vec<AccountSpec>,
+    cache_path: PathBuf,
+    current_scope: (Option<String>, String),
+) -> Receiver<ScanResult> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result =
+            run_inbox_only(&cache_path, &accounts, &current_scope).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// Background catch-up worker: walks every *non-INBOX* folder for each
+/// account so the sidebar counts and any future scope switch see fresh
+/// data. Spawned by `InboxScreen` once the eager `start_inbox_worker`
+/// result lands. Returns the same `ScanData` shape so the apply path
+/// can reuse the rescan plumbing.
+pub fn start_catchup_worker(
+    accounts: Vec<AccountSpec>,
+    cache_path: PathBuf,
+    current_scope: (Option<String>, String),
+) -> Receiver<ScanResult> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result =
+            run_catchup(&cache_path, &accounts, &current_scope).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+#[cfg(test)]
 fn run(
     cache_path: &Path,
     accounts: &[AccountSpec],
@@ -64,6 +113,69 @@ fn run(
         threads: build_threads(rows),
         groups,
     })
+}
+
+fn run_inbox_only(
+    cache_path: &Path,
+    accounts: &[AccountSpec],
+    current_scope: &(Option<String>, String),
+) -> Result<ScanData> {
+    let mut idx = Index::open(cache_path)?;
+    let mut report = ScanReport::default();
+    for spec in accounts {
+        let found = scan_folder(&spec.name, &spec.root, "INBOX", &mut idx, &mut report)?;
+        idx.prune_folder(&spec.name, "INBOX", &found)?;
+    }
+    let (scope_account, scope_folder) = current_scope;
+    let rows = idx.list_folder(scope_account.as_deref(), scope_folder)?;
+    let groups = build_groups(&idx, accounts)?;
+    Ok(ScanData {
+        threads: build_threads(rows),
+        groups,
+    })
+}
+
+fn run_catchup(
+    cache_path: &Path,
+    accounts: &[AccountSpec],
+    current_scope: &(Option<String>, String),
+) -> Result<ScanData> {
+    let mut idx = Index::open(cache_path)?;
+    let mut report = ScanReport::default();
+    for spec in accounts {
+        if !spec.root.is_dir() {
+            continue;
+        }
+        for (label, folder_root) in spec.layout.discover_folders(&spec.root) {
+            let found = scan_folder(&spec.name, &folder_root, &label, &mut idx, &mut report)?;
+            idx.prune_folder(&spec.name, &label, &found)?;
+        }
+    }
+    let (scope_account, scope_folder) = current_scope;
+    let rows = idx.list_folder(scope_account.as_deref(), scope_folder)?;
+    let groups = build_groups(&idx, accounts)?;
+    Ok(ScanData {
+        threads: build_threads(rows),
+        groups,
+    })
+}
+
+/// Enumerate every `(account, folder)` the catchup worker would visit
+/// — `INBOX` plus everything `layout.discover_folders` returns per
+/// account. Used by `InboxScreen` to populate the "scanned this
+/// session" set without re-walking the filesystem in the apply path.
+pub fn enumerate_folders(accounts: &[AccountSpec]) -> HashSet<(String, String)> {
+    let mut out = HashSet::new();
+    for spec in accounts {
+        out.insert((spec.name.clone(), "INBOX".to_string()));
+        if !spec.root.is_dir() {
+            continue;
+        }
+        for (label, _) in spec.layout.discover_folders(&spec.root) {
+            out.insert((spec.name.clone(), label));
+        }
+    }
+    out
 }
 
 /// One `folder_stats(None)` for the "[all]" group, then one
@@ -86,6 +198,7 @@ fn build_groups(idx: &Index, accounts: &[AccountSpec]) -> Result<Vec<AccountFold
     Ok(groups)
 }
 
+#[cfg(test)]
 pub fn scan_account(
     account: &str,
     root: &Path,

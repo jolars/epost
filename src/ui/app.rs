@@ -257,6 +257,18 @@ pub struct InboxScreen {
     /// `[account]` group per account) and re-fetch from the index.
     pub current_folder: String,
     scan_rx: Option<Receiver<ScanResult>>,
+    /// Receiver for the background catch-up worker that walks every
+    /// non-INBOX folder after the eager INBOX scan returns. Separate
+    /// channel so a long catch-up doesn't block (or get blocked by)
+    /// the watcher's per-folder rescans. `None` once consumed.
+    catchup_rx: Option<Receiver<ScanResult>>,
+    /// `(account, folder)` pairs whose maildir contents have been
+    /// walked at least once this session. Drives the lazy-on-switch
+    /// path: scope-switching to a pair not in this set kicks an
+    /// immediate rescan instead of waiting for the catch-up worker.
+    /// Populated by the eager INBOX scan, the catch-up worker, and
+    /// every rescan-result apply.
+    scanned_folders: HashSet<(String, String)>,
     /// `notify`-backed maildir watcher. `None` when `[watch].enabled =
     /// false`, no accounts are configured, or `notify::Watcher::new`
     /// failed (degraded mode: startup full rescan only, no live updates).
@@ -464,8 +476,17 @@ impl App {
         self.inbox().parsed.as_deref()
     }
 
-    pub fn poll_scan(&mut self) {
-        self.inbox_mut().poll_scan();
+    pub fn poll_scan(&mut self, cfg: &Config) {
+        let Self {
+            screens,
+            cache_path,
+            status_error,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        inbox.poll_scan(cfg, cache_path, status_error);
     }
 
     /// Drain the inotify watcher channel into `pending_dirty`, harvest
@@ -774,7 +795,7 @@ impl InboxScreen {
         let scan_rx = if accounts.is_empty() {
             None
         } else {
-            Some(scan::start_worker(
+            Some(scan::start_inbox_worker(
                 accounts.clone(),
                 cache_path.to_path_buf(),
                 (None, "INBOX".to_string()),
@@ -840,6 +861,8 @@ impl InboxScreen {
             current_account: None,
             current_folder: "INBOX".to_string(),
             scan_rx,
+            catchup_rx: None,
+            scanned_folders: HashSet::new(),
             watcher,
             watch_rx,
             pending_dirty: HashSet::new(),
@@ -1388,8 +1411,17 @@ impl InboxScreen {
             }
         };
         self.scan = ScanState::Ready(build_threads(rows));
-        self.current_account = account;
+        self.current_account = account.clone();
         self.current_folder = folder.to_string();
+        // If this folder hasn't been walked yet this session (eager
+        // INBOX-only startup → catch-up may still be in flight, or the
+        // user navigated faster than the background pass), enqueue it
+        // for the rescan worker. `poll_watch` will pick it up next
+        // tick. Index rows shown right now come from whatever was
+        // cached on disk; the rescan replaces them once it lands. For
+        // the unified `[all]` scope, queue every account's copy of the
+        // folder since the view aggregates across accounts.
+        self.queue_lazy_scan(account.as_deref(), folder);
         self.selected = 0;
         self.reader_scroll = 0;
         self.reader_cursor_line = 0;
@@ -1406,27 +1438,145 @@ impl InboxScreen {
         self.body_changed_this_tick = true;
     }
 
-    pub fn poll_scan(&mut self) {
-        let Some(rx) = self.scan_rx.as_ref() else {
-            return;
+    /// Enqueue a rescan for `(account, folder)` if it hasn't been
+    /// walked yet this session. For the unified `[all]` scope queue
+    /// every known account's copy of the folder, since the view
+    /// aggregates across accounts and any one of them being stale
+    /// poisons the result. Known accounts come from `folder_stats` —
+    /// after the eager INBOX scan that always contains every
+    /// configured account, even those with empty folders.
+    fn queue_lazy_scan(&mut self, account: Option<&str>, folder: &str) {
+        let candidates: Vec<String> = match account {
+            Some(a) => vec![a.to_string()],
+            None => self
+                .folder_stats
+                .iter()
+                .filter_map(|g| g.scope.clone())
+                .collect(),
         };
-        match rx.try_recv() {
-            Ok(Ok(data)) => {
-                self.scan = ScanState::Ready(data.threads);
-                self.folder_stats = data.groups;
-                self.selected = 0;
-                self.scan_rx = None;
-            }
-            Ok(Err(msg)) => {
-                self.scan = ScanState::Failed(msg);
-                self.scan_rx = None;
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.scan = ScanState::Failed("scan worker died before reporting".into());
-                self.scan_rx = None;
+        for acc in candidates {
+            let key = (acc, folder.to_string());
+            if !self.scanned_folders.contains(&key) {
+                self.pending_dirty.insert(key);
             }
         }
+    }
+
+    pub fn poll_scan(
+        &mut self,
+        cfg: &Config,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) {
+        // 1. Drain the eager INBOX scan. On success, mark every
+        //    configured account's INBOX as scanned-this-session and
+        //    hand off to the background catch-up worker for the rest.
+        if let Some(rx) = self.scan_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    self.scan = ScanState::Ready(data.threads);
+                    self.folder_stats = data.groups;
+                    self.selected = 0;
+                    self.scan_rx = None;
+                    for name in cfg.accounts.keys() {
+                        self.scanned_folders
+                            .insert((name.clone(), "INBOX".to_string()));
+                    }
+                    if self.catchup_rx.is_none() && !cfg.accounts.is_empty() {
+                        self.catchup_rx = Some(scan::start_catchup_worker(
+                            account_specs(cfg),
+                            cache_path.to_path_buf(),
+                            (self.current_account.clone(), self.current_folder.clone()),
+                        ));
+                    }
+                }
+                Ok(Err(msg)) => {
+                    self.scan = ScanState::Failed(msg);
+                    self.scan_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.scan = ScanState::Failed("scan worker died before reporting".into());
+                    self.scan_rx = None;
+                }
+            }
+        }
+
+        // 2. Drain the background catch-up. Folder stats are always
+        //    replaced; the threaded list is re-queried from the index
+        //    iff the current scope's folder was covered (the worker's
+        //    `data.threads` is for the scope it captured at spawn, which
+        //    can be stale if the user navigated since).
+        if let Some(rx) = self.catchup_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    let covered = scan::enumerate_folders(&account_specs(cfg));
+                    self.apply_catchup(data, &covered, cache_path, status_error);
+                    self.catchup_rx = None;
+                }
+                Ok(Err(msg)) => {
+                    *status_error = Some(format!("catchup: {msg}"));
+                    self.catchup_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.catchup_rx = None;
+                }
+            }
+        }
+    }
+
+    /// Install the catch-up worker's payload. `folder_stats` is always
+    /// replaced (counts and folder list both shift). The threaded list
+    /// for the current scope is re-read from the index when the catch-up
+    /// covered the folder — `data.threads` is for the scope captured at
+    /// worker spawn time, which may be stale if the user navigated
+    /// during the walk. `covered` is the full set the catch-up touched
+    /// (so the "[all]" view-touched check is honest about which
+    /// accounts' folders ran).
+    fn apply_catchup(
+        &mut self,
+        data: scan::ScanData,
+        covered: &HashSet<(String, String)>,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) {
+        self.folder_stats = data.groups;
+        self.scanned_folders.extend(covered.iter().cloned());
+        let view_touched = covered.iter().any(|(account, folder)| {
+            folder == &self.current_folder
+                && match &self.current_account {
+                    None => true,
+                    Some(scope) => scope == account,
+                }
+        });
+        if !view_touched {
+            return;
+        }
+        let idx = match Index::open(cache_path) {
+            Ok(i) => i,
+            Err(e) => {
+                *status_error = Some(format!("catchup apply: open index: {e:#}"));
+                return;
+            }
+        };
+        let rows = match idx.list_folder(self.current_account.as_deref(), &self.current_folder) {
+            Ok(r) => r,
+            Err(e) => {
+                *status_error = Some(format!("catchup apply: list: {e:#}"));
+                return;
+            }
+        };
+        let old_msgid = self.selected_msgid();
+        self.scan = ScanState::Ready(build_threads(rows));
+        self.selected = match old_msgid {
+            Some(mid) => self
+                .threaded()
+                .iter()
+                .position(|r| r.row.msgid == mid)
+                .unwrap_or(0),
+            None => 0,
+        };
     }
 
     pub fn poll_watch(
@@ -1508,6 +1658,7 @@ impl InboxScreen {
     /// previously-selected message is no longer present.
     fn apply_rescan(&mut self, data: scan::ScanData, dirty: &HashSet<(String, String)>) {
         self.folder_stats = data.groups;
+        self.scanned_folders.extend(dirty.iter().cloned());
         let view_touched = dirty.iter().any(|(account, folder)| {
             folder == &self.current_folder
                 && match &self.current_account {
@@ -1727,6 +1878,22 @@ impl InboxScreen {
             .as_ref()
             .and_then(|s| s.haystack.iter().find(|r| r.msgid == msgid))
     }
+}
+
+/// Project the in-config accounts into the `AccountSpec` shape the
+/// scan / catch-up workers and `enumerate_folders` consume. Kept as a
+/// single helper so the projection (name + maildir + layout) stays
+/// consistent across the eager scan, the catch-up, and the watcher's
+/// per-folder rescan paths.
+fn account_specs(cfg: &Config) -> Vec<AccountSpec> {
+    cfg.accounts
+        .iter()
+        .map(|(name, a)| AccountSpec {
+            name: name.clone(),
+            root: a.maildir.clone(),
+            layout: a.layout,
+        })
+        .collect()
 }
 
 fn mirror_to_index(cache_path: &Path, row: &MessageRow) -> anyhow::Result<()> {
@@ -2204,15 +2371,19 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         cfg
     }
 
-    /// Spin until the scan worker either reports rows or fails. The
-    /// worker runs on `std::thread`; tests can't share the live event
-    /// loop, so this is the equivalent of one tick of the UI's
-    /// `poll_scan` until the channel resolves.
-    fn drain_scan(app: &mut App) {
+    /// Spin until the scan worker either reports rows or fails AND the
+    /// background catch-up worker (kicked once the eager INBOX scan
+    /// lands) has finished. Production startup deliberately returns to
+    /// the user on the eager INBOX result alone, but tests want every
+    /// folder scanned before they assert — so this helper waits past
+    /// both stages.
+    fn drain_scan(app: &mut App, cfg: &Config) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            app.poll_scan();
-            if matches!(app.inbox().scan, ScanState::Ready(_) | ScanState::Failed(_)) {
+            app.poll_scan(cfg);
+            let inbox_done = matches!(app.inbox().scan, ScanState::Ready(_) | ScanState::Failed(_));
+            let catchup_done = app.inbox().catchup_rx.is_none();
+            if inbox_done && catchup_done {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2228,7 +2399,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
         assert!(matches!(app.inbox().scan, ScanState::Ready(_)));
 
         app.ensure_body_for_selection();
@@ -2263,7 +2434,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         app.ensure_body_for_selection();
         // Second call on the same selection: nothing to parse, nothing to
@@ -2286,7 +2457,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         let start = app.inbox().threaded().first().expect("row").row.clone();
         assert!(start.flags.contains('S'), "fixture must start Seen");
@@ -2318,7 +2489,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         app.toggle_flag_selected('F');
 
@@ -2348,7 +2519,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         app.toggle_flag_selected('T');
         let after = app.inbox().threaded().first().expect("row").row.clone();
@@ -2375,7 +2546,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         let watcher_view = app.self_writes.clone();
         app.ensure_body_for_selection();
@@ -2428,7 +2599,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache.clone(), None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
         let msgid = app.inbox().selected_msgid().expect("a selected row");
 
         cmdline::dispatch("archive", &mut app, &cfg);
@@ -2461,7 +2632,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         cmdline::dispatch("trash", &mut app, &cfg);
 
@@ -2492,7 +2663,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         );
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         cmdline::dispatch("archive", &mut app, &cfg);
 
@@ -2509,7 +2680,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         cmdline::dispatch("archive", &mut app, &cfg);
 
@@ -2537,7 +2708,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         cmdline::dispatch("mv Receipts", &mut app, &cfg);
 
@@ -2560,7 +2731,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         cmdline::dispatch("mv", &mut app, &cfg);
 
@@ -2577,7 +2748,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         let watcher_view = app.self_writes.clone();
         cmdline::dispatch("archive", &mut app, &cfg);
@@ -2626,7 +2797,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         assert_eq!(app.inbox().current_folder, "INBOX");
         // Flatten across groups: the `[all]` group should contain both
@@ -2674,7 +2845,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         // Initial: [all] INBOX selected (None scope).
         assert_eq!(app.inbox().current_account, None);
@@ -2701,7 +2872,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         // [all] sees 2 INBOX rows (one per account).
         assert_eq!(app.inbox().threaded().len(), 2);
@@ -2731,7 +2902,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         // Pick whichever row is on top (date order), mark it read.
         app.ensure_body_for_selection();
@@ -2782,7 +2953,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         cmdline::dispatch("account work", &mut app, &cfg);
         assert_eq!(app.inbox().current_account.as_deref(), Some("work"));
@@ -2829,7 +3000,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
 
         let cfg = one_account_config(&tmp);
         let mut app = App::new(&cfg, cache.clone(), None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         // The list orders by date DESC, so <b> is row 0, <a> is row 1.
         // Select <a> (row 1) so the test exercises msgid-follow.
@@ -2880,7 +3051,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
 
         let cfg = one_account_config(&tmp);
         let mut app = App::new(&cfg, cache.clone(), None, None);
-        drain_scan(&mut app);
+        drain_scan(&mut app, &cfg);
 
         // Select <a> (row 1, older), then delete <a> externally and
         // expect selected to snap to 0 after the rescan.
@@ -2902,5 +3073,159 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         assert_eq!(app.inbox().threaded().len(), 1);
         assert_eq!(app.inbox().selected, 0);
         assert_eq!(app.inbox().selected_msgid().as_deref(), Some("b@x"));
+    }
+
+    /// Spin only the eager INBOX scan (waits for `scan_rx`); deliberately
+    /// does NOT wait for the catch-up worker the way `drain_scan` does.
+    /// Used by the two tests below that want to observe the
+    /// INBOX-only-eager intermediate state.
+    fn drain_inbox_only(app: &mut App, cfg: &Config) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.poll_scan(cfg);
+            if app.inbox().scan_rx.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("eager INBOX scan never reported");
+    }
+
+    /// Two-folder fixture (INBOX + Sent), one message in each. Returns
+    /// `(cfg, cache_path)`. Used by the lazy-scan tests below so the
+    /// fixture isn't open-coded twice.
+    fn one_account_two_folders(tmp: &TempDir) -> (Config, PathBuf) {
+        let mut cfg = Config::default();
+        cfg.accounts.insert(
+            "personal".into(),
+            Account {
+                maildir: tmp.path().join("Mail").join("personal"),
+                from: "Tester <tester@example.invalid>".into(),
+                layout: crate::mail::layout::Layout::Maildirpp,
+                sent_folder: None,
+                archive_folder: None,
+                spam_folder: None,
+                trash_folder: None,
+                smtp: None,
+            },
+        );
+        let root = tmp.path().join("Mail").join("personal");
+        fs::create_dir_all(root.join("cur")).unwrap();
+        fs::create_dir_all(root.join("new")).unwrap();
+        fs::create_dir_all(root.join(".Sent").join("cur")).unwrap();
+        fs::create_dir_all(root.join(".Sent").join("new")).unwrap();
+        fs::write(
+            root.join("cur").join("inbox-1:2,"),
+            b"Message-ID: <inbox-1@x>\r\nDate: Thu, 1 Jan 1970 00:00:00 +0000\r\nFrom: a@b\r\nSubject: hi\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".Sent").join("cur").join("sent-1:2,S"),
+            b"Message-ID: <sent-1@x>\r\nDate: Fri, 2 Jan 1970 00:00:00 +0000\r\nFrom: a@b\r\nSubject: sent\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        (cfg, tmp.path().join("index.sqlite"))
+    }
+
+    #[test]
+    fn eager_pass_indexes_inbox_but_not_sent() {
+        // The startup worker is INBOX-only; Sent must wait for the
+        // catch-up. Confirmed by inspecting the index between the eager
+        // result landing and the catch-up completing.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, cache) = one_account_two_folders(&tmp);
+
+        let mut app = App::new(&cfg, cache.clone(), None, None);
+        drain_inbox_only(&mut app, &cfg);
+
+        let idx = crate::store::index::Index::open(&cache).unwrap();
+        assert!(idx.get("inbox-1@x").unwrap().is_some(), "INBOX must land");
+        assert!(
+            idx.get("sent-1@x").unwrap().is_none(),
+            "Sent must NOT be in the index after the eager pass alone"
+        );
+        // Track-set reflects the same: INBOX scanned, Sent not yet.
+        assert!(
+            app.inbox()
+                .scanned_folders
+                .contains(&("personal".into(), "INBOX".into()))
+        );
+        assert!(
+            !app.inbox()
+                .scanned_folders
+                .contains(&("personal".into(), "Sent".into()))
+        );
+    }
+
+    #[test]
+    fn catchup_pass_indexes_sent_after_eager_inbox() {
+        // `drain_scan` waits past the eager pass and the catch-up.
+        // After it returns, Sent must be in the index and in the
+        // scanned-this-session set.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, cache) = one_account_two_folders(&tmp);
+
+        let mut app = App::new(&cfg, cache.clone(), None, None);
+        drain_scan(&mut app, &cfg);
+
+        let idx = crate::store::index::Index::open(&cache).unwrap();
+        assert!(idx.get("sent-1@x").unwrap().is_some(), "Sent indexed");
+        assert!(
+            app.inbox()
+                .scanned_folders
+                .contains(&("personal".into(), "Sent".into()))
+        );
+    }
+
+    #[test]
+    fn scope_switch_to_unscanned_folder_enqueues_rescan() {
+        // Cold start: only eager INBOX has run. Switching to Sent must
+        // mark it dirty so `poll_watch` picks it up on the next tick.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, cache) = one_account_two_folders(&tmp);
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_inbox_only(&mut app, &cfg);
+
+        // Pre-switch: Sent is not in scanned_folders, not in pending_dirty.
+        assert!(
+            !app.inbox()
+                .scanned_folders
+                .contains(&("personal".into(), "Sent".into()))
+        );
+        let pre = app.inbox().pending_dirty.clone();
+        assert!(!pre.contains(&("personal".into(), "Sent".into())));
+
+        app.switch_to_scope(Some("personal".into()), "Sent");
+
+        // Post-switch: Sent is enqueued for the rescan worker.
+        assert!(
+            app.inbox()
+                .pending_dirty
+                .contains(&("personal".into(), "Sent".into())),
+            "Sent must be enqueued for a lazy rescan, got {:?}",
+            app.inbox().pending_dirty
+        );
+    }
+
+    #[test]
+    fn scope_switch_to_already_scanned_folder_does_not_enqueue() {
+        // After `drain_scan` (eager + catch-up), both INBOX and Sent
+        // are in scanned_folders. Re-entering Sent must not enqueue a
+        // redundant rescan.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, cache) = one_account_two_folders(&tmp);
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        app.inbox_mut().pending_dirty.clear();
+        app.switch_to_scope(Some("personal".into()), "Sent");
+        assert!(
+            !app.inbox()
+                .pending_dirty
+                .contains(&("personal".into(), "Sent".into())),
+            "scanned-folders hit must skip the rescan enqueue"
+        );
     }
 }
