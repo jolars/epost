@@ -312,7 +312,7 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                     Vec::with_capacity(header_lines.len() + body.lines.len() + 4);
                 combined.extend(header_lines.iter().cloned());
                 combined.extend(body.lines.iter().cloned());
-                if !combined.iter().any(|l| !l.spans.is_empty())
+                if body.lines.is_empty()
                     && let Some(plain) = parsed.plain_fallback.as_deref()
                 {
                     combined.push(dim_line("(no HTML body, showing text/plain)"));
