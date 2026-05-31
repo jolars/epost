@@ -32,32 +32,6 @@ pub struct ScanData {
 
 pub type ScanResult = std::result::Result<ScanData, String>;
 
-/// Full-scan worker — walks INBOX *and* every discovered sub-folder
-/// for every account, single channel. Test-only utility: production
-/// startup splits this into `start_inbox_worker` (eager) +
-/// `start_catchup_worker` (background) so the user sees INBOX rows
-/// without waiting for the rest of the mailbox. The two-stage path
-/// makes a `drain_scan` helper awkward; keeping this one-shot variant
-/// lets the scan.rs tests assert on combined post-state.
-///
-/// `current_scope` is the `(account, folder)` pair driving the list
-/// pane — `account = None` means the unified view. The grouped stats
-/// returned by the worker always cover every configured account plus
-/// the "[all]" group regardless of scope.
-#[cfg(test)]
-pub fn start_worker(
-    accounts: Vec<AccountSpec>,
-    cache_path: PathBuf,
-    current_scope: (Option<String>, String),
-) -> Receiver<ScanResult> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = run(&cache_path, &accounts, &current_scope).map_err(|e| format!("{e:#}"));
-        let _ = tx.send(result);
-    });
-    rx
-}
-
 /// Eager startup worker: scans only INBOX for each configured account.
 /// The catch-up pass for every other discovered folder is spawned by
 /// `start_catchup_worker` once this result lands, so the user sees
@@ -96,25 +70,6 @@ pub fn start_catchup_worker(
     rx
 }
 
-#[cfg(test)]
-fn run(
-    cache_path: &Path,
-    accounts: &[AccountSpec],
-    current_scope: &(Option<String>, String),
-) -> Result<ScanData> {
-    let mut idx = Index::open(cache_path)?;
-    for spec in accounts {
-        scan_account(&spec.name, &spec.root, spec.layout, &mut idx)?;
-    }
-    let (scope_account, scope_folder) = current_scope;
-    let rows = idx.list_folder(scope_account.as_deref(), scope_folder)?;
-    let groups = build_groups(&idx, accounts)?;
-    Ok(ScanData {
-        threads: build_threads(rows),
-        groups,
-    })
-}
-
 fn run_inbox_only(
     cache_path: &Path,
     accounts: &[AccountSpec],
@@ -123,8 +78,12 @@ fn run_inbox_only(
     let mut idx = Index::open(cache_path)?;
     let mut report = ScanReport::default();
     for spec in accounts {
-        let found = scan_folder(&spec.name, &spec.inbox_root, "INBOX", &mut idx, &mut report)?;
-        idx.prune_folder(&spec.name, "INBOX", &found)?;
+        // The INBOX binding is always `folders[0]`. Scan its `path`
+        // (the resolved inbox root) and pin the index label to the
+        // canonical `"INBOX"`.
+        let inbox = &spec.folders[0];
+        let found = scan_folder(&spec.name, &inbox.path, &inbox.label, &mut idx, &mut report)?;
+        idx.prune_folder(&spec.name, &inbox.label, &found)?;
     }
     let (scope_account, scope_folder) = current_scope;
     let rows = idx.list_folder(scope_account.as_deref(), scope_folder)?;
@@ -146,9 +105,18 @@ fn run_catchup(
         if !spec.root.is_dir() {
             continue;
         }
-        for (label, folder_root) in spec.discover_non_inbox_folders() {
-            let found = scan_folder(&spec.name, &folder_root, &label, &mut idx, &mut report)?;
-            idx.prune_folder(&spec.name, &label, &found)?;
+        // Skip INBOX (eager-scanned); walk every other configured
+        // binding using the user's label (role display name or
+        // extra-folder literal) as the index folder name.
+        for binding in spec.folders.iter().skip(1) {
+            let found = scan_folder(
+                &spec.name,
+                &binding.path,
+                &binding.label,
+                &mut idx,
+                &mut report,
+            )?;
+            idx.prune_folder(&spec.name, &binding.label, &found)?;
         }
     }
     let (scope_account, scope_folder) = current_scope;
@@ -160,19 +128,14 @@ fn run_catchup(
     })
 }
 
-/// Enumerate every `(account, folder)` the catchup worker would visit
-/// — `INBOX` plus the non-INBOX folders the layout discovers per
-/// account. Used by `InboxScreen` to populate the "scanned this
-/// session" set without re-walking the filesystem in the apply path.
+/// Enumerate every `(account, folder)` the eager + catch-up workers
+/// will visit. Used by `InboxScreen` to populate the "scanned this
+/// session" set without re-iterating the binding list at apply time.
 pub fn enumerate_folders(accounts: &[AccountSpec]) -> HashSet<(String, String)> {
     let mut out = HashSet::new();
     for spec in accounts {
-        out.insert((spec.name.clone(), "INBOX".to_string()));
-        if !spec.root.is_dir() {
-            continue;
-        }
-        for (label, _) in spec.discover_non_inbox_folders() {
-            out.insert((spec.name.clone(), label));
+        for binding in &spec.folders {
+            out.insert((spec.name.clone(), binding.label.clone()));
         }
     }
     out
@@ -196,27 +159,6 @@ fn build_groups(idx: &Index, accounts: &[AccountSpec]) -> Result<Vec<AccountFold
         });
     }
     Ok(groups)
-}
-
-#[cfg(test)]
-pub fn scan_account(
-    account: &str,
-    root: &Path,
-    layout: Layout,
-    index: &mut Index,
-) -> Result<ScanReport> {
-    let mut report = ScanReport::default();
-    let found = scan_folder(account, root, "INBOX", index, &mut report)?;
-    index.prune_folder(account, "INBOX", &found)?;
-
-    if !root.is_dir() {
-        return Ok(report);
-    }
-    for (label, folder_root) in layout.discover_folders(root) {
-        let found = scan_folder(account, &folder_root, &label, index, &mut report)?;
-        index.prune_folder(account, &label, &found)?;
-    }
-    Ok(report)
 }
 
 /// Re-walk only the dirty (account, folder) pairs, prune the index for
@@ -251,14 +193,19 @@ fn rescan_run(
         let Some(spec) = accounts.get(account) else {
             continue;
         };
-        let folder_root = spec.folder_path(folder);
-        if !folder_root.is_dir() {
+        let Some(binding) = spec.binding_by_label(folder) else {
+            // Folder isn't configured on this account — nothing on
+            // disk for us to walk and nothing in the index keyed by
+            // it (we never wrote any). Skip rather than error.
+            continue;
+        };
+        if !binding.path.is_dir() {
             // The folder vanished entirely — drop every row we have for
             // it (empty keep-set) and move on.
             idx.prune_folder(account, folder, &HashSet::new())?;
             continue;
         }
-        let found = scan_folder(account, &folder_root, folder, &mut idx, &mut report)?;
+        let found = scan_folder(account, &binding.path, folder, &mut idx, &mut report)?;
         idx.prune_folder(account, folder, &found)?;
     }
     let (scope_account, scope_folder) = current_scope;
@@ -334,6 +281,40 @@ pub fn extract_flags(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Account;
+
+    /// Build a minimal `Account` for tests with optional role bindings.
+    /// `roles` is `(role_field, disk_name)`; supported keys mirror the
+    /// `Account` fields: `"archive"`, `"sent"`, `"spam"`, `"trash"`,
+    /// `"drafts"`, `"inbox"`.
+    fn test_account(maildir: PathBuf, layout: Layout, roles: &[(&str, &str)]) -> Account {
+        let mut acc = Account {
+            maildir,
+            from: "x".into(),
+            layout,
+            inbox: None,
+            archive: None,
+            sent: None,
+            spam: None,
+            trash: None,
+            drafts: None,
+            extra_folders: Vec::new(),
+            smtp: None,
+        };
+        for (field, name) in roles {
+            let v = Some(name.to_string());
+            match *field {
+                "inbox" => acc.inbox = v,
+                "archive" => acc.archive = v,
+                "sent" => acc.sent = v,
+                "spam" => acc.spam = v,
+                "trash" => acc.trash = v,
+                "drafts" => acc.drafts = v,
+                other => panic!("unknown role field {other}"),
+            }
+        }
+        acc
+    }
 
     #[test]
     fn extract_flags_reads_suffix() {
@@ -385,14 +366,14 @@ mod tests {
         let mut accounts: HashMap<String, AccountSpec> = HashMap::new();
         accounts.insert(
             "dev".to_string(),
-            AccountSpec {
-                name: "dev".to_string(),
-                root: root.clone(),
-                layout: Layout::Maildirpp,
-                inbox_root: root.clone(),
-            },
+            AccountSpec::from_account(
+                "dev",
+                &test_account(root.clone(), Layout::Maildirpp, &[("archive", "Archive")]),
+            ),
         );
-        let rx = start_worker(
+        // Seed eager INBOX + the catch-up so both INBOX and Archive
+        // are in the index before the rescan-only-dirty check.
+        let rx = start_inbox_worker(
             accounts.values().cloned().collect(),
             cache.clone(),
             (None, "INBOX".to_string()),
@@ -400,6 +381,12 @@ mod tests {
         let initial = rx.recv().unwrap().unwrap();
         let inbox_count_initial = group_total(&initial.groups, None, "INBOX");
         assert_eq!(inbox_count_initial, 2);
+        let rx = start_catchup_worker(
+            accounts.values().cloned().collect(),
+            cache.clone(),
+            (None, "INBOX".to_string()),
+        );
+        rx.recv().unwrap().unwrap();
 
         // Delete one INBOX file, add another to Archive — but mark only
         // INBOX dirty. Archive should NOT be re-walked.
@@ -471,24 +458,20 @@ mod tests {
         let mut accounts: HashMap<String, AccountSpec> = HashMap::new();
         accounts.insert(
             "personal".into(),
-            AccountSpec {
-                name: "personal".into(),
-                root: root_a.clone(),
-                layout: Layout::Maildirpp,
-                inbox_root: root_a.clone(),
-            },
+            AccountSpec::from_account(
+                "personal",
+                &test_account(root_a.clone(), Layout::Maildirpp, &[]),
+            ),
         );
         accounts.insert(
             "work".into(),
-            AccountSpec {
-                name: "work".into(),
-                root: root_b.clone(),
-                layout: Layout::Maildirpp,
-                inbox_root: root_b.clone(),
-            },
+            AccountSpec::from_account(
+                "work",
+                &test_account(root_b.clone(), Layout::Maildirpp, &[]),
+            ),
         );
 
-        let rx = start_worker(
+        let rx = start_inbox_worker(
             accounts.values().cloned().collect(),
             cache.clone(),
             (None, "INBOX".to_string()),
@@ -515,13 +498,27 @@ mod tests {
 
     #[test]
     fn scans_dev_fixture_maildir() {
-        let mut idx = Index::open_in_memory().unwrap();
         let root = Path::new("dev/maildir");
         if !root.exists() {
             return;
         }
-        let report = scan_account("dev", root, Layout::Maildirpp, &mut idx).unwrap();
-        assert!(report.scanned >= 6, "scanned: {}", report.scanned);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = tmp.path().join("idx.sqlite");
+        let accounts = vec![AccountSpec::from_account(
+            "dev",
+            &test_account(
+                root.to_path_buf(),
+                Layout::Maildirpp,
+                &[("sent", "Sent"), ("archive", "Archive")],
+            ),
+        )];
+        // Eager INBOX → catch-up: same path production takes.
+        let rx = start_inbox_worker(accounts.clone(), cache.clone(), (None, "INBOX".into()));
+        rx.recv().unwrap().unwrap();
+        let rx = start_catchup_worker(accounts, cache.clone(), (None, "INBOX".into()));
+        rx.recv().unwrap().unwrap();
+
+        let idx = Index::open(&cache).unwrap();
         let inbox = idx.list_folder(None, "INBOX").unwrap();
         assert!(!inbox.is_empty(), "inbox empty");
         let sent = idx.list_folder(None, "Sent").unwrap();

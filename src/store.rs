@@ -4,80 +4,94 @@ pub mod sync;
 pub mod thread;
 pub mod watch;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::config::{Account, resolve_inbox_root};
+use crate::config::{Account, FolderRole, resolve_inbox_root};
 use crate::mail::layout::Layout;
 
+/// One scannable folder on an account: the label used in the index
+/// `folder` column / sidebar display, plus the on-disk root that
+/// holds `cur/new/tmp`. `role` is `Some` for canonical roles (so
+/// `:archive` etc. can locate the right binding); `None` for
+/// `extra_folders` entries (where the label is the literal disk
+/// name).
+#[derive(Debug, Clone)]
+pub struct FolderBinding {
+    pub label: String,
+    pub path: PathBuf,
+    pub role: Option<FolderRole>,
+}
+
 /// Per-account fan-out parameters for the scan worker and the inotify
-/// watcher. Bundles the pieces both consumers need (name, maildir root,
-/// on-disk folder layout, resolved INBOX path) so signatures don't grow
-/// to quadruples.
+/// watcher. Bundles the static-per-launch context they need (name,
+/// maildir root, layout) plus the resolved binding list that drives
+/// which folders get scanned, watched, and displayed — built once
+/// from `Account` at startup so workers don't re-resolve on every
+/// walk.
 #[derive(Debug, Clone)]
 pub struct AccountSpec {
     pub name: String,
     pub root: PathBuf,
     pub layout: Layout,
-    /// Resolved on-disk root for INBOX `cur/new/tmp`. Equal to `root`
-    /// under the traditional convention (INBOX at the maildir root);
-    /// otherwise a same-account subdir (e.g. `<root>/Inbox` for
-    /// mbsync's default-pattern setup). Computed once at spec
-    /// construction so workers don't re-stat on every walk.
-    pub inbox_root: PathBuf,
+    /// Resolved binding list. INBOX is always first (built from the
+    /// auto-detected or configured inbox root); the remaining
+    /// entries are the canonical roles that the account actually
+    /// binds (`archive`, `sent`, `spam`, `trash`, `drafts`) in
+    /// canonical order, followed by `extra_folders` in their config
+    /// order. Workers walk this list verbatim — no filesystem
+    /// discovery, no folder shows up unless the user opted in.
+    pub folders: Vec<FolderBinding>,
 }
 
 impl AccountSpec {
-    /// Build a spec from a config-side `Account`, resolving the
-    /// INBOX path via the user's optional `inbox_folder` override and
-    /// the on-disk fallback chain.
     pub fn from_account(name: &str, account: &Account) -> Self {
         let root = account.maildir.clone();
-        let inbox_root = resolve_inbox_root(&root, account.inbox_folder.as_deref());
+        let layout = account.layout;
+        let inbox_path = resolve_inbox_root(&root, account.inbox.as_deref());
+        let mut folders = Vec::new();
+        folders.push(FolderBinding {
+            label: FolderRole::Inbox.label().to_string(),
+            path: inbox_path,
+            role: Some(FolderRole::Inbox),
+        });
+        for role in FolderRole::ALL.iter().copied() {
+            if role == FolderRole::Inbox {
+                continue;
+            }
+            if let Some(disk_name) = account.role_disk_name(role) {
+                folders.push(FolderBinding {
+                    label: role.label().to_string(),
+                    path: layout.folder_path(&root, disk_name),
+                    role: Some(role),
+                });
+            }
+        }
+        for extra in &account.extra_folders {
+            folders.push(FolderBinding {
+                label: extra.clone(),
+                path: layout.folder_path(&root, extra),
+                role: None,
+            });
+        }
         Self {
             name: name.to_string(),
             root,
-            layout: account.layout,
-            inbox_root,
+            layout,
+            folders,
         }
     }
 
-    /// Resolve a folder label to its on-disk root. `"INBOX"` routes
-    /// through the resolved `inbox_root`; every other label goes
-    /// through the layout's regular mapping.
-    pub fn folder_path(&self, label: &str) -> PathBuf {
-        if label == "INBOX" {
-            self.inbox_root.clone()
-        } else {
-            self.layout.folder_path(&self.root, label)
-        }
+    /// Look up the binding rendered under `label` — either a role
+    /// label (`"Archive"`) or an extra-folder literal. `None` means
+    /// the account isn't configured to expose that folder.
+    pub fn binding_by_label(&self, label: &str) -> Option<&FolderBinding> {
+        self.folders.iter().find(|b| b.label == label)
     }
 
-    /// Discover every non-INBOX folder under the account root,
-    /// filtering out whatever subdir was resolved as INBOX so it
-    /// isn't double-listed as both `"INBOX"` and (e.g.) `"Inbox"`.
-    pub fn discover_non_inbox_folders(&self) -> Vec<(String, PathBuf)> {
-        let inbox = self.inbox_root.as_path();
-        self.layout
-            .discover_folders(&self.root)
-            .into_iter()
-            .filter(|(_, p)| p.as_path() != inbox)
-            .collect()
-    }
-
-    /// Project a config `(name, Account)` pair into a fresh spec.
-    /// Convenience for the `cfg.accounts.iter().map(...)` pattern at
-    /// the worker / watcher boundaries.
-    pub fn from_pair(pair: (&String, &Account)) -> Self {
-        Self::from_account(pair.0, pair.1)
-    }
-
-    /// `<root>/cur` exists? Used by the watcher to decide whether
-    /// there's anything to watch directly at the account root (vs.
-    /// only via subfolders). Kept here so the path-vs-Path Layout
-    /// stuff stays bundled.
-    #[allow(dead_code)]
-    pub fn root_is_maildir(root: &Path) -> bool {
-        root.join("cur").is_dir()
+    /// Look up the binding for a canonical role. Drives `:archive` /
+    /// `:trash` / sent-copy resolution.
+    pub fn binding_by_role(&self, role: FolderRole) -> Option<&FolderBinding> {
+        self.folders.iter().find(|b| b.role == Some(role))
     }
 }
 
@@ -93,74 +107,116 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discover_excludes_resolved_inbox_subdir() {
-        // mbsync default-pattern verbatim setup: no maildir at root,
-        // INBOX lives at `<root>/Inbox`, plus `Sent`/`Archive` at the
-        // same level. Discovery must not list `Inbox` as a separate
-        // folder — that's what `INBOX` already covers.
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        mk_maildir(&root, "Inbox");
-        mk_maildir(&root, "Sent");
-        mk_maildir(&root, "Archive");
-
-        let acc = Account {
-            maildir: root.clone(),
+    fn account(maildir: PathBuf, layout: Layout) -> Account {
+        Account {
+            maildir,
             from: "x".into(),
-            layout: Layout::Verbatim,
-            inbox_folder: None,
-            sent_folder: None,
-            archive_folder: None,
-            spam_folder: None,
-            trash_folder: None,
+            layout,
+            inbox: None,
+            archive: None,
+            sent: None,
+            spam: None,
+            trash: None,
+            drafts: None,
+            extra_folders: Vec::new(),
             smtp: None,
-        };
-        let spec = AccountSpec::from_account("a", &acc);
-
-        // INBOX resolved to the subdir.
-        assert_eq!(spec.inbox_root, root.join("Inbox"));
-
-        let labels: Vec<String> = spec
-            .discover_non_inbox_folders()
-            .into_iter()
-            .map(|(l, _)| l)
-            .collect();
-        // Sorted by Layout::discover_folders; Inbox is filtered out.
-        assert_eq!(labels, vec!["Archive".to_string(), "Sent".to_string()]);
+        }
     }
 
     #[test]
-    fn discover_keeps_inbox_subdir_when_root_is_the_inbox() {
-        // Traditional layout: maildir at root IS the INBOX. A subdir
-        // literally named `Inbox` here would be a regular folder
-        // (unlikely but valid), and discovery should NOT filter it.
+    fn bindings_emit_inbox_only_when_no_roles_configured() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        mk_maildir(&root, ""); // root is a maildir
-        mk_maildir(&root, "Inbox"); // also a regular subfolder
+        mk_maildir(&root, "");
 
-        let acc = Account {
-            maildir: root.clone(),
-            from: "x".into(),
-            layout: Layout::Verbatim,
-            inbox_folder: None,
-            sent_folder: None,
-            archive_folder: None,
-            spam_folder: None,
-            trash_folder: None,
-            smtp: None,
-        };
+        let acc = account(root.clone(), Layout::Verbatim);
         let spec = AccountSpec::from_account("a", &acc);
 
-        // inbox_root resolved to root (root has cur/), not the Inbox subdir.
-        assert_eq!(spec.inbox_root, root);
-        let labels: Vec<String> = spec
-            .discover_non_inbox_folders()
-            .into_iter()
-            .map(|(l, _)| l)
+        let labels: Vec<&str> = spec.folders.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, vec!["INBOX"]);
+        assert_eq!(spec.folders[0].path, root);
+        assert_eq!(spec.folders[0].role, Some(FolderRole::Inbox));
+    }
+
+    #[test]
+    fn bindings_emit_roles_in_canonical_order() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        mk_maildir(&root, "");
+        mk_maildir(&root, "Sent");
+        mk_maildir(&root, "Archive");
+        mk_maildir(&root, "Trash");
+
+        let mut acc = account(root.clone(), Layout::Verbatim);
+        // Config in non-canonical order shouldn't change emitted order.
+        acc.trash = Some("Trash".into());
+        acc.archive = Some("Archive".into());
+        acc.sent = Some("Sent".into());
+
+        let spec = AccountSpec::from_account("a", &acc);
+        let labels: Vec<&str> = spec.folders.iter().map(|b| b.label.as_str()).collect();
+        // FolderRole::ALL order: Inbox, Drafts, Sent, Archive, Spam, Trash.
+        // Unset roles (Drafts, Spam) are skipped.
+        assert_eq!(labels, vec!["INBOX", "Sent", "Archive", "Trash"]);
+    }
+
+    #[test]
+    fn bindings_map_role_label_to_disk_path() {
+        // The role label decouples display from disk naming. Here the
+        // archive role points at a weirdly named disk folder, but the
+        // sidebar/index see "Archive".
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        mk_maildir(&root, "");
+        mk_maildir(&root, "MyWeirdArchive");
+
+        let mut acc = account(root.clone(), Layout::Verbatim);
+        acc.archive = Some("MyWeirdArchive".into());
+
+        let spec = AccountSpec::from_account("a", &acc);
+        let archive = spec.binding_by_role(FolderRole::Archive).unwrap();
+        assert_eq!(archive.label, "Archive");
+        assert_eq!(archive.path, root.join("MyWeirdArchive"));
+    }
+
+    #[test]
+    fn extras_appear_after_roles_with_literal_labels() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        mk_maildir(&root, "");
+
+        let mut acc = account(root.clone(), Layout::Verbatim);
+        acc.archive = Some("Archive".into());
+        acc.extra_folders = vec!["[Gmail]/All Mail".into(), "Receipts".into()];
+
+        let spec = AccountSpec::from_account("a", &acc);
+        let labels: Vec<&str> = spec.folders.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["INBOX", "Archive", "[Gmail]/All Mail", "Receipts"]
+        );
+        // Extras have no role attached — drives the role-vs-extra
+        // branches in command routing.
+        let extras: Vec<Option<FolderRole>> = spec
+            .folders
+            .iter()
+            .filter(|b| b.label.contains("Gmail") || b.label == "Receipts")
+            .map(|b| b.role)
             .collect();
-        // The literal `Inbox` subdir survives discovery as a regular folder.
-        assert_eq!(labels, vec!["Inbox".to_string()]);
+        assert_eq!(extras, vec![None, None]);
+    }
+
+    #[test]
+    fn inbox_resolved_to_subdir_when_root_not_a_maildir() {
+        // mbsync default-pattern layout: root is not a maildir, INBOX
+        // lives at `<root>/Inbox`. The binding's path should follow
+        // the resolver.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        mk_maildir(&root, "Inbox");
+
+        let acc = account(root.clone(), Layout::Verbatim);
+        let spec = AccountSpec::from_account("a", &acc);
+        assert_eq!(spec.folders[0].path, root.join("Inbox"));
     }
 }

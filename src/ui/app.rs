@@ -1090,7 +1090,21 @@ impl InboxScreen {
             *status_error = Some(format!("move: unknown account {account_name}"));
             return;
         };
-        let folder_root = account.folder_path(target_folder);
+        // Bindings are config-derived and cheap to rebuild; doing it
+        // here avoids threading the AccountSpec map through every
+        // move callsite. The binding's `path` carries the on-disk
+        // root (role's `disk_name` resolved via layout, or an extra's
+        // literal). `target_folder` is the index/sidebar label, so
+        // role names like "Archive" route correctly to weirdly-named
+        // disk folders.
+        let spec = AccountSpec::from_account(&account_name, account);
+        let Some(binding) = spec.binding_by_label(target_folder) else {
+            *status_error = Some(format!(
+                "move: {target_folder} not configured on {account_name}"
+            ));
+            return;
+        };
+        let folder_root = binding.path.clone();
         let target_cur = folder_root.join("cur");
 
         if let Err(e) = flags::ensure_maildir(&folder_root) {
@@ -1869,7 +1883,10 @@ impl InboxScreen {
 /// stays consistent across the eager scan, the catch-up, and the
 /// watcher's per-folder rescan paths.
 fn account_specs(cfg: &Config) -> Vec<AccountSpec> {
-    cfg.accounts.iter().map(AccountSpec::from_pair).collect()
+    cfg.accounts
+        .iter()
+        .map(|(name, a)| AccountSpec::from_account(name, a))
+        .collect()
 }
 
 fn mirror_to_index(cache_path: &Path, row: &MessageRow) -> anyhow::Result<()> {
@@ -2302,11 +2319,15 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
                 layout: crate::mail::layout::Layout::Maildirpp,
-                inbox_folder: None,
-                sent_folder: None,
-                archive_folder: None,
-                spam_folder: None,
-                trash_folder: None,
+                inbox: None,
+                sent: None,
+                archive: None,
+                spam: None,
+                trash: None,
+
+                drafts: None,
+
+                extra_folders: Vec::new(),
                 smtp: None,
             },
         );
@@ -2325,11 +2346,15 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                     maildir: tmp.path().join("Mail").join(name),
                     from: format!("Tester <{name}@example.invalid>"),
                     layout: crate::mail::layout::Layout::Maildirpp,
-                    inbox_folder: None,
-                    sent_folder: None,
-                    archive_folder: None,
-                    spam_folder: None,
-                    trash_folder: None,
+                    inbox: None,
+                    sent: None,
+                    archive: None,
+                    spam: None,
+                    trash: None,
+
+                    drafts: None,
+
+                    extra_folders: Vec::new(),
                     smtp: None,
                 },
             );
@@ -2559,11 +2584,13 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
                 layout: crate::mail::layout::Layout::Maildirpp,
-                inbox_folder: None,
-                sent_folder: None,
-                archive_folder: archive.map(str::to_string),
-                spam_folder: None,
-                trash_folder: trash.map(str::to_string),
+                inbox: None,
+                sent: None,
+                archive: archive.map(str::to_string),
+                spam: None,
+                trash: trash.map(str::to_string),
+                drafts: None,
+                extra_folders: Vec::new(),
                 smtp: None,
             },
         );
@@ -2674,7 +2701,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
             .as_deref()
             .expect("status_error should be set");
         assert!(
-            err.contains("archive_folder"),
+            err.contains("archive"),
             "error must mention the missing config key, got {err:?}"
         );
     }
@@ -2683,7 +2710,11 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
     fn mv_to_custom_folder() {
         let tmp = TempDir::new().unwrap();
         drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
-        let cfg = account_with_folders(&tmp, None, None);
+        let mut cfg = account_with_folders(&tmp, None, None);
+        // `:mv X` only routes to folders the account declares; with
+        // role-based config that means `extra_folders` for anything
+        // that isn't a canonical role.
+        cfg.accounts.get_mut("personal").unwrap().extra_folders = vec!["Receipts".into()];
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
@@ -2772,7 +2803,10 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
 <p>sent body</p>\r\n";
         std::fs::write(sent_root.join("9999.M0P9.host:2,S"), sent_msg).unwrap();
 
-        let cfg = one_account_config(&tmp);
+        let mut cfg = one_account_config(&tmp);
+        // Bind the Sent role so the catch-up walks the folder; without
+        // this the new role-based filter would skip it.
+        cfg.accounts.get_mut("personal").unwrap().sent = Some("Sent".into());
         let cache = tmp.path().join("index.sqlite");
 
         let mut app = App::new(&cfg, cache, None, None);
@@ -3081,11 +3115,15 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 maildir: tmp.path().join("Mail").join("personal"),
                 from: "Tester <tester@example.invalid>".into(),
                 layout: crate::mail::layout::Layout::Maildirpp,
-                inbox_folder: None,
-                sent_folder: None,
-                archive_folder: None,
-                spam_folder: None,
-                trash_folder: None,
+                inbox: None,
+                // Bind Sent so the catch-up walks the folder; the
+                // role-based filter would skip it otherwise.
+                sent: Some("Sent".into()),
+                archive: None,
+                spam: None,
+                trash: None,
+                drafts: None,
+                extra_folders: Vec::new(),
                 smtp: None,
             },
         );

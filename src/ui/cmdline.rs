@@ -175,11 +175,11 @@ impl MoveKind {
         }
     }
 
-    fn folder(self, acc: &crate::config::Account) -> Option<&String> {
+    fn role(self) -> crate::config::FolderRole {
         match self {
-            MoveKind::Archive => acc.archive_folder.as_ref(),
-            MoveKind::Spam => acc.spam_folder.as_ref(),
-            MoveKind::Trash => acc.trash_folder.as_ref(),
+            MoveKind::Archive => crate::config::FolderRole::Archive,
+            MoveKind::Spam => crate::config::FolderRole::Spam,
+            MoveKind::Trash => crate::config::FolderRole::Trash,
         }
     }
 }
@@ -198,14 +198,19 @@ fn move_named(app: &mut App, cfg: &Config, kind: MoveKind) {
         app.status_error = Some(format!("{label}: unknown account {}", row.account));
         return;
     };
-    let Some(folder) = kind.folder(account).cloned() else {
+    if account.role_disk_name(kind.role()).is_none() {
         app.status_error = Some(format!(
-            "{label}: no {label}_folder configured for {}",
+            "{label}: no {label} configured for {}",
             row.account
         ));
         return;
-    };
-    app.move_selected_to(&folder, cfg);
+    }
+    // The role's display label (`"Archive"` / `"Spam"` / `"Trash"`)
+    // is what `move_selected_to` expects as the target — it resolves
+    // the on-disk path via the binding list and writes that label
+    // into the index.
+    let target = kind.role().label().to_string();
+    app.move_selected_to(&target, cfg);
 }
 
 /// Re-export for the `a` / `D` keybindings: dispatch the same `:archive`
@@ -348,10 +353,12 @@ fn send_active(app: &mut App, cfg: &Config) {
             return;
         }
     };
+    // Look up the Sent role on the account-derived binding list so the
+    // disk path follows whatever the user wrote in `sent = "..."`.
     let sent_cur_dir = cfg.accounts.get(&account_name).and_then(|a| {
-        a.sent_folder
-            .as_ref()
-            .map(|sf| a.folder_path(sf).join("cur"))
+        crate::store::AccountSpec::from_account(&account_name, a)
+            .binding_by_role(crate::config::FolderRole::Sent)
+            .map(|b| b.path.join("cur"))
     });
     let bytes = match mail_compose::serialize(&draft) {
         Ok(b) => b,

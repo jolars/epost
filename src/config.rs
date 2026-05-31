@@ -241,6 +241,51 @@ pub fn smtp_command_for<'a>(cfg: &'a Config, account: &str) -> Result<&'a [Strin
     Err("smtp.command not configured".into())
 }
 
+/// Canonical folder roles. Each role has a fixed display label that
+/// epost uses everywhere — in the sidebar, in the index `folder`
+/// column, and as the target of role-bound commands (`:archive`,
+/// `:trash`, …). The disk-side folder name (which provider you sync
+/// from decides) lives in the per-account `Account` keys; the role
+/// label decouples display + commands from disk naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FolderRole {
+    Inbox,
+    Archive,
+    Sent,
+    Spam,
+    Trash,
+    Drafts,
+}
+
+impl FolderRole {
+    /// Canonical display label. `INBOX` stays uppercase to match
+    /// IMAP convention and existing assumptions; the rest are
+    /// title-case English. These are the strings written into the
+    /// index's `folder` column and rendered in the sidebar.
+    pub fn label(self) -> &'static str {
+        match self {
+            FolderRole::Inbox => "INBOX",
+            FolderRole::Archive => "Archive",
+            FolderRole::Sent => "Sent",
+            FolderRole::Spam => "Spam",
+            FolderRole::Trash => "Trash",
+            FolderRole::Drafts => "Drafts",
+        }
+    }
+
+    /// Canonical role order. Drives sidebar layout (Inbox first, then
+    /// Drafts, Sent, Archive, Spam, Trash) and the binding-build
+    /// order in `AccountSpec`.
+    pub const ALL: [FolderRole; 6] = [
+        FolderRole::Inbox,
+        FolderRole::Drafts,
+        FolderRole::Sent,
+        FolderRole::Archive,
+        FolderRole::Spam,
+        FolderRole::Trash,
+    ];
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
@@ -258,48 +303,63 @@ pub struct Account {
     /// `<maildir>/Inbox/` then `<maildir>/INBOX/` and finally falls
     /// back to the root.
     #[serde(default)]
-    pub inbox_folder: Option<String>,
+    pub inbox: Option<String>,
+    /// Disk-side folder name for each canonical role. The role's
+    /// `label()` (e.g. `"Archive"`) is what shows up in the sidebar
+    /// and the index; the string here is the actual folder name in
+    /// `maildir` (e.g. `"[Gmail]/All Mail"`). Unset means the
+    /// account doesn't expose that role — `:archive` etc. will
+    /// error.
     #[serde(default)]
-    pub sent_folder: Option<String>,
+    pub archive: Option<String>,
     #[serde(default)]
-    pub archive_folder: Option<String>,
+    pub sent: Option<String>,
     #[serde(default)]
-    pub spam_folder: Option<String>,
+    pub spam: Option<String>,
     #[serde(default)]
-    pub trash_folder: Option<String>,
+    pub trash: Option<String>,
+    #[serde(default)]
+    pub drafts: Option<String>,
+    /// Folders that don't fit any canonical role but should still
+    /// appear in the sidebar (and be scanned). Sidebar/index label
+    /// is the literal string here. Examples: Gmail's `"[Gmail]/All
+    /// Mail"`, project / mailing-list buckets, etc.
+    #[serde(default)]
+    pub extra_folders: Vec<String>,
     #[serde(default)]
     pub smtp: Option<Smtp>,
 }
 
 impl Account {
     /// Resolved on-disk root for the account's INBOX `cur/new/tmp`.
-    /// See `inbox_folder` for the resolution order. Hits the
-    /// filesystem (`is_dir`) so callers should cache the result
-    /// rather than re-resolving in hot paths.
+    /// See `inbox` for the resolution order. Hits the filesystem
+    /// (`is_dir`) so callers should cache the result rather than
+    /// re-resolving in hot paths.
     pub fn inbox_root(&self) -> PathBuf {
-        resolve_inbox_root(&self.maildir, self.inbox_folder.as_deref())
+        resolve_inbox_root(&self.maildir, self.inbox.as_deref())
     }
 
-    /// Resolve a folder label to its on-disk root, honouring the
-    /// `inbox_folder` override / auto-detect for `"INBOX"` and
-    /// falling through to the layout's regular mapping for every
-    /// other label.
-    pub fn folder_path(&self, label: &str) -> PathBuf {
-        if label == "INBOX" {
-            self.inbox_root()
-        } else {
-            self.layout.folder_path(&self.maildir, label)
+    /// Disk-side folder name configured for the given role, if any.
+    /// `None` means the role isn't bound on this account.
+    pub fn role_disk_name(&self, role: FolderRole) -> Option<&str> {
+        match role {
+            FolderRole::Inbox => self.inbox.as_deref(),
+            FolderRole::Archive => self.archive.as_deref(),
+            FolderRole::Sent => self.sent.as_deref(),
+            FolderRole::Spam => self.spam.as_deref(),
+            FolderRole::Trash => self.trash.as_deref(),
+            FolderRole::Drafts => self.drafts.as_deref(),
         }
     }
 }
 
 /// Resolve where INBOX's `cur/new/tmp` actually lives. Order:
-/// explicit `inbox_folder` override → `<root>/cur` exists (root is
-/// itself the INBOX maildir, the traditional layout) → `<root>/Inbox`
-/// → `<root>/INBOX` → fall back to `<root>` so callers still get a
+/// explicit `inbox` override → `<root>/cur` exists (root is itself
+/// the INBOX maildir, the traditional layout) → `<root>/Inbox` →
+/// `<root>/INBOX` → fall back to `<root>` so callers still get a
 /// stable path even when INBOX isn't synced yet.
-pub fn resolve_inbox_root(root: &Path, inbox_folder: Option<&str>) -> PathBuf {
-    if let Some(sub) = inbox_folder {
+pub fn resolve_inbox_root(root: &Path, inbox: Option<&str>) -> PathBuf {
+    if let Some(sub) = inbox {
         return root.join(sub);
     }
     if root.join("cur").is_dir() {
@@ -369,19 +429,19 @@ mod tests {
             [accounts.dev]
             maildir = "./dev/maildir"
             from = "Dev <dev@example.invalid>"
-            sent_folder = "Sent"
-            archive_folder = "Archive"
-            spam_folder = "Spam"
-            trash_folder = "Trash"
+            sent = "Sent"
+            archive = "Archive"
+            spam = "Spam"
+            trash = "Trash"
             "#,
         )
         .unwrap();
         assert!(cfg.ui.reader);
         assert_eq!(cfg.accounts["dev"].from, "Dev <dev@example.invalid>");
         let dev = &cfg.accounts["dev"];
-        assert_eq!(dev.archive_folder.as_deref(), Some("Archive"));
-        assert_eq!(dev.spam_folder.as_deref(), Some("Spam"));
-        assert_eq!(dev.trash_folder.as_deref(), Some("Trash"));
+        assert_eq!(dev.archive.as_deref(), Some("Archive"));
+        assert_eq!(dev.spam.as_deref(), Some("Spam"));
+        assert_eq!(dev.trash.as_deref(), Some("Trash"));
     }
 
     #[test]
@@ -690,16 +750,20 @@ mod tests {
             maildir: root.to_path_buf(),
             from: "x".into(),
             layout: crate::mail::layout::Layout::Verbatim,
-            inbox_folder: None,
-            sent_folder: None,
-            archive_folder: None,
-            spam_folder: None,
-            trash_folder: None,
+            inbox: None,
+            sent: None,
+            archive: None,
+            spam: None,
+            trash: None,
+
+            drafts: None,
+
+            extra_folders: Vec::new(),
             smtp: None,
         };
-        // INBOX routes through the resolver (→ Inbox subdir).
-        assert_eq!(acc.folder_path("INBOX"), root.join("Inbox"));
-        // Non-INBOX labels go through the layout's regular mapping.
-        assert_eq!(acc.folder_path("Archive"), root.join("Archive"));
+        // Inbox resolver still operates on Account directly.
+        assert_eq!(acc.inbox_root(), root.join("Inbox"));
+        // Non-INBOX folder-path resolution moved to AccountSpec
+        // bindings; see store.rs tests.
     }
 }

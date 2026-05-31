@@ -40,85 +40,11 @@ impl Layout {
             }
         }
     }
-
-    /// Discover every subfolder under `root`. INBOX is implicit and not
-    /// returned. Each entry is `(label, folder_root)` where `folder_root`
-    /// contains `cur/new/tmp`. Sorted by label.
-    pub fn discover_folders(&self, root: &Path) -> Vec<(String, PathBuf)> {
-        let mut out = Vec::new();
-        match self {
-            Layout::Maildirpp => discover_maildirpp(root, &mut out),
-            Layout::Verbatim => discover_verbatim(root, "", &mut out),
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-}
-
-fn discover_maildirpp(root: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let Ok(ft) = e.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let path = e.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.starts_with('.') || name == "." || name == ".." {
-            continue;
-        }
-        let label = name.strip_prefix('.').unwrap_or(name).to_string();
-        out.push((label, path));
-    }
-}
-
-fn discover_verbatim(root: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let Ok(ft) = e.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let path = e.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        // Skip the maildir's own cur/new/tmp at every depth and any
-        // dotfile dirs (.git, .notmuch, etc.).
-        if matches!(name, "cur" | "new" | "tmp") || name.starts_with('.') {
-            continue;
-        }
-        let label = if prefix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        // A directory is a folder iff it contains `cur/`. Either way we
-        // recurse — a folder can itself contain sub-folders.
-        if path.join("cur").is_dir() {
-            out.push((label.clone(), path.clone()));
-        }
-        discover_verbatim(&path, &label, out);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    fn mkmaildir(p: &Path) {
-        for sub in ["cur", "new", "tmp"] {
-            fs::create_dir_all(p.join(sub)).unwrap();
-        }
-    }
 
     #[test]
     fn maildirpp_folder_path_dot_prefixes() {
@@ -145,73 +71,6 @@ mod tests {
         assert_eq!(
             l.folder_path(Path::new("/m"), "Sent/2024"),
             PathBuf::from("/m/Sent/2024")
-        );
-    }
-
-    #[test]
-    fn maildirpp_discover_strips_leading_dot() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        mkmaildir(root);
-        mkmaildir(&root.join(".Sent"));
-        mkmaildir(&root.join(".Sent.2024"));
-        mkmaildir(&root.join(".Archive"));
-        // A stray non-dot dir is ignored under maildir++.
-        fs::create_dir_all(root.join("ignored")).unwrap();
-
-        let folders = Layout::Maildirpp.discover_folders(root);
-        let labels: Vec<&str> = folders.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["Archive", "Sent", "Sent.2024"]);
-    }
-
-    #[test]
-    fn verbatim_discover_recurses_and_uses_slash_labels() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        mkmaildir(root);
-        mkmaildir(&root.join("Sent"));
-        mkmaildir(&root.join("Sent/2024"));
-        mkmaildir(&root.join("Archive"));
-        // A pure container (no cur/) that holds another folder: only
-        // the inner one is a folder, but discovery still descends.
-        fs::create_dir_all(root.join("Containers")).unwrap();
-        mkmaildir(&root.join("Containers/Project"));
-        // Dotfile dirs and dot-prefixed entries are skipped.
-        fs::create_dir_all(root.join(".notmuch")).unwrap();
-
-        let folders = Layout::Verbatim.discover_folders(root);
-        let labels: Vec<&str> = folders.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(
-            labels,
-            vec!["Archive", "Containers/Project", "Sent", "Sent/2024"]
-        );
-        // Folder roots resolve to the right paths.
-        let lookup: std::collections::HashMap<&str, &Path> = folders
-            .iter()
-            .map(|(l, p)| (l.as_str(), p.as_path()))
-            .collect();
-        assert_eq!(lookup["Sent/2024"], root.join("Sent/2024").as_path());
-        assert_eq!(
-            lookup["Containers/Project"],
-            root.join("Containers/Project").as_path()
-        );
-    }
-
-    #[test]
-    fn verbatim_discover_skips_maildir_internals_at_every_depth() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        mkmaildir(root);
-        mkmaildir(&root.join("Sent"));
-        // A nested folder literally named like an internal would be a
-        // spec violation; cur/new/tmp are reserved at every depth.
-        assert_eq!(
-            Layout::Verbatim
-                .discover_folders(root)
-                .into_iter()
-                .map(|(l, _)| l)
-                .collect::<Vec<_>>(),
-            vec!["Sent".to_string()]
         );
     }
 

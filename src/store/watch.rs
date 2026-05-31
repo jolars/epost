@@ -116,10 +116,6 @@ enum RegisterMsg {
         folder_root: PathBuf,
         layout: Layout,
     },
-    /// Re-discover one account's folders and register any that aren't
-    /// already watched. Fired after a Create(Folder) event under a
-    /// discovery root.
-    Rediscover { account: String },
 }
 
 #[derive(Default)]
@@ -130,21 +126,10 @@ struct DirtyState {
 
 type LookupMap = HashMap<PathBuf, FolderKey>;
 
-/// Owning info for an account, keyed by name. Held alongside the
-/// `lookup` and `discovery_roots` maps so the debounce thread can run
-/// `discover_non_inbox_folders` without bouncing back to the caller.
-#[derive(Clone)]
-struct AccountInfo {
-    spec: AccountSpec,
-}
-type Accounts = HashMap<String, AccountInfo>;
-
 /// Map from a watched directory (account root, or — under verbatim — a
-/// folder root) to the account it belongs to. Used in `handle_event` to
-/// map a `Create(Folder)` event back to (a) its account and (b) the
-/// right reaction: Maildir++ folder events under the account root strip
-/// the dot and register the new folder directly; verbatim events
-/// anywhere queue a full re-discovery for the account.
+/// folder root) to the account it belongs to. Kept alongside the
+/// `lookup` map for symmetry: `lookup` is per-folder `{cur,new}`,
+/// `discovery_roots` is per-folder-root.
 type DiscoveryRoots = HashMap<PathBuf, String>;
 
 impl Watcher {
@@ -192,12 +177,6 @@ pub fn start(
 ) -> Result<(Watcher, Receiver<WatcherEvent>)> {
     let lookup: Arc<Mutex<LookupMap>> = Arc::new(Mutex::new(HashMap::new()));
     let discovery_roots: Arc<Mutex<DiscoveryRoots>> = Arc::new(Mutex::new(HashMap::new()));
-    let acc_map: Arc<Mutex<Accounts>> = Arc::new(Mutex::new(
-        accounts
-            .iter()
-            .map(|s| (s.name.clone(), AccountInfo { spec: s.clone() }))
-            .collect(),
-    ));
     let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (out_tx, out_rx) = mpsc::channel();
@@ -207,20 +186,11 @@ pub fn start(
         let lookup = lookup.clone();
         let state = state.clone();
         let self_writes = self_writes.clone();
-        let discovery_roots = discovery_roots.clone();
-        let register_tx_cb = register_tx.clone();
         move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else {
                 return;
             };
-            handle_event(
-                ev,
-                &lookup,
-                &state,
-                &self_writes,
-                &discovery_roots,
-                &register_tx_cb,
-            );
+            handle_event(ev, &lookup, &state, &self_writes);
         }
     };
 
@@ -234,7 +204,6 @@ pub fn start(
     let dt_state = state.clone();
     let dt_shutdown = shutdown.clone();
     let dt_discovery = discovery_roots.clone();
-    let dt_accounts = acc_map.clone();
     let dt_debounce = cfg.debounce;
     let handle = std::thread::Builder::new()
         .name("epost-watch-debounce".into())
@@ -245,7 +214,6 @@ pub fn start(
                 dt_state,
                 dt_shutdown,
                 dt_discovery,
-                dt_accounts,
                 register_rx,
                 out_tx,
                 wake_tx,
@@ -285,26 +253,20 @@ fn register_initial(
             .with_context(|| format!("watching maildir root {}", spec.root.display()))?;
         dr.insert(spec.root.clone(), spec.name.clone());
 
-        // INBOX `cur`/`new`. `spec.inbox_root` is the resolved location
-        // (root for the classic maildir convention, or a same-account
-        // subdir like `<root>/Inbox` for mbsync default-pattern setups).
-        for sub in ["cur", "new"] {
-            let dir = spec.inbox_root.join(sub);
-            if dir.is_dir() {
-                w.watch(&dir, RecursiveMode::NonRecursive)
-                    .with_context(|| format!("watching {}", dir.display()))?;
-                lk.insert(dir, (spec.name.clone(), "INBOX".to_string()));
-            }
-        }
-
-        for (label, folder_root) in spec.discover_non_inbox_folders() {
+        // Watch every binding's `{cur,new}`. The INBOX binding
+        // (`folders[0]`) and every role/extra after it share the
+        // same shape, so one loop covers both. Layout drives the
+        // discovery-roots side: under verbatim, each folder root is
+        // itself a discovery root so nested sub-folder creation is
+        // visible.
+        for binding in &spec.folders {
             install_folder_watches(
                 &mut w,
                 &mut lk,
                 &mut dr,
                 &spec.name,
-                &label,
-                &folder_root,
+                &binding.label,
+                &binding.path,
                 spec.layout,
             );
         }
@@ -345,15 +307,12 @@ fn handle_event(
     lookup: &Arc<Mutex<LookupMap>>,
     state: &Arc<(Mutex<DirtyState>, Condvar)>,
     self_writes: &SelfWrites,
-    discovery_roots: &Arc<Mutex<DiscoveryRoots>>,
-    register_tx: &Sender<RegisterMsg>,
 ) {
     if !is_event_interesting(&ev.kind) {
         return;
     }
 
     let mut to_mark: Vec<FolderKey> = Vec::new();
-    let mut rediscover_accounts: HashSet<String> = HashSet::new();
 
     for path in &ev.paths {
         // Suppress our own writes.
@@ -362,7 +321,10 @@ fn handle_event(
         }
 
         // File event: the parent dir (e.g. `.../Foo/cur`) is the
-        // lookup key.
+        // lookup key. Folder-creation events under unconfigured
+        // paths are intentionally dropped — under role-based folder
+        // config, new folders only appear when the user adds them
+        // to their config.
         if let Some(folder_dir) = path.parent() {
             let hit = lookup
                 .lock()
@@ -371,28 +333,8 @@ fn handle_event(
                 .cloned();
             if let Some(key) = hit {
                 to_mark.push(key);
-                continue;
             }
         }
-
-        // Folder event under a known discovery root (account root, or —
-        // under verbatim — an existing folder root). Queue re-discovery for
-        // that account; the debounce thread will diff against already-
-        // registered folder roots and add only the new ones.
-        if let Some(parent) = path.parent() {
-            let acc = discovery_roots
-                .lock()
-                .expect("discovery_roots poisoned")
-                .get(parent)
-                .cloned();
-            if let Some(account) = acc {
-                rediscover_accounts.insert(account);
-            }
-        }
-    }
-
-    for account in rediscover_accounts {
-        let _ = register_tx.send(RegisterMsg::Rediscover { account });
     }
 
     if !to_mark.is_empty() {
@@ -427,7 +369,6 @@ fn debounce_loop(
     state: Arc<(Mutex<DirtyState>, Condvar)>,
     shutdown: Arc<AtomicBool>,
     discovery_roots: Arc<Mutex<DiscoveryRoots>>,
-    accounts: Arc<Mutex<Accounts>>,
     register_rx: Receiver<RegisterMsg>,
     out: Sender<WatcherEvent>,
     wake_tx: Sender<AppEvent>,
@@ -436,7 +377,7 @@ fn debounce_loop(
     let (lock, cv) = &*state;
     loop {
         while let Ok(msg) = register_rx.try_recv() {
-            apply_register(&msg, &watcher, &lookup, &discovery_roots, &accounts, &state);
+            apply_register(&msg, &watcher, &lookup, &discovery_roots);
         }
 
         if shutdown.load(Ordering::Acquire) {
@@ -474,8 +415,6 @@ fn apply_register(
     watcher: &Arc<Mutex<RecommendedWatcher>>,
     lookup: &Arc<Mutex<LookupMap>>,
     discovery_roots: &Arc<Mutex<DiscoveryRoots>>,
-    accounts: &Arc<Mutex<Accounts>>,
-    state: &Arc<(Mutex<DirtyState>, Condvar)>,
 ) {
     match msg {
         RegisterMsg::AddFolder {
@@ -496,49 +435,6 @@ fn apply_register(
                 folder_root,
                 *layout,
             );
-        }
-        RegisterMsg::Rediscover { account } => {
-            let info = accounts
-                .lock()
-                .expect("accounts poisoned")
-                .get(account)
-                .cloned();
-            let Some(info) = info else { return };
-            let folders = info.spec.discover_non_inbox_folders();
-            let mut new_keys: Vec<FolderKey> = Vec::new();
-            {
-                let mut w = watcher.lock().expect("watcher poisoned");
-                let mut lk = lookup.lock().expect("lookup poisoned");
-                let mut dr = discovery_roots.lock().expect("discovery_roots poisoned");
-                for (label, folder_root) in folders {
-                    let cur = folder_root.join("cur");
-                    if lk.contains_key(&cur) {
-                        // Already registered.
-                        continue;
-                    }
-                    install_folder_watches(
-                        &mut w,
-                        &mut lk,
-                        &mut dr,
-                        account,
-                        &label,
-                        &folder_root,
-                        info.spec.layout,
-                    );
-                    new_keys.push((account.clone(), label));
-                }
-            }
-            // Dirty-mark every newly-discovered folder so a rescan picks
-            // up its pre-existing files.
-            if !new_keys.is_empty() {
-                let (lk2, cv) = &**state;
-                let mut g = lk2.lock().expect("dirty state poisoned");
-                for k in new_keys {
-                    g.dirty.insert(k);
-                }
-                g.last_event_at = Some(Instant::now());
-                cv.notify_all();
-            }
         }
     }
 }
@@ -621,15 +517,13 @@ mod tests {
             .insert(PathBuf::from("/m/dev/cur"), ("dev".into(), "INBOX".into()));
         let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
         let sw = SelfWrites::new();
-        let dr = Arc::new(Mutex::new(HashMap::new()));
-        let (rtx, _rrx) = mpsc::channel::<RegisterMsg>();
 
         let ev = notify::Event {
             kind: EventKind::Create(notify::event::CreateKind::File),
             paths: vec![PathBuf::from("/m/dev/cur/1.M0.h:2,S")],
             attrs: Default::default(),
         };
-        handle_event(ev, &lookup, &state, &sw, &dr, &rtx);
+        handle_event(ev, &lookup, &state, &sw);
 
         let g = state.0.lock().unwrap();
         assert!(g.dirty.contains(&("dev".to_string(), "INBOX".to_string())));
@@ -647,15 +541,13 @@ mod tests {
         let sw = SelfWrites::new();
         let path = PathBuf::from("/m/dev/cur/1.M0.h:2,S");
         sw.record(&path);
-        let dr = Arc::new(Mutex::new(HashMap::new()));
-        let (rtx, _rrx) = mpsc::channel::<RegisterMsg>();
 
         let ev = notify::Event {
             kind: EventKind::Create(notify::event::CreateKind::File),
             paths: vec![path.clone()],
             attrs: Default::default(),
         };
-        handle_event(ev, &lookup, &state, &sw, &dr, &rtx);
+        handle_event(ev, &lookup, &state, &sw);
 
         let g = state.0.lock().unwrap();
         assert!(
@@ -677,69 +569,53 @@ mod tests {
             .insert(PathBuf::from("/m/dev/cur"), ("dev".into(), "INBOX".into()));
         let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
         let sw = SelfWrites::new();
-        let dr = Arc::new(Mutex::new(HashMap::new()));
-        let (rtx, _rrx) = mpsc::channel::<RegisterMsg>();
 
         let ev = notify::Event {
             kind: EventKind::Access(notify::event::AccessKind::Read),
             paths: vec![PathBuf::from("/m/dev/cur/1.M0.h:2,S")],
             attrs: Default::default(),
         };
-        handle_event(ev, &lookup, &state, &sw, &dr, &rtx);
+        handle_event(ev, &lookup, &state, &sw);
 
         assert!(state.0.lock().unwrap().dirty.is_empty());
     }
 
-    #[test]
-    fn handle_event_new_folder_under_account_root_queues_rediscovery() {
-        let lookup = Arc::new(Mutex::new(HashMap::new()));
-        let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
-        let sw = SelfWrites::new();
-        let dr = Arc::new(Mutex::new(HashMap::new()));
-        dr.lock()
-            .unwrap()
-            .insert(PathBuf::from("/m/dev"), "dev".to_string());
-        let (rtx, rrx) = mpsc::channel::<RegisterMsg>();
-
-        let ev = notify::Event {
-            kind: EventKind::Create(notify::event::CreateKind::Folder),
-            paths: vec![PathBuf::from("/m/dev/.NewFolder")],
-            attrs: Default::default(),
+    /// Build an `AccountSpec` from a maildir + a list of role bindings
+    /// for use in watch tests. `roles` keys mirror `Account` fields
+    /// (`"sent"`, `"archive"`, …); `extras` go on `extra_folders`.
+    fn test_spec(
+        name: &str,
+        root: PathBuf,
+        layout: Layout,
+        roles: &[(&str, &str)],
+        extras: &[&str],
+    ) -> AccountSpec {
+        let mut acc = crate::config::Account {
+            maildir: root,
+            from: "x".into(),
+            layout,
+            inbox: None,
+            archive: None,
+            sent: None,
+            spam: None,
+            trash: None,
+            drafts: None,
+            extra_folders: extras.iter().map(|s| s.to_string()).collect(),
+            smtp: None,
         };
-        handle_event(ev, &lookup, &state, &sw, &dr, &rtx);
-
-        let msg = rrx.try_recv().expect("expected a Rediscover message");
-        match msg {
-            RegisterMsg::Rediscover { account } => assert_eq!(account, "dev"),
-            _ => panic!("expected Rediscover"),
+        for (field, disk) in roles {
+            let v = Some(disk.to_string());
+            match *field {
+                "inbox" => acc.inbox = v,
+                "archive" => acc.archive = v,
+                "sent" => acc.sent = v,
+                "spam" => acc.spam = v,
+                "trash" => acc.trash = v,
+                "drafts" => acc.drafts = v,
+                other => panic!("unknown role field {other}"),
+            }
         }
-    }
-
-    #[test]
-    fn handle_event_new_nested_folder_under_verbatim_folder_root_queues_rediscovery() {
-        let lookup = Arc::new(Mutex::new(HashMap::new()));
-        let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
-        let sw = SelfWrites::new();
-        let dr = Arc::new(Mutex::new(HashMap::new()));
-        // The Sent folder root has been registered as a discovery root
-        // (verbatim layout); create a 2024 sub-folder under it.
-        dr.lock()
-            .unwrap()
-            .insert(PathBuf::from("/m/dev/Sent"), "dev".to_string());
-        let (rtx, rrx) = mpsc::channel::<RegisterMsg>();
-
-        let ev = notify::Event {
-            kind: EventKind::Create(notify::event::CreateKind::Folder),
-            paths: vec![PathBuf::from("/m/dev/Sent/2024")],
-            attrs: Default::default(),
-        };
-        handle_event(ev, &lookup, &state, &sw, &dr, &rtx);
-
-        let msg = rrx.try_recv().expect("expected a Rediscover message");
-        match msg {
-            RegisterMsg::Rediscover { account } => assert_eq!(account, "dev"),
-            _ => panic!("expected Rediscover"),
-        }
+        AccountSpec::from_account(name, &acc)
     }
 
     #[test]
@@ -762,12 +638,13 @@ mod tests {
         ));
         let lookup = Arc::new(Mutex::new(HashMap::new()));
         let discovery_roots = Arc::new(Mutex::new(HashMap::new()));
-        let accounts = vec![AccountSpec {
-            name: "dev".to_string(),
-            root: root.clone(),
-            layout: Layout::Maildirpp,
-            inbox_root: root.clone(),
-        }];
+        let accounts = vec![test_spec(
+            "dev",
+            root.clone(),
+            Layout::Maildirpp,
+            &[("sent", "Sent"), ("archive", "Archive")],
+            &[],
+        )];
         register_initial(&watcher_arc, &lookup, &discovery_roots, &accounts).unwrap();
 
         let lk = lookup.lock().unwrap();
@@ -787,14 +664,10 @@ mod tests {
             lk.get(&root.join(".Archive").join("new")),
             Some(&("dev".into(), "Archive".into()))
         );
-        // Only the account root is a discovery root under maildir++.
-        let dr = discovery_roots.lock().unwrap();
-        assert_eq!(dr.get(&root), Some(&"dev".to_string()));
-        assert!(dr.get(&root.join(".Sent")).is_none());
     }
 
     #[test]
-    fn register_initial_verbatim_walks_nested_and_marks_folder_roots_as_discovery() {
+    fn register_initial_verbatim_walks_configured_extras() {
         use std::fs;
         use tempfile::TempDir;
 
@@ -814,21 +687,23 @@ mod tests {
         ));
         let lookup = Arc::new(Mutex::new(HashMap::new()));
         let discovery_roots = Arc::new(Mutex::new(HashMap::new()));
-        let accounts = vec![AccountSpec {
-            name: "verbatim".to_string(),
-            root: root.clone(),
-            layout: Layout::Verbatim,
-            inbox_root: root.clone(),
-        }];
+        // Nested folders go on `extra_folders` — the role-based
+        // design treats anything beyond the canonical six as
+        // user-declared.
+        let accounts = vec![test_spec(
+            "verbatim",
+            root.clone(),
+            Layout::Verbatim,
+            &[("sent", "Sent"), ("archive", "Archive")],
+            &["Sent/2024"],
+        )];
         register_initial(&watcher_arc, &lookup, &discovery_roots, &accounts).unwrap();
 
         let lk = lookup.lock().unwrap();
-        // INBOX.
         assert_eq!(
             lk.get(&root.join("cur")),
             Some(&("verbatim".into(), "INBOX".into()))
         );
-        // Real-subdir sub-folder with /-joined label.
         assert_eq!(
             lk.get(&root.join("Sent").join("cur")),
             Some(&("verbatim".into(), "Sent".into()))
@@ -841,15 +716,5 @@ mod tests {
             lk.get(&root.join("Archive").join("new")),
             Some(&("verbatim".into(), "Archive".into()))
         );
-        // Under verbatim: every folder root is a discovery root so
-        // nested sub-folder creates get caught.
-        let dr = discovery_roots.lock().unwrap();
-        assert_eq!(dr.get(&root), Some(&"verbatim".to_string()));
-        assert_eq!(dr.get(&root.join("Sent")), Some(&"verbatim".to_string()));
-        assert_eq!(
-            dr.get(&root.join("Sent").join("2024")),
-            Some(&"verbatim".to_string())
-        );
-        assert_eq!(dr.get(&root.join("Archive")), Some(&"verbatim".to_string()));
     }
 }
