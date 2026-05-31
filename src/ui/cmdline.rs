@@ -11,9 +11,9 @@ use crate::config::Config;
 use crate::mail::compose::{self as mail_compose, Draft};
 use crate::mail::parse;
 use crate::store::sync as store_sync;
-use crate::ui::app::{App, Mode, Screen};
+use crate::ui::app::{App, Mode, PendingSend, Screen};
 use crate::ui::browser;
-use crate::ui::compose::{ComposeScreen, ComposeStatus};
+use crate::ui::compose::ComposeScreen;
 
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.mode {
@@ -367,11 +367,37 @@ fn send_active(app: &mut App, cfg: &Config) {
             return;
         }
     };
-    let rx = mail_compose::start_send_worker(bytes, smtp_cmd, sent_cur_dir);
-    if let Some(c) = app.active_compose_mut() {
-        c.send_rx = Some(rx);
-        c.status = ComposeStatus::Sending;
+    let label = send_label(&draft);
+    let rx = mail_compose::start_send_worker(bytes, smtp_cmd, sent_cur_dir, app.event_tx.clone());
+    app.pending_sends.push(PendingSend {
+        rx,
+        label: label.clone(),
+    });
+    // `:send` always runs on a compose tab, so close_active_tab won't
+    // touch the inbox. Surface the close error defensively just in case.
+    if let Err(msg) = app.close_active_tab() {
+        app.status_error = Some(format!("send: {msg}"));
+        return;
     }
+    app.status_error = Some(format!("sending: {label}"));
+}
+
+/// Short identifier for a send used in the status row. Prefers the
+/// subject; falls back to the first recipient when the subject is
+/// empty so the user can still tell concurrent sends apart.
+fn send_label(draft: &Draft) -> String {
+    let subject = draft.subject.trim();
+    if !subject.is_empty() {
+        return subject.to_string();
+    }
+    draft
+        .to
+        .iter()
+        .chain(draft.cc.iter())
+        .chain(draft.bcc.iter())
+        .find(|r| !r.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "(no subject)".to_string())
 }
 
 /// Pub re-export of the cmdline `:compose` handler so the `c`

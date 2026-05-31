@@ -8,7 +8,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::picker::Picker;
 
 use crate::config::{Account, Config};
-use crate::mail::compose::SendOutcome;
+use crate::mail::compose::{SendOutcome, SendResult};
 use crate::mail::flags::{self, FlagOp};
 use crate::mail::html::{self, Block};
 use crate::mail::parse;
@@ -19,7 +19,7 @@ use crate::store::sync::SyncResult;
 use crate::store::thread::{ThreadedRow, build_threads};
 use crate::store::watch::{self, SelfWrites, Watcher, WatcherConfig, WatcherEvent};
 use crate::ui::clipboard::ClipboardResult;
-use crate::ui::compose::{ComposeScreen, ComposeStatus};
+use crate::ui::compose::ComposeScreen;
 use crate::ui::events::AppEvent;
 use crate::ui::images::{self, ImageKey, ResolvedImage};
 use crate::ui::search::SearchState;
@@ -137,6 +137,12 @@ pub struct App {
     /// `[sync].command` is running; cleared on completion. A second
     /// `:sync` while one is in flight errors out rather than queueing.
     pub sync_rx: Option<Receiver<SyncResult>>,
+    /// In-flight `:send` workers. `:send` closes the compose tab
+    /// immediately and pushes the worker's receiver here so completion
+    /// surfaces in the cmdline status row whichever tab the user is on.
+    /// `label` is a short subject-or-recipients identifier so the
+    /// status message disambiguates when multiple sends overlap.
+    pub pending_sends: Vec<PendingSend>,
     /// In-flight clipboard-fallback worker. `Some` while a yank pipe is
     /// running; cleared on completion. Concurrent yanks pile up
     /// receivers and the most recent one wins for status display —
@@ -154,6 +160,14 @@ pub struct App {
 pub enum Screen {
     Inbox(InboxScreen),
     Compose(ComposeScreen),
+}
+
+/// One in-flight send worker. Owned by `App` (not the compose tab) so
+/// `:send` can close the tab immediately and the result still surfaces
+/// when the worker reports back.
+pub struct PendingSend {
+    pub rx: Receiver<SendResult>,
+    pub label: String,
 }
 
 /// Per-screen state for the maildir reader: pane visibility/focus, scan
@@ -328,6 +342,7 @@ impl App {
             cache_path,
             self_writes,
             sync_rx: None,
+            pending_sends: Vec::new(),
             clipboard_rx: None,
             event_tx,
         }
@@ -380,40 +395,25 @@ impl App {
         }
     }
 
-    /// Drain any pending send-worker result on each compose tab.
-    /// Transitions `ComposeStatus` and surfaces a one-shot message to
-    /// the cmdline status row. Mirrors the `poll_scan` pattern.
-    pub fn poll_compose_sends(&mut self) {
-        let Self {
-            screens,
-            status_error,
-            ..
-        } = self;
-        for screen in screens.iter_mut() {
-            let Screen::Compose(c) = screen else { continue };
-            let Some(rx) = c.send_rx.as_ref() else {
-                continue;
-            };
-            match rx.try_recv() {
-                Ok(Ok(SendOutcome::Sent)) => {
-                    c.status = ComposeStatus::Sent;
-                    c.send_rx = None;
+    /// Drain finished send workers from `pending_sends`. `:send` closes
+    /// the compose tab synchronously, so the worker's result has no tab
+    /// to land on — it surfaces in the cmdline status row instead.
+    /// Successful sends overwrite any in-flight "sending: …" message
+    /// the user might still be looking at.
+    pub fn poll_pending_sends(&mut self) {
+        let mut i = 0;
+        while i < self.pending_sends.len() {
+            match self.pending_sends[i].rx.try_recv() {
+                Ok(result) => {
+                    let pending = self.pending_sends.swap_remove(i);
+                    self.status_error = Some(format_send_status(&pending.label, result));
                 }
-                Ok(Ok(SendOutcome::SentNoCopy(msg))) => {
-                    c.status = ComposeStatus::Sent;
-                    c.send_rx = None;
-                    *status_error = Some(format!("sent (no Sent copy: {msg})"));
+                Err(TryRecvError::Empty) => {
+                    i += 1;
                 }
-                Ok(Err(e)) => {
-                    c.status = ComposeStatus::Failed(e.clone());
-                    c.send_rx = None;
-                    *status_error = Some(format!("send failed: {e}"));
-                }
-                Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    c.status = ComposeStatus::Failed("send worker died".into());
-                    c.send_rx = None;
-                    *status_error = Some("send: worker died".into());
+                    let pending = self.pending_sends.swap_remove(i);
+                    self.status_error = Some(format!("send ({}): worker died", pending.label));
                 }
             }
         }
@@ -1881,6 +1881,14 @@ impl InboxScreen {
 /// single helper so the projection (resolving INBOX path, etc.)
 /// stays consistent across the eager scan, the catch-up, and the
 /// watcher's per-folder rescan paths.
+fn format_send_status(label: &str, result: SendResult) -> String {
+    match result {
+        Ok(SendOutcome::Sent) => format!("sent: {label}"),
+        Ok(SendOutcome::SentNoCopy(msg)) => format!("sent: {label} (no Sent copy: {msg})"),
+        Err(e) => format!("send failed ({label}): {e}"),
+    }
+}
+
 fn account_specs(cfg: &Config) -> Vec<AccountSpec> {
     cfg.accounts
         .iter()

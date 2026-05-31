@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mail_builder::MessageBuilder;
@@ -390,15 +390,21 @@ pub type SendResult = Result<SendOutcome, String>;
 /// over stdin and (on success) drops a copy in `sent_cur_dir` with the
 /// `:2,S` info suffix. Returns a one-shot receiver the UI polls each
 /// tick. Mirrors `store::scan::start_worker` so the polling pattern is
-/// identical.
+/// identical. When `event_tx` is plumbed in, the worker also pushes an
+/// `AppEvent::Wake` on completion so the main loop surfaces the result
+/// immediately rather than waiting for the next idle heartbeat.
 pub fn start_send_worker(
     bytes: Vec<u8>,
     smtp_cmd: Vec<String>,
     sent_cur_dir: Option<PathBuf>,
+    event_tx: Option<Sender<crate::ui::events::AppEvent>>,
 ) -> Receiver<SendResult> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(send_blocking(&bytes, &smtp_cmd, sent_cur_dir.as_deref()));
+        if let Some(wake) = event_tx {
+            let _ = wake.send(crate::ui::events::AppEvent::Wake);
+        }
     });
     rx
 }

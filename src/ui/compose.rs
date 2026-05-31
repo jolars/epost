@@ -5,7 +5,6 @@
 //! tempfile that persists for the tab's lifetime.
 
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -16,7 +15,7 @@ use ratatui::widgets::Paragraph;
 use tempfile::NamedTempFile;
 use tui_term::widget::PseudoTerminal;
 
-use crate::mail::compose::{Draft, SendResult};
+use crate::mail::compose::Draft;
 use crate::ui::embed::EditorSession;
 use crate::ui::style::pane_block;
 use crate::ui::text_input::TextInput;
@@ -29,14 +28,6 @@ pub enum ComposeField {
     Bcc,
     Subject,
     Body,
-}
-
-#[derive(Debug)]
-pub enum ComposeStatus {
-    Editing,
-    Sending,
-    Sent,
-    Failed(String),
 }
 
 pub struct ComposeScreen {
@@ -65,8 +56,6 @@ pub struct ComposeScreen {
     /// `compose::draw`. Used to size the pty when spawning and to
     /// resize it on terminal resize.
     pub last_body_inner: Option<(u16, u16)>,
-    pub status: ComposeStatus,
-    pub send_rx: Option<Receiver<SendResult>>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     /// Files queued for `multipart/mixed` attachment. Maintained by
@@ -102,8 +91,6 @@ impl ComposeScreen {
             editor_pending: true,
             editor: None,
             last_body_inner: None,
-            status: ComposeStatus::Editing,
-            send_rx: None,
             in_reply_to: draft.in_reply_to,
             references: draft.references,
             attachments: draft.attachments,
@@ -309,29 +296,16 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         f.render_widget(Paragraph::new(body_lines), body_inner);
     }
 
-    let hint = match &screen.status {
-        ComposeStatus::Editing if editing => Line::from(Span::styled(
+    let hint = if editing {
+        Line::from(Span::styled(
             " editing in $EDITOR — exit the editor (e.g. :wq) to return to the form ",
             Style::default().fg(Color::DarkGray),
-        )),
-        ComposeStatus::Editing => Line::from(Span::styled(
+        ))
+    } else {
+        Line::from(Span::styled(
             " Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
             Style::default().fg(Color::DarkGray),
-        )),
-        ComposeStatus::Sending => Line::from(Span::styled(
-            " sending… ",
-            Style::default().fg(Color::Yellow),
-        )),
-        ComposeStatus::Sent => Line::from(Span::styled(
-            " sent ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )),
-        ComposeStatus::Failed(e) => Line::from(Span::styled(
-            format!(" send failed: {e} "),
-            Style::default().fg(Color::Red),
-        )),
+        ))
     };
     f.render_widget(Paragraph::new(hint), hint_area);
 }
