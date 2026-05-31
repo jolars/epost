@@ -299,6 +299,19 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                 let mut body = layout_with_images(&parsed.blocks, inner_width, pick, |k| {
                     inbox.resolved_image(k)
                 });
+                if body.lines.is_empty()
+                    && let Some(plain) = parsed.plain_fallback.as_deref()
+                {
+                    body.lines
+                        .push(dim_line("(no HTML body, showing text/plain)"));
+                    body.line_text.push(String::new());
+                    body.line_block_idx.push(None);
+                    for ln in plain.lines() {
+                        body.lines.push(Line::raw(ln.to_string()));
+                        body.line_text.push(ln.to_string());
+                        body.line_block_idx.push(None);
+                    }
+                }
                 // Translate per-body image-slot indices into absolute
                 // line indices by offsetting by the header rows.
                 let offset = out.len();
@@ -309,17 +322,9 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                 body_only_lines_this_frame = body.lines.len().min(u16::MAX as usize) as u16;
                 header_lines = out;
                 let mut combined: Vec<Line<'static>> =
-                    Vec::with_capacity(header_lines.len() + body.lines.len() + 4);
+                    Vec::with_capacity(header_lines.len() + body.lines.len());
                 combined.extend(header_lines.iter().cloned());
                 combined.extend(body.lines.iter().cloned());
-                if body.lines.is_empty()
-                    && let Some(plain) = parsed.plain_fallback.as_deref()
-                {
-                    combined.push(dim_line("(no HTML body, showing text/plain)"));
-                    for ln in plain.lines() {
-                        combined.push(Line::raw(ln.to_string()));
-                    }
-                }
                 laid = Some(body);
                 combined
             }
