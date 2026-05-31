@@ -123,7 +123,7 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
 
     // Route to per-screen handlers.
     if let Some(Screen::Compose(c)) = app.screens.get_mut(app.active) {
-        compose::handle_key(c, k);
+        compose::handle_key(c, k, cfg);
         return;
     }
 

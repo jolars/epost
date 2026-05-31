@@ -11,10 +11,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tempfile::NamedTempFile;
 use tui_term::widget::PseudoTerminal;
 
+use crate::config::Config;
 use crate::mail::compose::Draft;
 use crate::ui::embed::EditorSession;
 use crate::ui::style::pane_block;
@@ -62,6 +63,32 @@ pub struct ComposeScreen {
     /// `:attach <path>` / `:detach <n>`; rendered as a read-only row in
     /// the compose header when non-empty.
     pub attachments: Vec<PathBuf>,
+    /// Open account-picker overlay. `Some` while the From dropdown is
+    /// active; `None` ambient. Triggered by Enter on the From field;
+    /// j/k or arrows navigate, Enter commits, Esc cancels. Selecting an
+    /// option rewrites both `account` (drives SMTP + Sent folder) and
+    /// `from` (the visible header) so changing the displayed identity
+    /// also changes the actual sending account.
+    pub from_picker: Option<FromPicker>,
+}
+
+/// One entry in the From dropdown: an account key (`[accounts.<name>]`)
+/// paired with its configured `from` display string. The picker is
+/// built from a `Config` snapshot at open time so it survives without a
+/// borrow back into the app's config.
+#[derive(Debug, Clone)]
+pub struct FromOption {
+    pub account: String,
+    pub from: String,
+}
+
+/// State for the active From dropdown. Options are sorted by account
+/// name so the list order is stable across opens regardless of
+/// `HashMap` iteration order.
+#[derive(Debug)]
+pub struct FromPicker {
+    pub options: Vec<FromOption>,
+    pub selected: usize,
 }
 
 impl ComposeScreen {
@@ -94,6 +121,7 @@ impl ComposeScreen {
             in_reply_to: draft.in_reply_to,
             references: draft.references,
             attachments: draft.attachments,
+            from_picker: None,
         })
     }
 
@@ -164,7 +192,18 @@ impl ComposeScreen {
 /// active — `ui::keys::handle` forwards everything to the pty when
 /// one is live, so this path only handles form editing (Tab cycles
 /// fields, `Alt-e` / `Enter` on Body requests a re-open of `$EDITOR`).
-pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent) {
+/// Takes `cfg` so the From-field Enter handler can build the account
+/// picker from `[accounts.*]` without reaching back to App.
+pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) {
+    // When the From picker is open, capture navigation/commit keys here
+    // and short-circuit the rest of the form dispatch. Anything we don't
+    // recognise is swallowed so a stray keystroke can't both edit a
+    // header field and dismiss the popup in one event.
+    if screen.from_picker.is_some() {
+        handle_from_picker_key(screen, k);
+        return;
+    }
+
     // Alt-e always requests editor; convenient from any header field.
     if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('e') {
         screen.editor_pending = true;
@@ -181,9 +220,72 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent) {
         }
         return;
     }
+    // Enter on the From field opens the account picker. The TextInput
+    // doesn't bind Enter, so claiming it here is non-breaking — manual
+    // editing of From still works for one-off display-name tweaks; the
+    // picker is for switching the *sending identity* (account, which
+    // drives SMTP routing and the Sent-folder destination).
+    if screen.focused == ComposeField::From && k.code == KeyCode::Enter {
+        open_from_picker(screen, cfg);
+        return;
+    }
     if let Some(input) = screen.focused_input_mut() {
         input.handle(k);
     }
+}
+
+fn open_from_picker(screen: &mut ComposeScreen, cfg: &Config) {
+    let options = collect_from_options(cfg);
+    if options.is_empty() {
+        return;
+    }
+    let selected = options
+        .iter()
+        .position(|o| o.account == screen.account)
+        .unwrap_or(0);
+    screen.from_picker = Some(FromPicker { options, selected });
+}
+
+fn handle_from_picker_key(screen: &mut ComposeScreen, k: KeyEvent) {
+    let Some(picker) = screen.from_picker.as_mut() else {
+        return;
+    };
+    match k.code {
+        KeyCode::Esc => {
+            screen.from_picker = None;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let last = picker.options.len().saturating_sub(1);
+            picker.selected = picker.selected.saturating_add(1).min(last);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            picker.selected = picker.selected.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            if let Some(opt) = picker.options.get(picker.selected).cloned() {
+                screen.account = opt.account;
+                screen.from = TextInput::from_string(opt.from);
+            }
+            screen.from_picker = None;
+        }
+        _ => {}
+    }
+}
+
+/// Build the From-dropdown choices from configured accounts. Sorted by
+/// account name so the list order is stable across opens (the underlying
+/// `HashMap` iteration order isn't).
+fn collect_from_options(cfg: &Config) -> Vec<FromOption> {
+    let mut opts: Vec<FromOption> = cfg
+        .accounts
+        .iter()
+        .map(|(name, acc)| FromOption {
+            account: name.clone(),
+            from: acc.from.clone(),
+        })
+        .collect();
+    opts.sort_by(|a, b| a.account.cmp(&b.account));
+    opts
 }
 
 /// Render the compose screen into `area`. Layout: a header block
@@ -212,9 +314,10 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         constraints.push(Constraint::Length(1));
     }
     let rows = Layout::vertical(constraints).split(header_inner);
+    let from_row = rows[0];
     render_field(
         f,
-        rows[0],
+        from_row,
         "From:    ",
         &screen.from,
         screen.focused == ComposeField::From,
@@ -301,6 +404,16 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
             " editing in $EDITOR — exit the editor (e.g. :wq) to return to the form ",
             Style::default().fg(Color::DarkGray),
         ))
+    } else if screen.from_picker.is_some() {
+        Line::from(Span::styled(
+            " ↑/↓ or j/k pick account  Enter select  Esc cancel ",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else if screen.focused == ComposeField::From {
+        Line::from(Span::styled(
+            " Enter pick account  Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
+            Style::default().fg(Color::DarkGray),
+        ))
     } else {
         Line::from(Span::styled(
             " Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
@@ -308,6 +421,81 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         ))
     };
     f.render_widget(Paragraph::new(hint), hint_area);
+
+    // The From dropdown overlays the form when open. Drawn last so it
+    // paints over whatever sits below the From row (To/Cc, the body
+    // pane, etc.). The Clear widget blanks the underlying cells so a
+    // rendered $EDITOR or body preview doesn't bleed through the popup.
+    if let Some(picker) = screen.from_picker.as_ref() {
+        draw_from_picker(f, from_row, picker, area);
+    }
+}
+
+/// Draw the account-picker dropdown anchored below the From row. Width
+/// is sized to the longest option (clamped to the available width), and
+/// the popup is positioned to stay inside `bounds` even when the From
+/// row is near the right edge.
+fn draw_from_picker(f: &mut Frame, from_row: Rect, picker: &FromPicker, bounds: Rect) {
+    // Indent the dropdown to align with the field contents, not the
+    // label — visually it then hangs off the editable area.
+    const LABEL_WIDTH: u16 = 9; // "From:    "
+
+    let max_option_width = picker
+        .options
+        .iter()
+        .map(|o| {
+            (o.account.chars().count() + " — ".chars().count() + o.from.chars().count()) as u16
+        })
+        .max()
+        .unwrap_or(20);
+    // 2 cells for the L/R border, 2 cells of inner padding.
+    let want_width = max_option_width.saturating_add(4).max(20);
+    let height = (picker.options.len() as u16).saturating_add(2);
+
+    let anchor_x = from_row.x.saturating_add(LABEL_WIDTH);
+    let available_width = bounds.right().saturating_sub(anchor_x).min(bounds.width);
+    let width = want_width.min(available_width).max(10);
+    let x = anchor_x.min(bounds.right().saturating_sub(width));
+    let y = from_row.y.saturating_add(1);
+    let max_height = bounds.bottom().saturating_sub(y);
+    let height = height.min(max_height).max(3);
+
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" From — pick account ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line<'static>> = picker
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            let selected = i == picker.selected;
+            let marker = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(marker.to_string(), style),
+                Span::styled(format!("{} — {}", opt.account, opt.from), style),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_field(f: &mut Frame, area: Rect, label: &str, input: &TextInput, focused: bool) {
