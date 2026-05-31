@@ -173,6 +173,10 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             app.cycle_focus(false);
             return;
         }
+        KeyCode::Char('n') => {
+            cmdline::open_blank_compose_external(app, cfg);
+            return;
+        }
         _ => {}
     }
 
