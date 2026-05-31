@@ -225,6 +225,30 @@ pub fn resolve_editor(c: &Compose) -> Vec<String> {
     raw.split_whitespace().map(String::from).collect()
 }
 
+/// Resolve the "default-when-no-scope" account: the one flagged
+/// `primary = true`, or the alphabetically-first account when none is
+/// flagged (or several are — multi-primary is treated as
+/// unconfigured so the choice stays deterministic). Returns the
+/// account's key (`[accounts.<name>]`); look the `Account` itself up
+/// via `cfg.accounts.get(...)`.
+pub fn primary_account_name(cfg: &Config) -> Option<String> {
+    let primaries: Vec<&String> = cfg
+        .accounts
+        .iter()
+        .filter(|(_, a)| a.primary)
+        .map(|(name, _)| name)
+        .collect();
+    if primaries.len() == 1 {
+        return Some(primaries[0].clone());
+    }
+    // None set, or more than one set: fall back to alphabetic first so
+    // the chosen default doesn't shift between runs (HashMap iteration
+    // order is not stable across hashes).
+    let mut names: Vec<&String> = cfg.accounts.keys().collect();
+    names.sort();
+    names.first().map(|s| (*s).clone())
+}
+
 /// Pick the SMTP command for a given account: account-local override
 /// first, then top-level `[smtp].command`, else error.
 pub fn smtp_command_for<'a>(cfg: &'a Config, account: &str) -> Result<&'a [String], String> {
@@ -328,6 +352,15 @@ pub struct Account {
     pub extra_folders: Vec<String>,
     #[serde(default)]
     pub smtp: Option<Smtp>,
+    /// Marks this account as the default identity for new (blank) sends
+    /// from the unified `[all]` scope, where there is no per-account
+    /// scope to imply a sender. Reply / reply-all / forward ignore this
+    /// flag and continue to use the originating message's account. If no
+    /// account is flagged (or the flag is set on more than one), the
+    /// resolver falls back to the alphabetically-first account so the
+    /// default stays stable across runs.
+    #[serde(default)]
+    pub primary: bool,
 }
 
 impl Account {
@@ -413,6 +446,70 @@ fn expand_tilde(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_account_returns_flagged_one() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [accounts.work]
+            maildir = "./w"
+            from = "W <w@example.invalid>"
+
+            [accounts.personal]
+            maildir = "./p"
+            from = "P <p@example.invalid>"
+            primary = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(primary_account_name(&cfg).as_deref(), Some("personal"));
+    }
+
+    #[test]
+    fn primary_account_falls_back_to_alphabetic_when_unset() {
+        // Two accounts, neither flagged → alphabetic-first tiebreaker
+        // so the resolver is deterministic across HashMap rehashes.
+        let cfg: Config = toml::from_str(
+            r#"
+            [accounts.work]
+            maildir = "./w"
+            from = "W <w@example.invalid>"
+
+            [accounts.personal]
+            maildir = "./p"
+            from = "P <p@example.invalid>"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(primary_account_name(&cfg).as_deref(), Some("personal"));
+    }
+
+    #[test]
+    fn primary_account_falls_back_when_multiple_flagged() {
+        // Ambiguous config (multiple primaries) collapses to the
+        // alphabetic-first tiebreaker rather than picking arbitrarily.
+        let cfg: Config = toml::from_str(
+            r#"
+            [accounts.work]
+            maildir = "./w"
+            from = "W <w@example.invalid>"
+            primary = true
+
+            [accounts.personal]
+            maildir = "./p"
+            from = "P <p@example.invalid>"
+            primary = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(primary_account_name(&cfg).as_deref(), Some("personal"));
+    }
+
+    #[test]
+    fn primary_account_none_for_empty_config() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(primary_account_name(&cfg).is_none());
+    }
 
     #[test]
     fn parses_minimal_dev_config() {
@@ -760,6 +857,7 @@ mod tests {
 
             extra_folders: Vec::new(),
             smtp: None,
+            primary: false,
         };
         // Inbox resolver still operates on Account directly.
         assert_eq!(acc.inbox_root(), root.join("Inbox"));

@@ -408,11 +408,32 @@ pub fn open_blank_compose_external(app: &mut App, cfg: &Config) {
 }
 
 fn open_blank_compose(app: &mut App, cfg: &Config) {
-    let Some((name, account)) = cfg.accounts.iter().next() else {
-        app.status_error = Some("compose: no accounts configured".into());
+    // Pre-select the From identity. From an account-scoped inbox the
+    // pre-selection is "obvious" — the scope itself implies the sender.
+    // From the unified `[all]` scope there is no implied account, so
+    // fall back to `[accounts.*].primary = true` (resolved by
+    // `config::primary_account_name`, which also handles the
+    // alphabetic-tiebreaker for "no primary set" / "multiple primaries").
+    // Either way the picker still opens via Enter on the From field if
+    // the user wants to switch identity before sending.
+    let name = match app.inbox().current_account.clone() {
+        Some(scoped) => scoped,
+        None => match config::primary_account_name(cfg) {
+            Some(n) => n,
+            None => {
+                app.status_error = Some("compose: no accounts configured".into());
+                return;
+            }
+        },
+    };
+    let Some(account) = cfg.accounts.get(&name) else {
+        // Defensive: scope name should always exist in cfg, but if the
+        // user removed the account from config and `:reload` lands, we
+        // shouldn't panic — surface a clean error instead.
+        app.status_error = Some(format!("compose: unknown account: {name}"));
         return;
     };
-    let draft = Draft::new_blank(name, &account.from);
+    let draft = Draft::new_blank(&name, &account.from);
     match ComposeScreen::from_draft(draft) {
         Ok(screen) => {
             app.open_compose(screen);

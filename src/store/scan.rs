@@ -300,6 +300,7 @@ mod tests {
             drafts: None,
             extra_folders: Vec::new(),
             smtp: None,
+            primary: false,
         };
         for (field, name) in roles {
             let v = Some(name.to_string());

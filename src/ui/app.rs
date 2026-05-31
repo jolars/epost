@@ -2336,6 +2336,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
 
                 extra_folders: Vec::new(),
                 smtp: None,
+                primary: false,
             },
         );
         cfg
@@ -2363,6 +2364,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
 
                     extra_folders: Vec::new(),
                     smtp: None,
+                    primary: false,
                 },
             );
             let inbox = tmp.path().join("Mail").join(name);
@@ -2599,6 +2601,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 drafts: None,
                 extra_folders: Vec::new(),
                 smtp: None,
+                primary: false,
             },
         );
         cfg
@@ -3132,6 +3135,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 drafts: None,
                 extra_folders: Vec::new(),
                 smtp: None,
+                primary: false,
             },
         );
         let root = tmp.path().join("Mail").join("personal");

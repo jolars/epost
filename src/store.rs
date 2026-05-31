@@ -120,6 +120,7 @@ mod tests {
             drafts: None,
             extra_folders: Vec::new(),
             smtp: None,
+            primary: false,
         }
     }
 

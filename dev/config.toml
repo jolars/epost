@@ -60,6 +60,10 @@ sent = "Sent"
 archive = "Archive"
 spam = "Spam"
 trash = "Trash"
+# `primary = true` pre-selects this account's identity in the From field
+# of new (blank) compose tabs opened from the unified `[all]` scope.
+# Reply / forward continue to use the originating message's account.
+primary = true
 
 [accounts.work]
 maildir = "./dev/scratch/maildir-work"

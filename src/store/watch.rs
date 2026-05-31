@@ -602,6 +602,7 @@ mod tests {
             drafts: None,
             extra_folders: extras.iter().map(|s| s.to_string()).collect(),
             smtp: None,
+            primary: false,
         };
         for (field, disk) in roles {
             let v = Some(disk.to_string());
