@@ -84,7 +84,24 @@ pub struct ComposeScreen {
     /// `from` (the visible header) so changing the displayed identity
     /// also changes the actual sending account.
     pub from_picker: Option<FromPicker>,
+    /// File this composer was loaded from in `Drafts/cur/`. `Some` when
+    /// the tab came from "Enter on a draft" — re-saving / `:send`
+    /// success uses it to delete the stale draft file. `None` for fresh
+    /// `:compose`, `:reply`, and `:forward` flows.
+    pub origin_draft_path: Option<PathBuf>,
+    /// Open close-confirm prompt. `Some` while the "Save / Discard /
+    /// Cancel" overlay is up; `None` ambient. Set by `:close` when the
+    /// composer is dirty; cleared by Cancel (or by Save on success).
+    pub confirm_close: Option<CloseConfirm>,
 }
+
+/// State for the close-confirm overlay. Currently a unit struct used
+/// as a presence flag — the prompt has no internal state beyond
+/// "open" — but kept as a named type so a future expansion (e.g.
+/// remembering which key arm errored last) doesn't need a struct
+/// rewrite.
+#[derive(Debug, Default)]
+pub struct CloseConfirm;
 
 /// One entry in the From dropdown: an account key (`[accounts.<name>]`)
 /// paired with its configured `from` display string. The picker is
@@ -139,6 +156,8 @@ impl ComposeScreen {
             references: draft.references,
             attachments: draft.attachments,
             from_picker: None,
+            origin_draft_path: None,
+            confirm_close: None,
         })
     }
 
@@ -170,6 +189,22 @@ impl ComposeScreen {
     pub fn body_is_dirty(&self) -> bool {
         let lines = self.body.textarea.lines();
         !(lines.len() == 1 && lines[0].is_empty())
+    }
+
+    /// True when any addressable field has content — drives the
+    /// "save draft?" prompt on `:close`. Conservative: a `:reply`
+    /// will always count as dirty because the template populates
+    /// To+Subject+quoted body. That's intended; the alternative
+    /// (touched-since-open tracking) silently loses content when the
+    /// dirty heuristic guesses wrong, and the user explicitly chose
+    /// the conservative version.
+    pub fn is_dirty(&self) -> bool {
+        !self.to.as_str().is_empty()
+            || !self.cc.as_str().is_empty()
+            || !self.bcc.as_str().is_empty()
+            || !self.subject.as_str().is_empty()
+            || !self.attachments.is_empty()
+            || self.body_is_dirty()
     }
 
     /// Build a Draft from the current field contents + native editor.
@@ -244,6 +279,16 @@ impl ComposeScreen {
 /// `:` `/` `?` from the body editor's Normal / Visual modes; the host
 /// uses them for `:`-cmdline / search). Everything else is consumed.
 pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyOutcome {
+    // Close-confirm prompt sits in front of everything else (including
+    // the From picker) so a stray keystroke during the prompt can't
+    // also drive form state. All keys are consumed; the Save and
+    // Discard arms bubble back to the host loop via the new
+    // `KeyOutcome` variants so it can call `close_active_tab` /
+    // `postpone_active` with the borrows it has and we don't.
+    if screen.confirm_close.is_some() {
+        return handle_confirm_close_key(screen, k);
+    }
+
     // When the From picker is open, capture navigation/commit keys here
     // and short-circuit the rest of the form dispatch. Anything we don't
     // recognise is swallowed so a stray keystroke can't both edit a
@@ -389,6 +434,36 @@ pub fn set_account(screen: &mut ComposeScreen, cfg: &Config, account: &str) -> R
     screen.from = TextInput::from_string(acc.from.clone());
     screen.from_picker = None;
     Ok(())
+}
+
+/// Close-confirm prompt key handler. The Save and Discard arms return
+/// a `KeyOutcome` variant the host loop acts on with `&mut App` in
+/// scope; Cancel just clears the prompt and stays in the composer.
+/// Any unrecognised key is consumed so it can't also reach the form.
+///
+/// On Save we deliberately leave `confirm_close` set: the host may
+/// fail to write the draft (no Drafts folder configured, disk full,
+/// …) and needs to keep the prompt up so the user can pick Discard
+/// or Cancel instead. The host clears `confirm_close` on success.
+fn handle_confirm_close_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutcome {
+    match k.code {
+        KeyCode::Esc => {
+            screen.confirm_close = None;
+            KeyOutcome::Consumed
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            screen.confirm_close = None;
+            KeyOutcome::Consumed
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyOutcome::SaveAndClose
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Char('n') | KeyCode::Char('N') => {
+            screen.confirm_close = None;
+            KeyOutcome::CloseTab
+        }
+        _ => KeyOutcome::Consumed,
+    }
 }
 
 fn handle_from_picker_key(screen: &mut ComposeScreen, k: KeyEvent) {
@@ -589,6 +664,62 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     if let Some(picker) = screen.from_picker.as_ref() {
         draw_from_picker(f, from_row, picker, area);
     }
+
+    // The Save / Discard / Cancel prompt sits in front of everything
+    // (including the From picker) — `handle_key` already routes input
+    // to it first, so rendering it last keeps the visual and logical
+    // layering in sync.
+    if screen.confirm_close.is_some() {
+        draw_confirm_close(f, area);
+    }
+}
+
+/// Centered confirmation popup: "Save draft? [S]ave / [D]iscard /
+/// [C]ancel". Visual grammar mirrors `draw_from_picker` (yellow
+/// border, `Clear`'d background) so the user reads them as the same
+/// class of modal.
+fn draw_confirm_close(f: &mut Frame, bounds: Rect) {
+    const WIDTH: u16 = 44;
+    const HEIGHT: u16 = 5;
+    let width = WIDTH.min(bounds.width);
+    let height = HEIGHT.min(bounds.height);
+    let x = bounds
+        .x
+        .saturating_add(bounds.width.saturating_sub(width) / 2);
+    let y = bounds
+        .y
+        .saturating_add(bounds.height.saturating_sub(height) / 2);
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Save draft? ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let body = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[S]", key_style),
+            Span::raw("ave   "),
+            Span::styled("[D]", key_style),
+            Span::raw("iscard   "),
+            Span::styled("[C]", key_style),
+            Span::raw("ancel"),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(body), inner);
 }
 
 /// Draw the account-picker dropdown anchored below the From row. Width

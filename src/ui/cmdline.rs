@@ -120,9 +120,26 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
         },
         "compose" => open_blank_compose(app, cfg),
         "sync" => dispatch_sync(app, cfg),
-        "close" => match app.close_active_tab() {
+        "close" => {
+            // Open the Save / Discard / Cancel prompt instead of
+            // dropping a half-written draft on the floor. The prompt's
+            // own key handler then re-issues close (or postpone) for
+            // real once the user picks an arm.
+            if let Some(Screen::Compose(c)) = app.screens.get_mut(app.active)
+                && c.is_dirty()
+                && c.confirm_close.is_none()
+            {
+                c.confirm_close = Some(compose::CloseConfirm);
+                return;
+            }
+            match app.close_active_tab() {
+                Ok(()) => {}
+                Err(msg) => app.status_error = Some(msg.into()),
+            }
+        }
+        "postpone" => match postpone_active(app, cfg) {
             Ok(()) => {}
-            Err(msg) => app.status_error = Some(msg.into()),
+            Err(e) => app.status_error = Some(format!("postpone: {e}")),
         },
         "send" => send_active(app, cfg),
         "edit" => escape_to_external_editor(app),
@@ -337,6 +354,7 @@ fn send_active(app: &mut App, cfg: &Config) {
         return;
     };
     let account_name = c.account.clone();
+    let origin_draft_path = c.origin_draft_path.clone();
     let draft = match c.collect_draft() {
         Ok(d) => d,
         Err(e) => {
@@ -374,6 +392,7 @@ fn send_active(app: &mut App, cfg: &Config) {
     app.pending_sends.push(PendingSend {
         rx,
         label: label.clone(),
+        origin_draft_path,
     });
     // `:send` always runs on a compose tab, so close_active_tab won't
     // touch the inbox. Surface the close error defensively just in case.
@@ -382,6 +401,67 @@ fn send_active(app: &mut App, cfg: &Config) {
         return;
     }
     app.status_error = Some(format!("sending: {label}"));
+}
+
+/// Save the active compose tab as a draft in the account's Drafts
+/// folder and close the tab. Shared between `:postpone` and the close
+/// prompt's "Save" arm; either entry point returns `Err` with a
+/// user-facing message on failure so the host can surface it in the
+/// status row (and, for the prompt path, keep the overlay up).
+pub fn postpone_active(app: &mut App, cfg: &Config) -> Result<(), String> {
+    // Snapshot what we need from the compose tab before releasing the
+    // mutable borrow — `app.self_writes` and `close_active_tab` both
+    // need it next.
+    let (account_name, draft, origin) = {
+        let Some(c) = app.active_compose_mut() else {
+            return Err("not on a compose tab".into());
+        };
+        let draft = c.collect_draft().map_err(|e| format!("read body: {e}"))?;
+        (c.account.clone(), draft, c.origin_draft_path.clone())
+    };
+
+    let Some(account) = cfg.accounts.get(&account_name) else {
+        return Err(format!("unknown account: {account_name}"));
+    };
+    let spec = crate::store::AccountSpec::from_account(&account_name, account);
+    let Some(drafts_binding) = spec.binding_by_role(crate::config::FolderRole::Drafts) else {
+        return Err(format!("no Drafts folder configured for {account_name}"));
+    };
+    let drafts_cur = drafts_binding.path.join("cur");
+
+    let saved = mail_compose::save_draft(&draft, &drafts_cur, &app.self_writes)
+        .map_err(|e| format!("save to {}: {e}", drafts_binding.path.display()))?;
+
+    // Delete the originating draft if this composer was opened from
+    // one. Record the self-write first so the maildir watcher doesn't
+    // echo the deletion back as an external change. A NotFound here
+    // (mbsync raced us, or the user deleted manually) is benign;
+    // anything else surfaces as a status hint but doesn't unsave the
+    // new draft we just wrote.
+    if let Some(old) = origin
+        && old != saved
+    {
+        app.self_writes.record(&old);
+        match std::fs::remove_file(&old) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                app.self_writes.consume(&old);
+            }
+            Err(e) => {
+                app.self_writes.consume(&old);
+                app.status_error = Some(format!("postpone: clean old draft: {e}"));
+            }
+        }
+    }
+
+    // Clear the prompt before tearing down the tab (the screen is
+    // about to drop, but the close-prompt's contract is "host clears
+    // on success" so be explicit).
+    if let Some(c) = app.active_compose_mut() {
+        c.confirm_close = None;
+    }
+    app.close_active_tab().map_err(|s| s.to_string())?;
+    Ok(())
 }
 
 /// Short identifier for a send used in the status row. Prefers the
@@ -486,6 +566,80 @@ fn open_blank_compose(app: &mut App, cfg: &Config) {
             app.status_error = Some(format!("compose: {e}"));
         }
     }
+}
+
+/// If the currently-selected list row sits in the active account's
+/// Drafts folder, open it in a new compose tab and return `true`.
+/// Returns `false` for non-Drafts rows so the caller can fall back to
+/// its default Enter behaviour (focusing the reader). Failures while
+/// opening a known-Drafts row surface in the status row and still
+/// return `true`; the caller treats them as "handled."
+pub fn resume_selected_draft_if_drafts(app: &mut App, cfg: &Config) -> bool {
+    let Some(row) = app.inbox().selected_row().map(|t| t.row.clone()) else {
+        return false;
+    };
+    let Some(account) = cfg.accounts.get(&row.account) else {
+        return false;
+    };
+    if account.drafts.as_deref() != Some(row.folder.as_str()) {
+        return false;
+    }
+
+    let path = row.path.clone();
+    let headers = match parse::read_headers(&path) {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            app.status_error = Some("resume: failed to parse headers".into());
+            return true;
+        }
+        Err(e) => {
+            app.status_error = Some(format!("resume: {e:#}"));
+            return true;
+        }
+    };
+    let body = match parse::read_body(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            app.status_error = Some(format!("resume: {e:#}"));
+            return true;
+        }
+    };
+    let attachment_count = parse::count_attachments(&path);
+
+    let body_text = body
+        .plain
+        .clone()
+        .or_else(|| body.html.clone())
+        .unwrap_or_default();
+
+    let draft = Draft {
+        account: row.account.clone(),
+        from: account.from.clone(),
+        to: headers.to.clone(),
+        cc: headers.cc.clone(),
+        bcc: headers.bcc.clone(),
+        subject: headers.subject.clone().unwrap_or_default(),
+        body: body_text,
+        in_reply_to: headers.in_reply.clone(),
+        references: headers.refs.clone(),
+        attachments: Vec::new(),
+    };
+
+    match ComposeScreen::from_draft(draft) {
+        Ok(mut screen) => {
+            screen.origin_draft_path = Some(path);
+            app.open_compose(screen);
+            if attachment_count > 0 {
+                app.status_error = Some(format!(
+                    "draft re-opened — {attachment_count} attachment(s) dropped, re-:attach as needed"
+                ));
+            }
+        }
+        Err(e) => {
+            app.status_error = Some(format!("resume: {e}"));
+        }
+    }
+    true
 }
 
 pub enum ReplyKind {

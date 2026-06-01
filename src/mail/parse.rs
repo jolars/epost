@@ -14,6 +14,10 @@ pub struct Headers {
     pub reply_to: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
+    /// `Bcc:` recipients. Almost never present on received mail (Bcc is
+    /// stripped en route by the sender's MTA), but a draft we wrote
+    /// ourselves into `Drafts/` retains it so resume can restore it.
+    pub bcc: Vec<String>,
     pub subject: Option<String>,
     pub in_reply: Option<String>,
     pub refs: Vec<String>,
@@ -82,6 +86,21 @@ pub fn read_headers(path: &Path) -> Result<Option<Headers>> {
     Ok(parse_headers(&bytes))
 }
 
+/// Count `multipart/*` attachment parts on the message at `path`.
+/// Used by the draft-resume path to warn that attachments are being
+/// dropped (v1 doesn't reconstruct them on the composer side).
+/// Returns 0 on a parse failure or an unparseable file rather than
+/// erroring — a missing warning is preferable to refusing to resume.
+pub fn count_attachments(path: &Path) -> usize {
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    let Some(msg) = MessageParser::default().parse(&bytes) else {
+        return 0;
+    };
+    msg.attachment_count()
+}
+
 pub fn parse_headers(bytes: &[u8]) -> Option<Headers> {
     let msg = MessageParser::default().parse_headers(bytes)?;
 
@@ -97,6 +116,7 @@ pub fn parse_headers(bytes: &[u8]) -> Option<Headers> {
     let reply_to = msg.reply_to().and_then(|addrs| format_addr(addrs.first()?));
     let to = collect_addrs(msg.to());
     let cc = collect_addrs(msg.cc());
+    let bcc = collect_addrs(msg.bcc());
 
     let subject = msg.subject().map(|s| s.to_string());
 
@@ -118,6 +138,7 @@ pub fn parse_headers(bytes: &[u8]) -> Option<Headers> {
         reply_to,
         to,
         cc,
+        bcc,
         subject,
         in_reply,
         refs,

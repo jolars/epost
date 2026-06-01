@@ -53,6 +53,15 @@ struct Yank {
 pub enum KeyOutcome {
     Consumed,
     PassThrough,
+    /// Compose-level signal: close the active tab without saving.
+    /// Used by the "discard" arm of the close-confirm prompt.
+    CloseTab,
+    /// Compose-level signal: save the draft, then close the active tab.
+    /// Used by the "save" arm of the close-confirm prompt and by the
+    /// equivalent `:postpone` keystroke when one is added. The body
+    /// editor never produces this — it bubbles up from the outer
+    /// compose key handler.
+    SaveAndClose,
 }
 
 pub struct BodyEditor {
@@ -710,8 +719,8 @@ fn extract_range(lines: &[String], start: (usize, usize), end: (usize, usize)) -
     let lo = start.1.min(first.len());
     out.extend(first[lo..].iter());
     out.push('\n');
-    for row in (start.0 + 1)..end.0 {
-        out.push_str(&lines[row]);
+    for line in lines.iter().take(end.0).skip(start.0 + 1) {
+        out.push_str(line);
         out.push('\n');
     }
     let last: Vec<char> = lines[end.0].chars().collect();
@@ -722,8 +731,8 @@ fn extract_range(lines: &[String], start: (usize, usize), end: (usize, usize)) -
 
 fn extract_lines(lines: &[String], start_row: usize, end_row: usize) -> String {
     let mut out = String::new();
-    for row in start_row..=end_row {
-        out.push_str(&lines[row]);
+    for line in lines.iter().take(end_row + 1).skip(start_row) {
+        out.push_str(line);
         out.push('\n');
     }
     out

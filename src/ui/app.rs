@@ -169,10 +169,18 @@ pub struct App {
 }
 
 /// A user-visible screen with its own tab in the strip and its own
-/// per-screen state.
+/// per-screen state. `Compose` is boxed to push the heavy
+/// `BodyEditor` / overlay state onto the heap; `InboxScreen` is left
+/// inline because most of its bulk (`search`, `parsed`, image cache)
+/// is already heap-owned via internal `Box`/`Vec`/`HashMap`. The
+/// remaining size delta between the two variants is intrinsic to the
+/// design — the inbox carries the live scan/watcher state — so the
+/// `large_enum_variant` lint is allowed locally rather than spent on
+/// boxing both variants.
+#[allow(clippy::large_enum_variant)]
 pub enum Screen {
     Inbox(InboxScreen),
-    Compose(ComposeScreen),
+    Compose(Box<ComposeScreen>),
 }
 
 /// One in-flight send worker. Owned by `App` (not the compose tab) so
@@ -181,6 +189,12 @@ pub enum Screen {
 pub struct PendingSend {
     pub rx: Receiver<SendResult>,
     pub label: String,
+    /// File the composer was loaded from in `Drafts/cur/`, snapshotted
+    /// at `:send` time. Deleted on a successful send so the draft
+    /// doesn't linger after the message goes out. Left alone on
+    /// `SentNoCopy` and on send failure so the user has a recovery
+    /// copy. `None` for fresh-compose / reply / forward sends.
+    pub origin_draft_path: Option<PathBuf>,
 }
 
 /// Per-screen state for the maildir reader: pane visibility/focus, scan
@@ -382,7 +396,7 @@ impl App {
 
     /// Push a new compose tab, mark it active, return its index.
     pub fn open_compose(&mut self, screen: ComposeScreen) -> usize {
-        self.screens.push(Screen::Compose(screen));
+        self.screens.push(Screen::Compose(Box::new(screen)));
         let idx = self.screens.len() - 1;
         self.active = idx;
         idx
@@ -421,6 +435,25 @@ impl App {
             match self.pending_sends[i].rx.try_recv() {
                 Ok(result) => {
                     let pending = self.pending_sends.swap_remove(i);
+                    // Clean up the originating draft only on full send
+                    // success — `SentNoCopy` and `Err` both leave the
+                    // user with something they may want to revisit, so
+                    // the draft stays put.
+                    if let (Some(path), Ok(SendOutcome::Sent)) =
+                        (pending.origin_draft_path.as_ref(), &result)
+                    {
+                        self.self_writes.record(path);
+                        match std::fs::remove_file(path) {
+                            Ok(()) => {}
+                            Err(_) => {
+                                // The send went through; missing draft
+                                // file is best-effort cleanup. Drop the
+                                // self-write record so a future write
+                                // at the same path isn't suppressed.
+                                self.self_writes.consume(path);
+                            }
+                        }
+                    }
                     self.status_error = Some(format_send_status(&pending.label, result));
                 }
                 Err(TryRecvError::Empty) => {

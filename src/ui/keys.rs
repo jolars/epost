@@ -137,6 +137,25 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
     if let Some(Screen::Compose(c)) = app.screens.get_mut(app.active) {
         match compose::handle_key(c, k, cfg) {
             compose::KeyOutcome::Consumed => return,
+            compose::KeyOutcome::CloseTab => {
+                // The close-confirm "Discard" arm. The prompt already
+                // cleared `confirm_close`; just drop the tab. The
+                // borrow check rules out an inbox tab here — `c` came
+                // from `Screen::Compose(_)` above.
+                let _ = app.close_active_tab();
+                return;
+            }
+            compose::KeyOutcome::SaveAndClose => {
+                // The close-confirm "Save" arm. On failure (e.g. no
+                // Drafts folder configured) leave the prompt up so the
+                // user can pick Discard or Cancel instead — the host
+                // call below only clears the prompt + closes the tab
+                // on success.
+                if let Err(e) = cmdline::postpone_active(app, cfg) {
+                    app.status_error = Some(format!("postpone: {e}"));
+                }
+                return;
+            }
             compose::KeyOutcome::PassThrough => {
                 // Fall through to the app-level handlers (only `:`
                 // currently). Any other passthrough key is eaten by
@@ -229,7 +248,18 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
             KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
             KeyCode::Char('F') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Forward),
-            KeyCode::Char('l') | KeyCode::Enter if app.inbox().reader_visible => {
+            KeyCode::Char('l') if app.inbox().reader_visible => {
+                app.inbox_mut().focus = Pane::Reader;
+            }
+            KeyCode::Enter
+                if !cmdline::resume_selected_draft_if_drafts(app, cfg)
+                    && app.inbox().reader_visible =>
+            {
+                // Enter on a row sitting in the active account's Drafts
+                // folder resumes the draft in a new composer (the
+                // `resume_*` call above returns true and short-circuits
+                // the guard). For any other folder, fall back to
+                // focusing the reader pane.
                 app.inbox_mut().focus = Pane::Reader;
             }
             KeyCode::Esc if app.inbox().search.is_some() => app.clear_search(),

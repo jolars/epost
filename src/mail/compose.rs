@@ -462,26 +462,75 @@ fn send_blocking(bytes: &[u8], smtp_cmd: &[String], sent_cur_dir: Option<&Path>)
     }
 }
 
-/// Write `bytes` into `cur_dir` as a maildir-spec `<unique>:2,S` file.
-/// Atomic via `tmp/<unique>` + rename. fsyncs the data file before the
-/// rename (the maildir spec requires it).
-pub fn deliver_sent(bytes: &[u8], cur_dir: &Path) -> io::Result<PathBuf> {
+/// Write `bytes` into `cur_dir` as a maildir-spec `<unique>:2,<flags>`
+/// file. Atomic via `tmp/<unique>` + rename. fsyncs the data file
+/// before the rename (the maildir spec requires it). Callers pass the
+/// per-role flag set: `"S"` for Sent, `"D"` for Drafts, etc.
+pub fn deliver_maildir_message(bytes: &[u8], cur_dir: &Path, flags: &str) -> io::Result<PathBuf> {
     let folder_root = cur_dir
         .parent()
-        .ok_or_else(|| io::Error::other("sent cur dir has no parent"))?;
+        .ok_or_else(|| io::Error::other("maildir cur dir has no parent"))?;
     let tmp_dir = folder_root.join("tmp");
     fs::create_dir_all(&tmp_dir)?;
     fs::create_dir_all(cur_dir)?;
 
     let unique = unique_filename();
     let tmp_path = tmp_dir.join(&unique);
-    let final_path = cur_dir.join(format!("{unique}:2,S"));
+    let final_path = cur_dir.join(format!("{unique}:2,{flags}"));
 
     let mut f = fs::File::create(&tmp_path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     drop(f);
     fs::rename(&tmp_path, &final_path)?;
+    Ok(final_path)
+}
+
+/// Sent-folder delivery — thin wrapper for the `:send` path.
+pub fn deliver_sent(bytes: &[u8], cur_dir: &Path) -> io::Result<PathBuf> {
+    deliver_maildir_message(bytes, cur_dir, "S")
+}
+
+/// Serialize `draft` and atomically write it to `drafts_cur` with the
+/// maildir `D` flag. Records both the tmp and final paths in
+/// `SelfWrites` *before* the rename so the notify watcher swallows its
+/// own write; both are consumed on error so a later genuine write at
+/// the same path isn't suppressed. Returns the final on-disk path.
+pub fn save_draft(
+    draft: &Draft,
+    drafts_cur: &Path,
+    sw: &crate::store::watch::SelfWrites,
+) -> io::Result<PathBuf> {
+    let bytes = serialize(draft)?;
+
+    let folder_root = drafts_cur
+        .parent()
+        .ok_or_else(|| io::Error::other("drafts cur dir has no parent"))?;
+    let tmp_dir = folder_root.join("tmp");
+    fs::create_dir_all(&tmp_dir)?;
+    fs::create_dir_all(drafts_cur)?;
+
+    let unique = unique_filename();
+    let tmp_path = tmp_dir.join(&unique);
+    let final_path = drafts_cur.join(format!("{unique}:2,D"));
+
+    sw.record(&tmp_path);
+    sw.record(&final_path);
+
+    let write_result = (|| -> io::Result<()> {
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        sw.consume(&tmp_path);
+        sw.consume(&final_path);
+        return Err(e);
+    }
     Ok(final_path)
 }
 
@@ -544,6 +593,7 @@ mod tests {
             reply_to: None,
             to: vec!["bob@example.com".into(), "Jane <jane@example.com>".into()],
             cc: vec!["carol@example.com".into()],
+            bcc: Vec::new(),
             subject: Some("Lunch?".into()),
             in_reply: None,
             refs: vec!["root@example.com".into()],
