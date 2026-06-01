@@ -153,6 +153,12 @@ pub struct App {
     /// `AppEvent::Wake` events. `None` in tests where no event loop is
     /// running.
     pub event_tx: Option<Sender<AppEvent>>,
+    /// Set by `finalize_finished_editors` when an embedded `$EDITOR`
+    /// exits — nvim/vim typically leaves the host cursor in whatever
+    /// shape `guicursor` last requested (often a bar). The main draw
+    /// loop drains this and emits `CSI 0 SP q` so the rest of the app
+    /// (and the user's shell after exit) doesn't inherit a stuck shape.
+    pub cursor_style_reset_pending: bool,
 }
 
 /// A user-visible screen with its own tab in the strip and its own
@@ -345,6 +351,7 @@ impl App {
             pending_sends: Vec::new(),
             clipboard_rx: None,
             event_tx,
+            cursor_style_reset_pending: false,
         }
     }
 

@@ -164,6 +164,14 @@ fn tick(
         .unwrap_or(ratatui::layout::Size::new(80, 24));
     spawn_pending_editors(app, &cfg.compose, term_size, event_tx);
 
+    // Drain any DECSCUSR changes the embedded editor asked for, plus
+    // a one-shot reset queued by `finalize_finished_editors`. We emit
+    // these inside the BSU/ESU braces below so the cursor-shape switch
+    // lands in the same atomic frame as the cell repaint — without that,
+    // some terminals flash the old shape between the cell draw and the
+    // shape change.
+    let cursor_style_bytes = collect_cursor_style_escapes(app);
+
     // DEC Synchronized Output (mode 2026): tell the host terminal to
     // buffer everything between BSU and ESU and apply it as one atomic
     // frame instead of painting cell-by-cell. Terminals that don't
@@ -175,6 +183,9 @@ fn tick(
     {
         let backend = terminal.backend_mut();
         let _ = backend.write_all(b"\x1b[?2026h");
+        if !cursor_style_bytes.is_empty() {
+            let _ = backend.write_all(&cursor_style_bytes);
+        }
     }
     // Drop the CompletedFrame here so terminal isn't still borrowed when
     // we reach for backend_mut() again to emit the ESU.
@@ -188,6 +199,32 @@ fn tick(
     Ok(())
 }
 
+/// Collect any cursor-shape changes the embedded editor(s) want to push
+/// to the host terminal this frame. Drains the per-session dirty flag so
+/// we don't re-emit the same shape every redraw, and folds in the
+/// one-shot reset queued by `finalize_finished_editors` when an editor
+/// exits. The bytes are written into the BSU/ESU envelope by the caller
+/// so the shape switch is part of the same atomic frame as the repaint.
+fn collect_cursor_style_escapes(app: &mut App) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for screen in app.screens.iter_mut() {
+        if let ui::app::Screen::Compose(c) = screen
+            && let Some(ed) = c.editor.as_ref()
+            && let Some(shape) = ed.take_cursor_style_change()
+        {
+            // `\x1b[N q` — DECSCUSR with the param the editor sent. 0
+            // restores the terminal default; 1..=6 are the standard
+            // blink/steady block/underline/bar combinations.
+            bytes.extend_from_slice(format!("\x1b[{shape} q").as_bytes());
+        }
+    }
+    if app.cursor_style_reset_pending {
+        app.cursor_style_reset_pending = false;
+        bytes.extend_from_slice(b"\x1b[0 q");
+    }
+    bytes
+}
+
 fn finalize_finished_editors(app: &mut App) {
     let mut to_finalize: Vec<usize> = Vec::new();
     for (i, screen) in app.screens.iter_mut().enumerate() {
@@ -198,12 +235,21 @@ fn finalize_finished_editors(app: &mut App) {
             to_finalize.push(i);
         }
     }
+    if to_finalize.is_empty() {
+        return;
+    }
     for i in to_finalize {
         if let Some(ui::app::Screen::Compose(c)) = app.screens.get_mut(i) {
             c.editor = None;
             c.reload_body_preview();
         }
     }
+    // The editor most likely left the host cursor style in whatever
+    // nvim's `guicursor` was using (bar for insert, etc.). Reset to the
+    // terminal's user default so the rest of the app — and any process
+    // launched after epost exits without going through LeaveAlternateScreen
+    // first — doesn't inherit a beam.
+    app.cursor_style_reset_pending = true;
 }
 
 fn spawn_pending_editors(

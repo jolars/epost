@@ -13,7 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tempfile::NamedTempFile;
-use tui_term::widget::PseudoTerminal;
+use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::config::Config;
 use crate::mail::compose::Draft;
@@ -372,10 +372,19 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     if let Some(ed) = screen.editor.as_mut() {
         if ed.is_primed() {
             ed.resize(body_inner.height, body_inner.width);
+            let hide = ed.hide_cursor();
+            let (c_row, c_col) = ed.cursor_position();
             ed.with_screen(|s| {
-                let widget = PseudoTerminal::new(s);
+                // Suppress tui-term's cell-painted cursor: we drive
+                // the real host cursor below so the user gets a
+                // genuine bar / block (DECSCUSR-controlled) instead
+                // of an always-block character pasted into the grid.
+                let widget = PseudoTerminal::new(s).cursor(Cursor::default().visibility(false));
                 f.render_widget(widget, body_inner);
             });
+            if !hide && c_row < body_inner.height && c_col < body_inner.width {
+                f.set_cursor_position((body_inner.x + c_col, body_inner.y + c_row));
+            }
         } else {
             let placeholder = Paragraph::new(Line::from(Span::styled(
                 "starting $EDITOR…",

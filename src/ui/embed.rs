@@ -44,6 +44,17 @@ struct ReplyCallbacks {
     /// thread drains this after each `parser.process()` call and forwards
     /// to the pty master writer.
     pending: Vec<u8>,
+    /// Latest DECSCUSR (`CSI Ps SP q`) parameter the hosted editor
+    /// requested. vt100 doesn't track cursor shape internally — without
+    /// this, nvim's insert-mode beam was being dropped silently. Values:
+    /// 0 = terminal default; 1 = blinking block; 2 = steady block;
+    /// 3 = blinking underline; 4 = steady underline;
+    /// 5 = blinking bar; 6 = steady bar.
+    cursor_shape: u16,
+    /// Set when `cursor_shape` changes; drained by
+    /// `EditorSession::take_cursor_style_change` so the main loop can
+    /// emit one `SetCursorStyle` per actual transition.
+    cursor_shape_dirty: bool,
 }
 
 impl vt100::Callbacks for ReplyCallbacks {
@@ -81,6 +92,17 @@ impl vt100::Callbacks for ReplyCallbacks {
                 let mode = first_param();
                 let reply = format!("\x1b[?{mode};0$y");
                 self.pending.extend_from_slice(reply.as_bytes());
+            }
+            // DECSCUSR: cursor shape. Captured here and surfaced via
+            // `EditorSession::take_cursor_style_change` because vt100
+            // itself doesn't model the shape — without this, nvim's
+            // bar-in-insert / block-in-normal switching was a no-op.
+            (Some(b' '), None, 'q') => {
+                let shape = first_param().min(6);
+                if shape != self.cursor_shape {
+                    self.cursor_shape = shape;
+                    self.cursor_shape_dirty = true;
+                }
             }
             _ => {}
         }
@@ -249,6 +271,35 @@ impl EditorSession {
     pub fn with_screen<R>(&self, f: impl FnOnce(&vt100::Screen) -> R) -> R {
         let parser = self.parser.lock().expect("parser poisoned");
         f(parser.screen())
+    }
+
+    /// Visible cursor position the embedded editor wants to point at,
+    /// in `(row, col)` cell coordinates relative to the pty grid.
+    pub fn cursor_position(&self) -> (u16, u16) {
+        self.with_screen(|s| s.cursor_position())
+    }
+
+    /// Whether the embedded editor has asked for the cursor to be
+    /// hidden (e.g. nvim during a redraw burst). When true the host
+    /// terminal cursor should not be positioned for this frame.
+    pub fn hide_cursor(&self) -> bool {
+        self.with_screen(|s| s.hide_cursor())
+    }
+
+    /// Drain a pending DECSCUSR change, if any. Returns the
+    /// most-recently-seen shape param (0..=6) so the caller can emit
+    /// `CSI Ps SP q` to the host terminal. Returns `None` when nothing
+    /// has changed since the last drain — keeps us from spamming the
+    /// host cursor-style escape on every frame.
+    pub fn take_cursor_style_change(&self) -> Option<u16> {
+        let mut p = self.parser.lock().ok()?;
+        let cb = p.callbacks_mut();
+        if cb.cursor_shape_dirty {
+            cb.cursor_shape_dirty = false;
+            Some(cb.cursor_shape)
+        } else {
+            None
+        }
     }
 
     pub fn is_done(&mut self) -> bool {
