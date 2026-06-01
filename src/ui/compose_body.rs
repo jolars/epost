@@ -17,6 +17,7 @@
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Style;
 use tui_textarea::{CursorMove, TextArea};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +70,16 @@ pub struct BodyEditor {
 impl BodyEditor {
     pub fn new(initial: &str) -> Self {
         let lines = split_for_textarea(initial);
-        let textarea = TextArea::new(lines);
+        let mut textarea = TextArea::new(lines);
+        // We draw the cursor ourselves via `f.set_cursor_position()` +
+        // DECSCUSR (block in Normal/Visual, bar in Insert), so kill
+        // tui-textarea's own cell-painted cursor — otherwise it shows a
+        // REVERSED block in Insert that looks wrong against the host
+        // bar and lingers as a stray white cell at EOL.
+        textarea.set_cursor_style(Style::default());
+        // Same reason: the default UNDERLINED highlight on the cursor
+        // line is jarring for prose composition.
+        textarea.set_cursor_line_style(Style::default());
         Self {
             textarea,
             mode: BodyMode::Normal,
@@ -131,10 +141,23 @@ impl BodyEditor {
             return KeyOutcome::Consumed;
         }
         if k.modifiers.contains(KeyModifiers::CONTROL) {
-            // Ctrl-* is mostly unbound in insert for v1; only handle the
-            // ones the host cares about. Ctrl-C falls through so the app
-            // can quit when there's no editor session — though normally
-            // the user would hit Esc first.
+            // Readline-flavoured editing chords that vim's insert mode
+            // also accepts. Everything else under Ctrl is swallowed (no
+            // accidental command-line / pane-cycling escape from insert).
+            match k.code {
+                KeyCode::Char('w') => {
+                    self.textarea.delete_word();
+                }
+                KeyCode::Char('u') => {
+                    self.textarea.delete_line_by_head();
+                }
+                KeyCode::Char('h') => {
+                    // Some terminals send Ctrl-H for Ctrl-Backspace; treat
+                    // as backspace so it isn't silently dropped.
+                    self.textarea.delete_char();
+                }
+                _ => {}
+            }
             return KeyOutcome::Consumed;
         }
         match k.code {
@@ -817,5 +840,31 @@ mod tests {
         feed(&mut ed, &[k('O'), k('x')]);
         assert_eq!(ed.text(), "x\nonly");
         assert_eq!(ed.mode, BodyMode::Insert);
+    }
+
+    #[test]
+    fn ctrl_w_in_insert_deletes_previous_word() {
+        let mut ed = BodyEditor::new("");
+        feed(&mut ed, &[k('i')]);
+        for c in "hello world".chars() {
+            ed.handle_key(k(c));
+        }
+        ed.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        // The exact split tui-textarea picks is its own concern; what we
+        // care about is that some leading prefix survives and "world"
+        // doesn't.
+        assert!(!ed.text().contains("world"), "got: {:?}", ed.text());
+        assert!(ed.text().starts_with("hello"), "got: {:?}", ed.text());
+    }
+
+    #[test]
+    fn ctrl_u_in_insert_deletes_to_line_start() {
+        let mut ed = BodyEditor::new("");
+        feed(&mut ed, &[k('i')]);
+        for c in "hello world".chars() {
+            ed.handle_key(k(c));
+        }
+        ed.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(ed.text(), "");
     }
 }

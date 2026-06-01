@@ -44,6 +44,13 @@ pub struct ComposeScreen {
     pub bcc: TextInput,
     pub subject: TextInput,
     pub focused: ComposeField,
+    /// Most recent non-`Body` field that held focus. Used by the
+    /// Ctrl-K "jump back to header" shortcut so a Ctrl-J → edit body →
+    /// Ctrl-K round-trip returns to the same row the user came from
+    /// (instead of always snapping to the first header). Updated by
+    /// `set_focus`, `focus_next`, `focus_prev`, and the From picker
+    /// commit path; never set to `Body` itself.
+    pub last_header_focused: ComposeField,
     /// Vim-style body editor. Always present; holds the canonical body
     /// text. When the user invokes `:edit`, the contents are flushed to
     /// `body_tempfile` and `$EDITOR` runs against that path; on exit we
@@ -116,10 +123,13 @@ impl ComposeScreen {
             cc: TextInput::from_string(draft.cc.join(", ")),
             bcc: TextInput::from_string(draft.bcc.join(", ")),
             subject: TextInput::from_string(draft.subject),
-            // Focus on the body so the native editor is immediately
-            // active. Mode starts in Normal (vim convention); the user
-            // hits `i` / `o` / `a` to start typing.
-            focused: ComposeField::Body,
+            // Start on To. New compose: it's empty and that's where the
+            // user types first. Reply/forward: it's pre-filled with the
+            // original sender(s); user can Ctrl-J straight to the body.
+            // Picked over From because From is a fixed identity normally
+            // changed via the picker (Enter), not by typing.
+            focused: ComposeField::To,
+            last_header_focused: ComposeField::To,
             body,
             editor_pending: false,
             editor: None,
@@ -178,26 +188,38 @@ impl ComposeScreen {
         })
     }
 
+    /// Switch focus to `field`, also pinning `last_header_focused`
+    /// whenever the destination is a header row. All focus changes
+    /// should go through here (Tab/BackTab, Ctrl-J/Ctrl-K, the From
+    /// picker commit) so the Ctrl-K "return to last header" jump always
+    /// points at the most recent header the user actually visited.
+    pub fn set_focus(&mut self, field: ComposeField) {
+        if field != ComposeField::Body {
+            self.last_header_focused = field;
+        }
+        self.focused = field;
+    }
+
     pub fn focus_next(&mut self) {
-        self.focused = match self.focused {
+        self.set_focus(match self.focused {
             ComposeField::From => ComposeField::To,
             ComposeField::To => ComposeField::Cc,
             ComposeField::Cc => ComposeField::Bcc,
             ComposeField::Bcc => ComposeField::Subject,
             ComposeField::Subject => ComposeField::Body,
             ComposeField::Body => ComposeField::From,
-        };
+        });
     }
 
     pub fn focus_prev(&mut self) {
-        self.focused = match self.focused {
+        self.set_focus(match self.focused {
             ComposeField::From => ComposeField::Body,
             ComposeField::To => ComposeField::From,
             ComposeField::Cc => ComposeField::To,
             ComposeField::Bcc => ComposeField::Cc,
             ComposeField::Subject => ComposeField::Bcc,
             ComposeField::Body => ComposeField::Subject,
-        };
+        });
     }
 
     fn focused_input_mut(&mut self) -> Option<&mut TextInput> {
@@ -237,6 +259,27 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
     if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('e') {
         screen.editor_pending = true;
         return KeyOutcome::Consumed;
+    }
+
+    // Ctrl-J / Ctrl-K: explicit header↔body jump. Intercepted before the
+    // body editor so they don't get swallowed by Insert mode or interpreted
+    // as half-page-up in Normal. From a header field, Ctrl-J also wins over
+    // the text input. Round-trippable: Ctrl-J from header → Body remembers
+    // the row, Ctrl-K from Body restores it via `last_header_focused`.
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        match k.code {
+            KeyCode::Char('j') => {
+                screen.set_focus(ComposeField::Body);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('k') => {
+                if screen.focused == ComposeField::Body {
+                    screen.set_focus(screen.last_header_focused);
+                }
+                return KeyOutcome::Consumed;
+            }
+            _ => {}
+        }
     }
 
     // Body: let the native vim editor have first crack. If it returns
@@ -467,11 +510,27 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
             f.render_widget(placeholder, body_inner);
         }
     } else {
-        // Native editor: tui-textarea paints its own cursor cell, so we
-        // don't call `f.set_cursor_position` here. Mode is signalled in
-        // the body block's title (NORMAL / INSERT / VISUAL) so the user
-        // still knows which keys do what.
+        // Native editor: tui-textarea's own cursor cell is disabled in
+        // `BodyEditor::new` so we drive the real host cursor here. Mode
+        // is signalled by DECSCUSR (steady block in Normal/Visual, steady
+        // bar in Insert) — emitted by the main loop's
+        // `collect_cursor_style_escapes` based on `body.mode`. The data
+        // cursor maps to (body_inner.x + col, body_inner.y + row); for
+        // bodies that fit in the pane (the typical case) there's no
+        // scroll to subtract. Bodies large enough to scroll the textarea
+        // will see a brief cursor-position drift until the next motion;
+        // acceptable v1 trade-off vs poking at tui-textarea internals.
         f.render_widget(&screen.body.textarea, body_inner);
+        if body_focused {
+            let (row, col) = screen.body.textarea.cursor();
+            let x = body_inner.x.saturating_add(col as u16);
+            let y = body_inner.y.saturating_add(row as u16);
+            if x < body_inner.x.saturating_add(body_inner.width)
+                && y < body_inner.y.saturating_add(body_inner.height)
+            {
+                f.set_cursor_position((x, y));
+            }
+        }
     }
 
     let hint = if editing {
@@ -638,5 +697,67 @@ fn title_for(draft: &Draft) -> String {
         "compose: (new)".to_string()
     } else {
         format!("compose: {subj}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mail::compose::Draft;
+
+    fn blank() -> ComposeScreen {
+        ComposeScreen::from_draft(Draft::new_blank("acct", "me <me@example.com>"))
+            .expect("compose screen")
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn fresh_compose_starts_on_to() {
+        let s = blank();
+        assert_eq!(s.focused, ComposeField::To);
+        assert_eq!(s.last_header_focused, ComposeField::To);
+    }
+
+    #[test]
+    fn ctrl_j_jumps_to_body_from_header() {
+        let mut s = blank();
+        s.set_focus(ComposeField::Cc);
+        let cfg = Config::default();
+        let out = handle_key(&mut s, key(KeyCode::Char('j'), KeyModifiers::CONTROL), &cfg);
+        assert!(matches!(out, KeyOutcome::Consumed));
+        assert_eq!(s.focused, ComposeField::Body);
+        // Last header should be the one we came from, so Ctrl-K returns there.
+        assert_eq!(s.last_header_focused, ComposeField::Cc);
+    }
+
+    #[test]
+    fn ctrl_k_from_body_returns_to_last_header() {
+        let mut s = blank();
+        s.set_focus(ComposeField::Subject);
+        let cfg = Config::default();
+        // Jump to body, then jump back.
+        handle_key(&mut s, key(KeyCode::Char('j'), KeyModifiers::CONTROL), &cfg);
+        assert_eq!(s.focused, ComposeField::Body);
+        handle_key(&mut s, key(KeyCode::Char('k'), KeyModifiers::CONTROL), &cfg);
+        assert_eq!(s.focused, ComposeField::Subject);
+    }
+
+    #[test]
+    fn tab_through_headers_updates_last_header_focused() {
+        let mut s = blank();
+        // To → Cc → Bcc via Tab.
+        s.focus_next();
+        s.focus_next();
+        assert_eq!(s.focused, ComposeField::Bcc);
+        assert_eq!(s.last_header_focused, ComposeField::Bcc);
+        // Tab to Subject then Body — Body shouldn't overwrite the
+        // last_header_focused marker.
+        s.focus_next();
+        s.focus_next();
+        assert_eq!(s.focused, ComposeField::Body);
+        assert_eq!(s.last_header_focused, ComposeField::Subject);
     }
 }
