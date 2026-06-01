@@ -104,26 +104,41 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
         }
     }
 
-    // `q` and `:` are global in Normal mode, regardless of active screen.
-    if k.code == KeyCode::Char('q') && !k.modifiers.contains(KeyModifiers::CONTROL) {
-        // In a compose tab, `q` should type a literal `q` into the
-        // focused field — never quit the app. Inbox keeps the old
-        // semantics.
-        if !matches!(app.screens.get(app.active), Some(Screen::Compose(_))) {
-            // Esc-after-commit: if a search is pinned and the user hits
-            // `q`, that's still quit. Search clearing lives on Esc.
-            app.quit = true;
-            return;
+    // `q` is global in Normal mode but never quits from a Compose tab
+    // (it should type a literal `q` into whichever field has focus).
+    if k.code == KeyCode::Char('q')
+        && !k.modifiers.contains(KeyModifiers::CONTROL)
+        && !matches!(app.screens.get(app.active), Some(Screen::Compose(_)))
+    {
+        app.quit = true;
+        return;
+    }
+
+    // Per-screen handlers run BEFORE the `:` cmdline intercept so the
+    // compose tab's native body editor (in Insert / Visual mode) can
+    // swallow `:` as a literal / selection key. Normal-mode body
+    // editor returns PassThrough for `:` so the cmdline still works.
+    if let Some(Screen::Compose(c)) = app.screens.get_mut(app.active) {
+        match compose::handle_key(c, k, cfg) {
+            compose::KeyOutcome::Consumed => return,
+            compose::KeyOutcome::PassThrough => {
+                // Fall through to the app-level handlers (only `:`
+                // currently). Any other passthrough key is eaten by
+                // the early-return below — no app-level binding
+                // should fire from inside a compose tab.
+            }
         }
     }
+
     if k.code == KeyCode::Char(':') {
         enter_command(app);
         return;
     }
 
-    // Route to per-screen handlers.
-    if let Some(Screen::Compose(c)) = app.screens.get_mut(app.active) {
-        compose::handle_key(c, k, cfg);
+    // Compose tab + body editor passed through but it's not `:`. Eat
+    // the key so a stray inbox binding doesn't fire while focus is on
+    // the compose form.
+    if matches!(app.screens.get(app.active), Some(Screen::Compose(_))) {
         return;
     }
 

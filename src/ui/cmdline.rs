@@ -125,6 +125,7 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
             Err(msg) => app.status_error = Some(msg.into()),
         },
         "send" => send_active(app, cfg),
+        "edit" => escape_to_external_editor(app),
         "reply" => open_reply(app, cfg, ReplyKind::Reply),
         "reply-all" => open_reply(app, cfg, ReplyKind::ReplyAll),
         "forward" => open_reply(app, cfg, ReplyKind::Forward),
@@ -407,6 +408,21 @@ pub fn open_blank_compose_external(app: &mut App, cfg: &Config) {
     open_blank_compose(app, cfg);
 }
 
+/// `:edit` — escape from the native body editor into `$EDITOR` under a
+/// pty. The main loop's `spawn_pending_editors` picks up the flag,
+/// flushes the body to a tempfile, and starts the pty session.
+fn escape_to_external_editor(app: &mut App) {
+    let Some(c) = app.active_compose_mut() else {
+        app.status_error = Some("edit: not on a compose tab".into());
+        return;
+    };
+    if c.editor.is_some() {
+        app.status_error = Some("edit: editor already active".into());
+        return;
+    }
+    c.editor_pending = true;
+}
+
 fn open_blank_compose(app: &mut App, cfg: &Config) {
     // Pre-select the From identity. From an account-scoped inbox the
     // pre-selection is "obvious" — the scope itself implies the sender.
@@ -435,7 +451,14 @@ fn open_blank_compose(app: &mut App, cfg: &Config) {
     };
     let draft = Draft::new_blank(&name, &account.from);
     match ComposeScreen::from_draft(draft) {
-        Ok(screen) => {
+        Ok(mut screen) => {
+            // `[compose].mode = "external"`: behave like the old
+            // pty-only path and spawn `$EDITOR` as soon as the tab
+            // renders. Otherwise the native editor is active and the
+            // user invokes `:edit` on demand.
+            if matches!(cfg.compose.mode, config::ComposeMode::External) {
+                screen.editor_pending = true;
+            }
             app.open_compose(screen);
         }
         Err(e) => {
@@ -489,7 +512,10 @@ pub fn open_reply(app: &mut App, cfg: &Config, kind: ReplyKind) {
         ReplyKind::Forward => Draft::forward(&headers, &body, &row.account, &from),
     };
     match ComposeScreen::from_draft(draft) {
-        Ok(screen) => {
+        Ok(mut screen) => {
+            if matches!(cfg.compose.mode, config::ComposeMode::External) {
+                screen.editor_pending = true;
+            }
             app.open_compose(screen);
         }
         Err(e) => {

@@ -137,7 +137,7 @@ fn tab_label(screen: &Screen) -> String {
     match screen {
         Screen::Inbox(_) => "INBOX".to_string(),
         Screen::Compose(c) => {
-            let dirty = if c.body_dirty { "*" } else { "" };
+            let dirty = if c.body_is_dirty() { "*" } else { "" };
             format!("{}{dirty}", c.title)
         }
     }

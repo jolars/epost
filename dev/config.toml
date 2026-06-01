@@ -41,6 +41,17 @@ global_folders = ["INBOX", "Archive", "Sent"]
 protocol = "auto"
 max_height_cells = 24
 
+[compose]
+# `native` (default) → built-in vim-style body editor lives inside the
+# ratatui frame; `:edit` escapes into `$EDITOR` on demand for one
+# session. `external` → behave like the pre-native path: spawn `$EDITOR`
+# under a pty as soon as a compose tab opens. Set this to `external`
+# when load-testing the pty escape hatch under `task dev`.
+mode = "native"
+# Optional override for the external editor command (used by `:edit`
+# and by `mode = "external"`). Unset → `$VISUAL` / `$EDITOR` / `vi`.
+# editor = "nvim -c 'set ft=mail'"
+
 # Three dev accounts pointing at scratch maildirs. `dev/maildir/`,
 # `dev/maildir-work/`, and `dev/maildir-verbatim/` are the tracked,
 # immutable fixtures; `task dev` / `task run` mirror them into

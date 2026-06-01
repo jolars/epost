@@ -241,7 +241,11 @@ fn finalize_finished_editors(app: &mut App) {
     for i in to_finalize {
         if let Some(ui::app::Screen::Compose(c)) = app.screens.get_mut(i) {
             c.editor = None;
-            c.reload_body_preview();
+            // Pull the user's edits from the tempfile back into the
+            // native body editor, then drop the tempfile. The native
+            // editor is the canonical store from here on; the tempfile
+            // only existed for the `$EDITOR` round-trip.
+            c.reload_body_from_tempfile();
         }
     }
     // The editor most likely left the host cursor style in whatever
@@ -271,11 +275,25 @@ fn spawn_pending_editors(
         let (rows, cols) = c
             .last_body_inner
             .unwrap_or_else(|| compose_body_inner_size(term_size));
-        match EditorSession::start(&c.body_path(), &argv, rows, cols, event_tx.clone()) {
+        // Flush the native editor to a tempfile and hand the path to
+        // `$EDITOR`. The tempfile lives on the screen for the duration
+        // of the session; on exit, `finalize_finished_editors` reads it
+        // back into the native editor and drops it.
+        let path = match c.materialize_body_tempfile() {
+            Ok(p) => p,
+            Err(e) => {
+                to_error = Some(format!("editor: {e:#}"));
+                continue;
+            }
+        };
+        match EditorSession::start(&path, &argv, rows, cols, event_tx.clone()) {
             Ok(session) => {
                 c.editor = Some(session);
             }
             Err(e) => {
+                // Drop the tempfile so a retry rebuilds it from the
+                // current editor contents.
+                c.body_tempfile = None;
                 to_error = Some(format!("editor: {e:#}"));
             }
         }

@@ -205,12 +205,27 @@ fn default_global_folders() -> Vec<String> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compose {
-    /// Editor command for the compose body. May contain whitespace-
-    /// separated arguments (e.g. `"vim -c 'set ft=mail'"`); quoting is
-    /// not parsed in v1. If unset, falls back to `$VISUAL` / `$EDITOR` /
-    /// `vi` at spawn time.
+    /// Editor backend for the body region. `native` (default) uses the
+    /// built-in vim-style editor inside the ratatui frame; `external`
+    /// auto-spawns `$EDITOR` under a pty when a compose tab opens. The
+    /// native editor can always escape to `$EDITOR` on demand via
+    /// `:edit`, regardless of this setting.
+    #[serde(default)]
+    pub mode: ComposeMode,
+    /// External editor command, used by `:edit` and by `mode = "external"`.
+    /// May contain whitespace-separated arguments (e.g.
+    /// `"vim -c 'set ft=mail'"`); quoting is not parsed in v1. If unset,
+    /// falls back to `$VISUAL` / `$EDITOR` / `vi` at spawn time.
     #[serde(default)]
     pub editor: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComposeMode {
+    #[default]
+    Native,
+    External,
 }
 
 /// Resolve the editor argv at spawn time. Done late (not at parse) so

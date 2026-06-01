@@ -1,8 +1,10 @@
 //! Compose screen: aerc-style form for one in-flight draft. Lives in
 //! its own tab so the user can `Ctrl-PgDn` away to other work and come
 //! back. Header fields (From / To / Cc / Bcc / Subject) edit in-place
-//! via `TextInput`; the body is delegated to `$EDITOR` against a
-//! tempfile that persists for the tab's lifetime.
+//! via `TextInput`; the body is owned by a vim-style native editor
+//! ([`crate::ui::compose_body::BodyEditor`]). `:edit` materialises the
+//! body to a tempfile and hands it to `$EDITOR` under a pty for users
+//! who want their heavy editor config.
 
 use std::path::PathBuf;
 
@@ -17,6 +19,8 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::config::Config;
 use crate::mail::compose::Draft;
+pub use crate::ui::compose_body::KeyOutcome;
+use crate::ui::compose_body::{BodyEditor, BodyMode, VisualKind};
 use crate::ui::embed::EditorSession;
 use crate::ui::style::pane_block;
 use crate::ui::text_input::TextInput;
@@ -40,19 +44,22 @@ pub struct ComposeScreen {
     pub bcc: TextInput,
     pub subject: TextInput,
     pub focused: ComposeField,
-    /// Tempfile holding the body text. Kept alive for the tab's
-    /// lifetime so reopening $EDITOR shows the prior draft.
-    body_file: NamedTempFile,
-    pub body_preview: String,
-    pub body_dirty: bool,
-    /// Set by the keymap when the user requests `$EDITOR`; the main loop
-    /// turns this into a live `EditorSession` once the next draw has
-    /// measured the body area.
+    /// Vim-style body editor. Always present; holds the canonical body
+    /// text. When the user invokes `:edit`, the contents are flushed to
+    /// `body_tempfile` and `$EDITOR` runs against that path; on exit we
+    /// read the tempfile back into here and drop it.
+    pub body: BodyEditor,
+    /// Set by `:edit` (or by the `mode = "external"` config branch at
+    /// tab open) to ask the main loop to spawn an `$EDITOR` session
+    /// against the body. Cleared once the session is live.
     pub editor_pending: bool,
     /// Embedded `$EDITOR` pty + parsed screen. While `Some`, all
     /// keys forward to the pty and the body region renders the
-    /// editor inline (aerc-style).
+    /// editor inline. Transient: lifetime of one `$EDITOR` invocation.
     pub editor: Option<EditorSession>,
+    /// Transient tempfile owning the body text while `$EDITOR` is live.
+    /// Created right before spawn, dropped after the post-exit reload.
+    pub body_tempfile: Option<NamedTempFile>,
     /// Most recent body rect (inner of the body block) recorded by
     /// `compose::draw`. Used to size the pty when spawning and to
     /// resize it on terminal resize.
@@ -92,14 +99,15 @@ pub struct FromPicker {
 }
 
 impl ComposeScreen {
+    /// Build a fresh compose screen from a Draft. The native body
+    /// editor is initialised with `draft.body` (so quoted text for
+    /// replies and forwards lands in the editor); `editor_pending`
+    /// starts false. Callers that want `$EDITOR` to auto-spawn on tab
+    /// open (the `mode = "external"` config branch) flip
+    /// `editor_pending = true` after constructing.
     pub fn from_draft(draft: Draft) -> std::io::Result<Self> {
-        let body_file = NamedTempFile::with_prefix("epost-body-")?;
-        if !draft.body.is_empty() {
-            std::fs::write(body_file.path(), &draft.body)?;
-        }
-        let body_preview = preview_of(&draft.body);
-        let body_dirty = !draft.body.is_empty();
         let title = title_for(&draft);
+        let body = BodyEditor::new(&draft.body);
         Ok(Self {
             title,
             account: draft.account,
@@ -108,15 +116,14 @@ impl ComposeScreen {
             cc: TextInput::from_string(draft.cc.join(", ")),
             bcc: TextInput::from_string(draft.bcc.join(", ")),
             subject: TextInput::from_string(draft.subject),
-            // Aerc-style: focus starts on the body and the editor
-            // spawns immediately, so switching to this tab lands the
-            // user inside `$EDITOR` with no transition.
+            // Focus on the body so the native editor is immediately
+            // active. Mode starts in Normal (vim convention); the user
+            // hits `i` / `o` / `a` to start typing.
             focused: ComposeField::Body,
-            body_file,
-            body_preview,
-            body_dirty,
-            editor_pending: true,
+            body,
+            editor_pending: false,
             editor: None,
+            body_tempfile: None,
             last_body_inner: None,
             in_reply_to: draft.in_reply_to,
             references: draft.references,
@@ -125,13 +132,38 @@ impl ComposeScreen {
         })
     }
 
-    pub fn body_path(&self) -> PathBuf {
-        self.body_file.path().to_path_buf()
+    /// Materialise the current body to a fresh tempfile, store the
+    /// tempfile on the screen so it stays alive while `$EDITOR` runs,
+    /// and return the path to hand to the pty. Used by both the
+    /// explicit `:edit` flow and the `mode = "external"` auto-spawn.
+    pub fn materialize_body_tempfile(&mut self) -> std::io::Result<PathBuf> {
+        let f = NamedTempFile::with_prefix("epost-body-")?;
+        std::fs::write(f.path(), self.body.text())?;
+        let path = f.path().to_path_buf();
+        self.body_tempfile = Some(f);
+        Ok(path)
     }
 
-    /// Build a Draft from the current field contents + body tempfile.
+    /// Read the body tempfile back into the native editor and drop the
+    /// tempfile. Called by the main loop after the `$EDITOR` session
+    /// finishes.
+    pub fn reload_body_from_tempfile(&mut self) {
+        if let Some(f) = self.body_tempfile.take() {
+            let text = std::fs::read_to_string(f.path()).unwrap_or_default();
+            self.body.set_text(&text);
+        }
+    }
+
+    /// True when the body has user-typed content (or pre-filled
+    /// quoted text from reply/forward). Drives the `*` marker on the
+    /// tab label. Cheap — we just check whether the textarea is empty.
+    pub fn body_is_dirty(&self) -> bool {
+        let lines = self.body.textarea.lines();
+        !(lines.len() == 1 && lines[0].is_empty())
+    }
+
+    /// Build a Draft from the current field contents + native editor.
     pub fn collect_draft(&self) -> std::io::Result<Draft> {
-        let body = std::fs::read_to_string(self.body_file.path()).unwrap_or_default();
         Ok(Draft {
             account: self.account.clone(),
             from: self.from.as_str().to_string(),
@@ -139,19 +171,11 @@ impl ComposeScreen {
             cc: split_addresses(self.cc.as_str()),
             bcc: split_addresses(self.bcc.as_str()),
             subject: self.subject.as_str().to_string(),
-            body,
+            body: self.body.text(),
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             attachments: self.attachments.clone(),
         })
-    }
-
-    /// Refresh `body_preview` from the tempfile contents (called by
-    /// the main loop after $EDITOR returns).
-    pub fn reload_body_preview(&mut self) {
-        let text = std::fs::read_to_string(self.body_file.path()).unwrap_or_default();
-        self.body_preview = preview_of(&text);
-        self.body_dirty = !text.is_empty();
     }
 
     pub fn focus_next(&mut self) {
@@ -188,37 +212,69 @@ impl ComposeScreen {
     }
 }
 
-/// Compose-mode key dispatch. Only called when no editor session is
-/// active — `ui::keys::handle` forwards everything to the pty when
-/// one is live, so this path only handles form editing (Tab cycles
-/// fields, `Alt-e` / `Enter` on Body requests a re-open of `$EDITOR`).
-/// Takes `cfg` so the From-field Enter handler can build the account
-/// picker from `[accounts.*]` without reaching back to App.
-pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) {
+/// Compose-mode key dispatch. Only called when no `$EDITOR` pty
+/// session is active — `ui::keys::handle` forwards everything to the
+/// pty when one is live, so this path handles form-level navigation
+/// plus the native body editor.
+///
+/// Returns [`KeyOutcome::PassThrough`] when the key should fall through
+/// to app-level dispatch (the only currently-passthrough keys are
+/// `:` `/` `?` from the body editor's Normal / Visual modes; the host
+/// uses them for `:`-cmdline / search). Everything else is consumed.
+pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyOutcome {
     // When the From picker is open, capture navigation/commit keys here
     // and short-circuit the rest of the form dispatch. Anything we don't
     // recognise is swallowed so a stray keystroke can't both edit a
     // header field and dismiss the popup in one event.
     if screen.from_picker.is_some() {
         handle_from_picker_key(screen, k);
-        return;
+        return KeyOutcome::Consumed;
     }
 
-    // Alt-e always requests editor; convenient from any header field.
+    // Alt-e drops into `$EDITOR` from any field. Same end result as
+    // `:edit`, just a chord. Kept for muscle memory from the old
+    // external-only flow.
     if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('e') {
         screen.editor_pending = true;
-        return;
+        return KeyOutcome::Consumed;
     }
-    match k.code {
-        KeyCode::Tab => screen.focus_next(),
-        KeyCode::BackTab => screen.focus_prev(),
-        _ => {}
-    }
+
+    // Body: let the native vim editor have first crack. If it returns
+    // PassThrough (only happens from Normal/Visual, for `:` `/` `?`),
+    // the caller will route the key to the app dispatch. Tab/BackTab
+    // also passes through the editor and we use it below to cycle out
+    // of the body to other fields.
     if screen.focused == ComposeField::Body {
-        if matches!(k.code, KeyCode::Enter | KeyCode::Char('e')) {
-            screen.editor_pending = true;
+        if let KeyOutcome::Consumed = screen.body.handle_key(k) {
+            return KeyOutcome::Consumed;
         }
-        return;
+        // Tab / BackTab: cycle fields. Other passthroughs (`:` etc.)
+        // are routed up to the app.
+        match k.code {
+            KeyCode::Tab => {
+                screen.focus_next();
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::BackTab => {
+                screen.focus_prev();
+                return KeyOutcome::Consumed;
+            }
+            _ => return KeyOutcome::PassThrough,
+        }
+    }
+
+    // Non-Body fields: Tab/BackTab cycle the form, Enter on From opens
+    // the picker, otherwise route to the TextInput.
+    match k.code {
+        KeyCode::Tab => {
+            screen.focus_next();
+            return KeyOutcome::Consumed;
+        }
+        KeyCode::BackTab => {
+            screen.focus_prev();
+            return KeyOutcome::Consumed;
+        }
+        _ => {}
     }
     // Enter on the From field opens the account picker. The TextInput
     // doesn't bind Enter, so claiming it here is non-breaking — manual
@@ -227,10 +283,35 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) {
     // drives SMTP routing and the Sent-folder destination).
     if screen.focused == ComposeField::From && k.code == KeyCode::Enter {
         open_from_picker(screen, cfg);
-        return;
+        return KeyOutcome::Consumed;
     }
     if let Some(input) = screen.focused_input_mut() {
         input.handle(k);
+    }
+    KeyOutcome::Consumed
+}
+
+fn body_block_title(screen: &ComposeScreen, editing: bool, focused: bool) -> String {
+    if editing {
+        return "Body — $EDITOR (exit the editor to return to the form)".into();
+    }
+    if !focused {
+        return "Body".into();
+    }
+    let mode = match screen.body.mode {
+        BodyMode::Normal => "NORMAL",
+        BodyMode::Insert => "INSERT",
+        BodyMode::Visual(VisualKind::Char) => "VISUAL",
+        BodyMode::Visual(VisualKind::Line) => "V-LINE",
+    };
+    format!("Body — {mode}")
+}
+
+fn native_body_hint(body: &BodyEditor) -> &'static str {
+    match body.mode {
+        BodyMode::Insert => " -- INSERT --  Esc to leave  :send  :close ",
+        BodyMode::Visual(_) => " -- VISUAL --  y yank  d delete  c change  Esc cancel ",
+        BodyMode::Normal => " i insert  v/V visual  yy/dd/p yank/del/paste  :edit  :send  :close ",
     }
 }
 
@@ -355,16 +436,9 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     }
 
     let editing = screen.editor.is_some();
-    let body_block = pane_block(
-        if editing {
-            "Body — $EDITOR (exit the editor to return to the form)"
-        } else if screen.focused == ComposeField::Body {
-            "Body (Enter/e to edit)"
-        } else {
-            "Body"
-        },
-        screen.focused == ComposeField::Body || editing,
-    );
+    let body_focused = screen.focused == ComposeField::Body;
+    let body_title = body_block_title(screen, editing, body_focused);
+    let body_block = pane_block(&body_title, body_focused || editing);
     let body_inner = body_block.inner(body_area);
     screen.last_body_inner = Some((body_inner.height, body_inner.width));
     f.render_widget(body_block, body_area);
@@ -393,19 +467,11 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
             f.render_widget(placeholder, body_inner);
         }
     } else {
-        let body_lines: Vec<Line<'static>> = if screen.body_preview.is_empty() {
-            vec![Line::from(Span::styled(
-                "(editor closed — press e to re-open, :send to send)",
-                Style::default().fg(Color::DarkGray),
-            ))]
-        } else {
-            screen
-                .body_preview
-                .lines()
-                .map(|l| Line::raw(l.to_string()))
-                .collect()
-        };
-        f.render_widget(Paragraph::new(body_lines), body_inner);
+        // Native editor: tui-textarea paints its own cursor cell, so we
+        // don't call `f.set_cursor_position` here. Mode is signalled in
+        // the body block's title (NORMAL / INSERT / VISUAL) so the user
+        // still knows which keys do what.
+        f.render_widget(&screen.body.textarea, body_inner);
     }
 
     let hint = if editing {
@@ -416,6 +482,11 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     } else if screen.from_picker.is_some() {
         Line::from(Span::styled(
             " ↑/↓ or j/k pick account  Enter select  Esc cancel ",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else if body_focused {
+        Line::from(Span::styled(
+            native_body_hint(&screen.body),
             Style::default().fg(Color::DarkGray),
         ))
     } else if screen.focused == ComposeField::From {
@@ -552,10 +623,6 @@ fn render_attachments_row(f: &mut Frame, area: Rect, attachments: &[PathBuf]) {
         .join(", ");
     let spans = vec![Span::styled("Attach:  ", label_style), Span::raw(body)];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn preview_of(body: &str) -> String {
-    body.lines().take(8).collect::<Vec<_>>().join("\n")
 }
 
 fn split_addresses(raw: &str) -> Vec<String> {
