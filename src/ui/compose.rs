@@ -261,6 +261,14 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
         return KeyOutcome::Consumed;
     }
 
+    // Alt-f opens the From / account picker from any field. Mirrors
+    // Alt-e for the editor — the picker is otherwise only reachable
+    // by tabbing to From and pressing Enter, which is hard to discover.
+    if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('f') {
+        open_from_picker(screen, cfg);
+        return KeyOutcome::Consumed;
+    }
+
     // Ctrl-J / Ctrl-K: explicit header↔body jump. Intercepted before the
     // body editor so they don't get swallowed by Insert mode or interpreted
     // as half-page-up in Normal. Ctrl-J always jumps to Body. Ctrl-K only
@@ -356,7 +364,7 @@ fn native_body_hint(body: &BodyEditor) -> &'static str {
     }
 }
 
-fn open_from_picker(screen: &mut ComposeScreen, cfg: &Config) {
+pub fn open_from_picker(screen: &mut ComposeScreen, cfg: &Config) {
     let options = collect_from_options(cfg);
     if options.is_empty() {
         return;
@@ -366,6 +374,21 @@ fn open_from_picker(screen: &mut ComposeScreen, cfg: &Config) {
         .position(|o| o.account == screen.account)
         .unwrap_or(0);
     screen.from_picker = Some(FromPicker { options, selected });
+}
+
+/// Switch the sending identity to `account` (must exist in `cfg`),
+/// rewriting both `screen.account` (drives SMTP routing + Sent-folder
+/// destination) and the visible `From:` header to the account's
+/// configured display string. Returns `Err` with a user-facing message
+/// when the account isn't configured.
+pub fn set_account(screen: &mut ComposeScreen, cfg: &Config, account: &str) -> Result<(), String> {
+    let Some(acc) = cfg.accounts.get(account) else {
+        return Err(format!("unknown account: {account}"));
+    };
+    screen.account = account.to_string();
+    screen.from = TextInput::from_string(acc.from.clone());
+    screen.from_picker = None;
+    Ok(())
 }
 
 fn handle_from_picker_key(screen: &mut ComposeScreen, k: KeyEvent) {
@@ -548,12 +571,12 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         ))
     } else if screen.focused == ComposeField::From {
         Line::from(Span::styled(
-            " Enter pick account  Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
+            " Enter/Alt-f pick account  Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
             Style::default().fg(Color::DarkGray),
         ))
     } else {
         Line::from(Span::styled(
-            " Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
+            " Alt-f pick account  Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
             Style::default().fg(Color::DarkGray),
         ))
     };

@@ -13,7 +13,7 @@ use crate::mail::parse;
 use crate::store::sync as store_sync;
 use crate::ui::app::{App, Mode, PendingSend, Screen};
 use crate::ui::browser;
-use crate::ui::compose::ComposeScreen;
+use crate::ui::compose::{self, ComposeScreen};
 
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.mode {
@@ -141,6 +141,7 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
         }
         "attach" => attach_path(app, cmd),
         "detach" => detach_index(app, &mut parts),
+        "from" => switch_from(app, cfg, parts.next()),
         "account" => match parts.next() {
             None | Some("all") => app.switch_to_scope(None, "INBOX"),
             Some(name) if cfg.accounts.contains_key(name) => {
@@ -406,6 +407,26 @@ fn send_label(draft: &Draft) -> String {
 /// cmdline buffer.
 pub fn open_blank_compose_external(app: &mut App, cfg: &Config) {
     open_blank_compose(app, cfg);
+}
+
+/// `:from [<account>]` — switch the sending identity on the active
+/// compose tab. With no argument, opens the same dropdown as Alt-f /
+/// Enter-on-From so the user can pick interactively. With an argument
+/// it validates against `[accounts.*]` and applies directly. Both
+/// paths rewrite `screen.account` (drives SMTP + Sent folder) and the
+/// visible `From:` header in lockstep.
+fn switch_from(app: &mut App, cfg: &Config, name: Option<&str>) {
+    let Some(c) = app.active_compose_mut() else {
+        app.status_error = Some("from: not on a compose tab".into());
+        return;
+    };
+    match name {
+        None => compose::open_from_picker(c, cfg),
+        Some(n) => match compose::set_account(c, cfg, n) {
+            Ok(()) => {}
+            Err(msg) => app.status_error = Some(format!("from: {msg}")),
+        },
+    }
 }
 
 /// `:edit` — escape from the native body editor into `$EDITOR` under a
