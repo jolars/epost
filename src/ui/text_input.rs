@@ -85,6 +85,49 @@ impl TextInput {
         self.cursor = 0;
     }
 
+    /// Readline `unix-word-rubout`: skip any trailing whitespace, then
+    /// delete back through the run of non-whitespace under / before the
+    /// cursor. Whitespace is the only delimiter — punctuation stays
+    /// glued to the word, which is what you want on address rows
+    /// (`Ctrl-W` over `"alice@example.com, bob@example.org"` kills the
+    /// whole second address, not just `.org`).
+    pub fn delete_word_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prefix = &self.buf[..self.cursor];
+        let chars: Vec<(usize, char)> = prefix.char_indices().collect();
+        let mut i = chars.len();
+        while i > 0 && chars[i - 1].1.is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].1.is_whitespace() {
+            i -= 1;
+        }
+        let new_cursor = if i == 0 { 0 } else { chars[i].0 };
+        self.buf.replace_range(new_cursor..self.cursor, "");
+        self.cursor = new_cursor;
+    }
+
+    /// Readline `unix-line-discard` (Ctrl-U): drop everything from the
+    /// start of the line up to the cursor.
+    pub fn delete_to_start(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.buf.replace_range(0..self.cursor, "");
+        self.cursor = 0;
+    }
+
+    /// Readline `kill-line` (Ctrl-K): drop everything from the cursor
+    /// to the end of the line.
+    pub fn delete_to_end(&mut self) {
+        if self.cursor >= self.buf.len() {
+            return;
+        }
+        self.buf.truncate(self.cursor);
+    }
+
     /// Take the buffer's contents, leaving the input empty.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
@@ -94,13 +137,56 @@ impl TextInput {
     /// Dispatch a key event to the standard set of editing operations.
     /// Returns true if the key was consumed. Modal callers should
     /// intercept Esc / Enter / mode-exit chords before calling.
+    ///
+    /// Recognised readline chords (no modes, no surprises):
+    /// `Ctrl-A` head, `Ctrl-E` end, `Ctrl-B` left, `Ctrl-F` right,
+    /// `Ctrl-W` delete-word-back, `Ctrl-U` delete-to-start,
+    /// `Ctrl-K` delete-to-end, `Ctrl-H` backspace, `Ctrl-D` delete.
+    /// Any other Ctrl/Alt chord is left for the caller to handle.
     pub fn handle(&mut self, k: KeyEvent) -> bool {
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            return match k.code {
+                KeyCode::Char('a') => {
+                    self.move_home();
+                    true
+                }
+                KeyCode::Char('e') => {
+                    self.move_end();
+                    true
+                }
+                KeyCode::Char('b') => {
+                    self.move_left();
+                    true
+                }
+                KeyCode::Char('f') => {
+                    self.move_right();
+                    true
+                }
+                KeyCode::Char('w') => {
+                    self.delete_word_left();
+                    true
+                }
+                KeyCode::Char('u') => {
+                    self.delete_to_start();
+                    true
+                }
+                KeyCode::Char('k') => {
+                    self.delete_to_end();
+                    true
+                }
+                KeyCode::Char('h') => {
+                    self.delete_left();
+                    true
+                }
+                KeyCode::Char('d') => {
+                    self.delete_right();
+                    true
+                }
+                _ => false,
+            };
+        }
         match k.code {
-            KeyCode::Char(c)
-                if !k
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::ALT) => {
                 self.insert_char(c);
                 true
             }
@@ -238,5 +324,86 @@ mod tests {
         assert_eq!(s, "a");
         assert!(t.is_empty());
         assert_eq!(t.cursor(), 0);
+    }
+
+    fn populated(s: &str) -> TextInput {
+        let mut t = TextInput::from_string(s);
+        t.move_end();
+        t
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_back_treating_address_as_one_word() {
+        let mut t = populated("alice@example.com, bob@example.org");
+        assert!(t.handle(ctrl('w')));
+        assert_eq!(t.as_str(), "alice@example.com, ");
+        // Second Ctrl-W eats the comma+space and then `alice@example.com`.
+        assert!(t.handle(ctrl('w')));
+        assert_eq!(t.as_str(), "");
+    }
+
+    #[test]
+    fn ctrl_u_drops_to_start_only_before_cursor() {
+        let mut t = TextInput::from_string("hello world");
+        // Park cursor in the middle ("hello "|"world").
+        t.move_home();
+        for _ in 0..6 {
+            t.move_right();
+        }
+        assert!(t.handle(ctrl('u')));
+        assert_eq!(t.as_str(), "world");
+        assert_eq!(t.cursor(), 0);
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_end_from_cursor() {
+        let mut t = TextInput::from_string("hello world");
+        t.move_home();
+        for _ in 0..5 {
+            t.move_right();
+        }
+        assert!(t.handle(ctrl('k')));
+        assert_eq!(t.as_str(), "hello");
+        assert_eq!(t.cursor(), 5);
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_jump_to_extremes() {
+        let mut t = TextInput::from_string("xyz");
+        t.move_home();
+        assert!(t.handle(ctrl('e')));
+        assert_eq!(t.cursor(), 3);
+        assert!(t.handle(ctrl('a')));
+        assert_eq!(t.cursor(), 0);
+    }
+
+    #[test]
+    fn ctrl_b_and_ctrl_f_step_one_char() {
+        let mut t = populated("ab");
+        assert!(t.handle(ctrl('b')));
+        assert_eq!(t.cursor(), 1);
+        assert!(t.handle(ctrl('f')));
+        assert_eq!(t.cursor(), 2);
+    }
+
+    #[test]
+    fn ctrl_h_is_backspace_and_ctrl_d_is_delete() {
+        let mut t = populated("abc");
+        assert!(t.handle(ctrl('h')));
+        assert_eq!(t.as_str(), "ab");
+        t.move_home();
+        assert!(t.handle(ctrl('d')));
+        assert_eq!(t.as_str(), "b");
+    }
+
+    #[test]
+    fn unhandled_ctrl_chord_returns_false_so_caller_can_route() {
+        let mut t = populated("abc");
+        assert!(!t.handle(ctrl('z')));
+        assert_eq!(t.as_str(), "abc");
     }
 }

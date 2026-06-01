@@ -59,13 +59,29 @@ fn global(app: &mut App, k: KeyEvent) -> bool {
             _ => {}
         }
     }
-    if k.modifiers.contains(KeyModifiers::ALT)
-        && let KeyCode::Char(c) = k.code
-        && let Some(d) = c.to_digit(10)
-        && (1..=9).contains(&d)
-    {
-        app.set_tab(d as usize - 1);
-        return true;
+    if k.modifiers.contains(KeyModifiers::ALT) {
+        match k.code {
+            // Alt-h / Alt-l cycle tabs (wraparound) — same behaviour as
+            // Ctrl-PageUp/PageDown but easier to hit on a laptop keyboard.
+            // Handled globally so they work from any mode, including from
+            // inside the compose body editor's Insert mode.
+            KeyCode::Char('h') => {
+                app.prev_tab();
+                return true;
+            }
+            KeyCode::Char('l') => {
+                app.next_tab();
+                return true;
+            }
+            KeyCode::Char(c)
+                if let Some(d) = c.to_digit(10)
+                    && (1..=9).contains(&d) =>
+            {
+                app.set_tab(d as usize - 1);
+                return true;
+            }
+            _ => {}
+        }
     }
     false
 }

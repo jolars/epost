@@ -263,19 +263,17 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
 
     // Ctrl-J / Ctrl-K: explicit header↔body jump. Intercepted before the
     // body editor so they don't get swallowed by Insert mode or interpreted
-    // as half-page-up in Normal. From a header field, Ctrl-J also wins over
-    // the text input. Round-trippable: Ctrl-J from header → Body remembers
-    // the row, Ctrl-K from Body restores it via `last_header_focused`.
+    // as half-page-up in Normal. Ctrl-J always jumps to Body. Ctrl-K only
+    // fires from Body — from a header it falls through so `TextInput`'s
+    // readline `kill-to-end` (Ctrl-K) keeps working there.
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
             KeyCode::Char('j') => {
                 screen.set_focus(ComposeField::Body);
                 return KeyOutcome::Consumed;
             }
-            KeyCode::Char('k') => {
-                if screen.focused == ComposeField::Body {
-                    screen.set_focus(screen.last_header_focused);
-                }
+            KeyCode::Char('k') if screen.focused == ComposeField::Body => {
+                screen.set_focus(screen.last_header_focused);
                 return KeyOutcome::Consumed;
             }
             _ => {}
