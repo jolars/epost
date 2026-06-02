@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::mail::text;
 use crate::ui::app::{App, Mode, Pane, Screen};
 use crate::ui::clipboard::{self, YankOutcome};
+use crate::ui::motion;
 use crate::ui::{cmdline, compose};
 
 pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
@@ -357,9 +358,12 @@ fn visual(app: &mut App, cfg: &Config, k: KeyEvent) {
         app.mode = Mode::Normal;
         return;
     }
+    // Compose-specific keys first: mode exit, kind swap, yank. These
+    // aren't motions, so they short-circuit `motion::apply`.
     match k.code {
         KeyCode::Esc => {
             app.exit_visual();
+            return;
         }
         KeyCode::Char('v') => {
             // Same-kind exits; opposite-kind swaps.
@@ -370,6 +374,7 @@ fn visual(app: &mut App, cfg: &Config, k: KeyEvent) {
                 app.inbox_mut()
                     .set_visual_kind(crate::ui::app::VisualKind::Char);
             }
+            return;
         }
         KeyCode::Char('V') => {
             let cur_kind = app.inbox().visual.as_ref().map(|v| v.kind);
@@ -379,30 +384,32 @@ fn visual(app: &mut App, cfg: &Config, k: KeyEvent) {
                 app.inbox_mut()
                     .set_visual_kind(crate::ui::app::VisualKind::Line);
             }
+            return;
         }
         KeyCode::Char('y') => {
             yank_visual(app, cfg);
+            return;
         }
-        KeyCode::Char('j') => app.inbox_mut().move_reader_cursor(1, 0),
-        KeyCode::Char('k') => app.inbox_mut().move_reader_cursor(-1, 0),
-        KeyCode::Char('h') => app.inbox_mut().move_reader_cursor(0, -1),
-        KeyCode::Char('l') => app.inbox_mut().move_reader_cursor(0, 1),
-        KeyCode::Char('G') => app.inbox_mut().move_reader_cursor_to_bottom(),
+        // `gg` chord: handled here because the latch lives on `App`.
+        // The motion module is stateless — first `g` arms, second `g`
+        // emits FirstLine directly. `key_to_motion` returns None for
+        // `g` so this branch is the only thing that consumes it.
         KeyCode::Char('g') => {
             if app.pending_g {
                 app.pending_g = false;
-                app.inbox_mut().move_reader_cursor_to_top();
+                motion::apply(app.inbox_mut(), motion::Motion::FirstLine);
             } else {
                 app.pending_g = true;
             }
+            return;
         }
-        KeyCode::Char('0') => app.inbox_mut().move_reader_cursor_to_line_start(),
-        KeyCode::Char('$') => app.inbox_mut().move_reader_cursor_to_line_end(),
-        _ => {
-            // Anything else clears a pending `g` prefix and otherwise is
-            // a no-op — keeps the keymap predictable in visual.
-            app.pending_g = false;
-        }
+        _ => {}
+    }
+    // Any non-`g` key clears the pending-g latch so a stray `g` plus
+    // an unrelated key doesn't silently chain into a later `gg`.
+    app.pending_g = false;
+    if let Some(m) = motion::key_to_motion(k) {
+        motion::apply(app.inbox_mut(), m);
     }
 }
 

@@ -10,6 +10,7 @@ pub mod folders;
 pub mod images;
 pub mod keys;
 pub mod list;
+pub mod motion;
 pub mod mouse;
 pub mod reader;
 pub mod search;

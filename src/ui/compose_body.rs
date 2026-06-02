@@ -20,6 +20,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
 use tui_textarea::{CursorMove, TextArea};
 
+use crate::ui::motion::{self, MotionTarget};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
     Normal,
@@ -229,35 +231,34 @@ impl BodyEditor {
             Pending::None => {}
         }
 
-        // Ctrl-R → redo, Ctrl-D / Ctrl-U → half-page scroll.
+        // Ctrl-R → redo, Ctrl-C → passthrough. Ctrl-d / Ctrl-u are
+        // motions and route through `motion::key_to_motion` below.
         if k.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(m) = motion::key_to_motion(k) {
+                motion::apply(self, m);
+                return KeyOutcome::Consumed;
+            }
             return self.handle_normal_ctrl(k);
         }
 
+        // Passthrough first so cmdline keys reach the app.
         match k.code {
-            // Passthrough: ex-cmdline, search, field-cycling. These are
-            // app-level concerns; the editor doesn't try to handle them.
             KeyCode::Char(':')
             | KeyCode::Char('/')
             | KeyCode::Char('?')
             | KeyCode::Tab
             | KeyCode::BackTab => return KeyOutcome::PassThrough,
+            _ => {}
+        }
 
-            // Motions
-            KeyCode::Char('h') | KeyCode::Left => self.move_h(),
-            KeyCode::Char('l') | KeyCode::Right => self.move_l(),
-            KeyCode::Char('j') | KeyCode::Down => self.textarea.move_cursor(CursorMove::Down),
-            KeyCode::Char('k') | KeyCode::Up => self.textarea.move_cursor(CursorMove::Up),
-            KeyCode::Char('w') => self.textarea.move_cursor(CursorMove::WordForward),
-            KeyCode::Char('b') => self.textarea.move_cursor(CursorMove::WordBack),
-            KeyCode::Char('e') => self.textarea.move_cursor(CursorMove::WordEnd),
-            KeyCode::Char('0') | KeyCode::Home => self.textarea.move_cursor(CursorMove::Head),
-            KeyCode::Char('$') | KeyCode::End => self.textarea.move_cursor(CursorMove::End),
-            KeyCode::Char('^') => self.textarea.move_cursor(CursorMove::Head),
-            KeyCode::Char('G') => {
-                self.textarea.move_cursor(CursorMove::Bottom);
-                self.textarea.move_cursor(CursorMove::Head);
-            }
+        // Motions: hjkl / w / b / e / 0 / $ / ^ / G — shared with the
+        // reader via the MotionTarget impl above.
+        if let Some(m) = motion::key_to_motion(k) {
+            motion::apply(self, m);
+            return KeyOutcome::Consumed;
+        }
+
+        match k.code {
             KeyCode::Char('g') => {
                 self.pending = Pending::G;
             }
@@ -317,19 +318,12 @@ impl BodyEditor {
     }
 
     fn handle_normal_ctrl(&mut self, k: KeyEvent) -> KeyOutcome {
+        // Motion-flavoured Ctrl chords (Ctrl-d / Ctrl-u) are dispatched
+        // by the caller before this lands; left here are the non-motion
+        // chords: Ctrl-R redo and Ctrl-C app passthrough.
         match k.code {
             KeyCode::Char('r') => {
                 self.textarea.redo();
-            }
-            KeyCode::Char('d') => {
-                for _ in 0..half_page() {
-                    self.textarea.move_cursor(CursorMove::Down);
-                }
-            }
-            KeyCode::Char('u') => {
-                for _ in 0..half_page() {
-                    self.textarea.move_cursor(CursorMove::Up);
-                }
             }
             // Ctrl-C falls through to the app (which quits) only when
             // the user has already left Insert. That matches the
@@ -392,16 +386,39 @@ impl BodyEditor {
             }
             return KeyOutcome::Consumed;
         }
+        // `gg` chord resolution: a prior `g` armed `Pending::G`; this
+        // call's `g` triggers FirstLine, anything else clears the latch
+        // and re-dispatches as a fresh key.
+        if matches!(self.pending, Pending::G) {
+            self.pending = Pending::None;
+            if matches!(k.code, KeyCode::Char('g')) {
+                motion::apply(self, motion::Motion::FirstLine);
+                self.refresh_visual_selection();
+                return KeyOutcome::Consumed;
+            }
+            // fall through
+        }
+
+        // Passthrough: ex-cmdline / field-cycle. The user's selection
+        // is preserved across cmdline ticks because we don't drop
+        // mode here; the cmdline handler stays in app-level scope.
         match k.code {
-            // Passthrough: ex-cmdline / field-cycle. The user's selection
-            // is preserved across cmdline ticks because we don't drop
-            // mode here; the cmdline handler stays in app-level scope.
             KeyCode::Char(':')
             | KeyCode::Char('/')
             | KeyCode::Char('?')
             | KeyCode::Tab
             | KeyCode::BackTab => return KeyOutcome::PassThrough,
+            _ => {}
+        }
 
+        // Motions: shared keymap with Normal + the reader.
+        if let Some(m) = motion::key_to_motion(k) {
+            motion::apply(self, m);
+            self.refresh_visual_selection();
+            return KeyOutcome::Consumed;
+        }
+
+        match k.code {
             // Toggle / swap visual kind
             KeyCode::Char('v') => {
                 if kind == VisualKind::Char {
@@ -440,39 +457,14 @@ impl BodyEditor {
                 return KeyOutcome::Consumed;
             }
 
-            // Motions (same set as Normal)
-            KeyCode::Char('h') | KeyCode::Left => self.move_h(),
-            KeyCode::Char('l') | KeyCode::Right => self.move_l(),
-            KeyCode::Char('j') | KeyCode::Down => self.textarea.move_cursor(CursorMove::Down),
-            KeyCode::Char('k') | KeyCode::Up => self.textarea.move_cursor(CursorMove::Up),
-            KeyCode::Char('w') => self.textarea.move_cursor(CursorMove::WordForward),
-            KeyCode::Char('b') => self.textarea.move_cursor(CursorMove::WordBack),
-            KeyCode::Char('e') => self.textarea.move_cursor(CursorMove::WordEnd),
-            KeyCode::Char('0') | KeyCode::Home => self.textarea.move_cursor(CursorMove::Head),
-            KeyCode::Char('$') | KeyCode::End => self.textarea.move_cursor(CursorMove::End),
-            KeyCode::Char('^') => self.textarea.move_cursor(CursorMove::Head),
-            KeyCode::Char('G') => {
-                self.textarea.move_cursor(CursorMove::Bottom);
-                self.textarea.move_cursor(CursorMove::Head);
-            }
+            // Arm the `gg` chord; resolution handled at the top of the
+            // next `handle_visual` call.
             KeyCode::Char('g') => {
-                // Cheap `gg` in visual: consume the next `g` via the
-                // same pending latch normal mode uses. The latch lives
-                // on the editor so it survives the per-key call.
                 self.pending = Pending::G;
                 return KeyOutcome::Consumed;
             }
 
             _ => {}
-        }
-
-        // Pending latch resolution for `gg` while in visual.
-        if let Pending::G = self.pending {
-            // Consumed above for the first `g`; the second arrives in a
-            // later call and the Normal-mode latch path handles it. But
-            // we're in Visual; route it here.
-            // (This branch is reached only when we just set Pending::G
-            // above; resolution happens on the next call.)
         }
 
         self.refresh_visual_selection();
@@ -689,6 +681,60 @@ impl BodyEditor {
             self.textarea.move_cursor(CursorMove::Head);
         } else {
             self.textarea.insert_str(&y.text);
+        }
+    }
+}
+
+/// Composer motion impl. Delegates to `tui_textarea::CursorMove` so
+/// word boundaries / line clamps match the engine the rest of the
+/// editor already uses — no risk of drifting from textarea's own word
+/// walker. `h`/`l` use the existing `move_h` / `move_l` so the
+/// "Normal-mode cursor sits ON a char (max col = line_len - 1)" rule
+/// stays in one place.
+impl MotionTarget for BodyEditor {
+    fn move_char_left(&mut self) {
+        self.move_h();
+    }
+    fn move_char_right(&mut self) {
+        self.move_l();
+    }
+    fn move_char_up(&mut self) {
+        self.textarea.move_cursor(CursorMove::Up);
+    }
+    fn move_char_down(&mut self) {
+        self.textarea.move_cursor(CursorMove::Down);
+    }
+    fn move_word_forward(&mut self) {
+        self.textarea.move_cursor(CursorMove::WordForward);
+    }
+    fn move_word_back(&mut self) {
+        self.textarea.move_cursor(CursorMove::WordBack);
+    }
+    fn move_word_end(&mut self) {
+        self.textarea.move_cursor(CursorMove::WordEnd);
+    }
+    fn move_line_start(&mut self) {
+        self.textarea.move_cursor(CursorMove::Head);
+    }
+    fn move_line_end(&mut self) {
+        self.textarea.move_cursor(CursorMove::End);
+    }
+    fn move_first_line(&mut self) {
+        self.textarea.move_cursor(CursorMove::Top);
+        self.textarea.move_cursor(CursorMove::Head);
+    }
+    fn move_last_line(&mut self) {
+        self.textarea.move_cursor(CursorMove::Bottom);
+        self.textarea.move_cursor(CursorMove::Head);
+    }
+    fn move_half_page(&mut self, down: bool) {
+        let m = if down {
+            CursorMove::Down
+        } else {
+            CursorMove::Up
+        };
+        for _ in 0..half_page() {
+            self.textarea.move_cursor(m);
         }
     }
 }

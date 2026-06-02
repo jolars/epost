@@ -22,6 +22,7 @@ use crate::ui::clipboard::ClipboardResult;
 use crate::ui::compose::ComposeScreen;
 use crate::ui::events::AppEvent;
 use crate::ui::images::{self, ImageKey, ResolvedImage};
+use crate::ui::motion::MotionTarget;
 use crate::ui::search::SearchState;
 use crate::ui::text_input::TextInput;
 use crate::ui::{cmdline, compose, folders, list, reader, tabs};
@@ -973,7 +974,51 @@ impl InboxScreen {
         // Sentinel: clamped to real line end at draw time.
         self.reader_cursor_col = u16::MAX;
     }
+}
 
+/// Reader motion impl. Cursor columns intentionally overshoot — the
+/// laid-out body isn't available at keymap time, so `reader::draw`
+/// clamps `reader_cursor_col` against `LaidOutBody.line_text[row]` once
+/// it has the live width in hand. Word motions stay unimplemented (the
+/// default no-op): word boundaries would need the body text too, and
+/// the reader doesn't surface that to the keymap layer yet.
+impl MotionTarget for InboxScreen {
+    fn move_char_left(&mut self) {
+        self.move_reader_cursor(0, -1);
+    }
+    fn move_char_right(&mut self) {
+        self.move_reader_cursor(0, 1);
+    }
+    fn move_char_up(&mut self) {
+        self.move_reader_cursor(-1, 0);
+    }
+    fn move_char_down(&mut self) {
+        self.move_reader_cursor(1, 0);
+    }
+    fn move_line_start(&mut self) {
+        self.move_reader_cursor_to_line_start();
+    }
+    fn move_line_end(&mut self) {
+        self.move_reader_cursor_to_line_end();
+    }
+    fn move_first_line(&mut self) {
+        self.move_reader_cursor_to_top();
+    }
+    fn move_last_line(&mut self) {
+        self.move_reader_cursor_to_bottom();
+    }
+    fn move_half_page(&mut self, down: bool) {
+        // Half-viewport step. Falls back to a tiny jump when the height
+        // hasn't been measured yet (first frame).
+        let step = (self.last_reader_inner_height / 2).max(1) as i32;
+        self.move_reader_cursor(if down { step } else { -step }, 0);
+    }
+
+    // Re-open the inherent impl block so the rest of InboxScreen's
+    // methods stay attached. Rust allows multiple `impl T` blocks.
+}
+
+impl InboxScreen {
     /// Adjust `reader_scroll` so the cursor sits inside the body
     /// viewport. Pure scroll-follow — does not move the cursor.
     pub fn follow_cursor(&mut self) {
