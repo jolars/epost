@@ -6,7 +6,7 @@
 //! body to a tempfile and hands it to `$EDITOR` under a pty for users
 //! who want their heavy editor config.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -18,6 +18,7 @@ use tempfile::NamedTempFile;
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::config::Config;
+use crate::mail::compose as mail_compose;
 use crate::mail::compose::Draft;
 pub use crate::ui::compose_body::KeyOutcome;
 use crate::ui::compose_body::{BodyEditor, BodyMode, VisualKind};
@@ -32,7 +33,30 @@ pub enum ComposeField {
     Cc,
     Bcc,
     Subject,
+    /// Focusable attachment row: expands into a list with a `+ Add
+    /// attachment...` sentinel when focused, collapses to a one-line
+    /// summary otherwise. Sits between Subject and Body in the cycle so
+    /// Tab from Subject lands here before falling through to the body.
+    Attach,
     Body,
+}
+
+/// Focusable attachment-row state. The visible behaviour is:
+///
+/// - **List mode** (`adding.is_none()`) — `j`/`k` walks rows; `selected`
+///   ranges over `0..=attachments.len()`, where the trailing value is
+///   the synthetic `+ Add attachment...` sentinel. `Enter`/`a` on the
+///   sentinel opens the inline path input; `d`/`x` on a real row removes
+///   it.
+/// - **Adding mode** (`adding.is_some()`) — the sentinel is replaced by
+///   a one-line `TextInput`; `Enter` validates via
+///   [`mail_compose::validate_attachment`] and (on success) pushes to
+///   `attachments`, drops the input, and lands `selected` on the new
+///   row. `Esc` / `Tab` / `BackTab` cancel the input.
+#[derive(Debug, Default)]
+pub struct AttachState {
+    pub selected: usize,
+    pub adding: Option<TextInput>,
 }
 
 pub struct ComposeScreen {
@@ -74,9 +98,17 @@ pub struct ComposeScreen {
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     /// Files queued for `multipart/mixed` attachment. Maintained by
-    /// `:attach <path>` / `:detach <n>`; rendered as a read-only row in
-    /// the compose header when non-empty.
+    /// `:attach <path>` / `:detach <n>` and by the focusable `Attach:`
+    /// header row (see [`AttachState`]).
     pub attachments: Vec<PathBuf>,
+    /// Selection + inline-input state for the focusable `Attach:` row.
+    pub attach: AttachState,
+    /// Transient status string the host loop drains into
+    /// `App.status_error` after `handle_key` returns. Used by the inline
+    /// attachment flow to surface the same "attached: X" / "attach: …"
+    /// messages the `:attach` cmdline produces, without plumbing the
+    /// app borrow through compose-mode key handling.
+    pub pending_status: Option<String>,
     /// Open account-picker overlay. `Some` while the From dropdown is
     /// active; `None` ambient. Triggered by Enter on the From field;
     /// j/k or arrows navigate, Enter commits, Esc cancels. Selecting an
@@ -155,6 +187,8 @@ impl ComposeScreen {
             in_reply_to: draft.in_reply_to,
             references: draft.references,
             attachments: draft.attachments,
+            attach: AttachState::default(),
+            pending_status: None,
             from_picker: None,
             origin_draft_path: None,
             confirm_close: None,
@@ -241,7 +275,8 @@ impl ComposeScreen {
             ComposeField::To => ComposeField::Cc,
             ComposeField::Cc => ComposeField::Bcc,
             ComposeField::Bcc => ComposeField::Subject,
-            ComposeField::Subject => ComposeField::Body,
+            ComposeField::Subject => ComposeField::Attach,
+            ComposeField::Attach => ComposeField::Body,
             ComposeField::Body => ComposeField::From,
         });
     }
@@ -253,7 +288,8 @@ impl ComposeScreen {
             ComposeField::Cc => ComposeField::To,
             ComposeField::Bcc => ComposeField::Cc,
             ComposeField::Subject => ComposeField::Bcc,
-            ComposeField::Body => ComposeField::Subject,
+            ComposeField::Attach => ComposeField::Subject,
+            ComposeField::Body => ComposeField::Attach,
         });
     }
 
@@ -264,7 +300,10 @@ impl ComposeScreen {
             ComposeField::Cc => &mut self.cc,
             ComposeField::Bcc => &mut self.bcc,
             ComposeField::Subject => &mut self.subject,
-            ComposeField::Body => return None,
+            // Body owns its own (vim) editor; Attach has its own key
+            // dispatch with an inline `TextInput` for the path prompt,
+            // handled before this fallback ever runs.
+            ComposeField::Body | ComposeField::Attach => return None,
         })
     }
 }
@@ -357,6 +396,13 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
         }
     }
 
+    // Attach owns its own selection + inline-path-input dispatch — runs
+    // before the generic field branch so j/k/d/x/Enter aren't routed to
+    // a `TextInput` (Attach has no per-field TextInput in list mode).
+    if screen.focused == ComposeField::Attach {
+        return handle_attach_key(screen, k);
+    }
+
     // Non-Body fields: Tab/BackTab cycle the form, Enter on From opens
     // the picker, otherwise route to the TextInput.
     match k.code {
@@ -381,6 +427,95 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
     }
     if let Some(input) = screen.focused_input_mut() {
         input.handle(k);
+    }
+    KeyOutcome::Consumed
+}
+
+/// Attach-row key dispatch. Splits into list mode (j/k/Enter/a/d/x +
+/// Tab/BackTab) and adding mode (forwards to the inline `TextInput`
+/// with Enter to commit / Esc/Tab to cancel).
+fn handle_attach_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutcome {
+    if screen.attach.adding.is_some() {
+        return handle_attach_adding_key(screen, k);
+    }
+    let len = screen.attachments.len();
+    let sentinel = len;
+    match k.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            screen.attach.selected = screen.attach.selected.saturating_add(1).min(sentinel);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            screen.attach.selected = screen.attach.selected.saturating_sub(1);
+        }
+        // Sentinel only: opens the inline path input. Real-row Enter is
+        // reserved for a future "open externally" affordance.
+        KeyCode::Enter | KeyCode::Char('a') if screen.attach.selected == sentinel => {
+            screen.attach.adding = Some(TextInput::new());
+        }
+        KeyCode::Char('d') | KeyCode::Char('x') if screen.attach.selected < len => {
+            let removed = screen.attachments.remove(screen.attach.selected);
+            let name = removed
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| removed.display().to_string());
+            let rem = screen.attachments.len();
+            screen.pending_status = Some(format!("detached: {name} ({rem} remaining)"));
+            // Clamp; deleting the last real row leaves selection on the
+            // sentinel, matching list-pane conventions elsewhere.
+            if screen.attach.selected > screen.attachments.len() {
+                screen.attach.selected = screen.attachments.len();
+            }
+        }
+        KeyCode::Tab => screen.focus_next(),
+        KeyCode::BackTab => screen.focus_prev(),
+        _ => {}
+    }
+    KeyOutcome::Consumed
+}
+
+fn handle_attach_adding_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutcome {
+    match k.code {
+        KeyCode::Esc => {
+            screen.attach.adding = None;
+        }
+        KeyCode::Enter => {
+            let raw = screen
+                .attach
+                .adding
+                .as_ref()
+                .map(|i| i.as_str().to_string())
+                .unwrap_or_default();
+            match mail_compose::validate_attachment(&raw) {
+                Ok(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    screen.attachments.push(path);
+                    let n = screen.attachments.len();
+                    screen.attach.selected = n - 1;
+                    screen.attach.adding = None;
+                    screen.pending_status = Some(format!("attached: {name} ({n} total)"));
+                }
+                Err(e) => {
+                    screen.pending_status = Some(format!("attach: {e}"));
+                    // Leave the input open so the user can correct the path.
+                }
+            }
+        }
+        KeyCode::Tab => {
+            screen.attach.adding = None;
+            screen.focus_next();
+        }
+        KeyCode::BackTab => {
+            screen.attach.adding = None;
+            screen.focus_prev();
+        }
+        _ => {
+            if let Some(input) = screen.attach.adding.as_mut() {
+                let _ = input.handle(k);
+            }
+        }
     }
     KeyOutcome::Consumed
 }
@@ -512,9 +647,22 @@ fn collect_from_options(cfg: &Config) -> Vec<FromOption> {
 /// (From / To / Cc / Bcc / Subject, plus an Attachments row when files
 /// are queued), a body-preview pane below, hint line at the bottom.
 pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
-    let show_attachments = !screen.attachments.is_empty();
-    // 5 fixed rows + 2 border lines = 7; +1 for the Attachments row when shown.
-    let header_height: u16 = if show_attachments { 8 } else { 7 };
+    let attach_focused = screen.focused == ComposeField::Attach;
+    // Defensive clamp: a cmdline `:detach` between frames can shrink the
+    // list out from under the cached selection. Sentinel row is at
+    // attachments.len(); selected must reach it but not exceed.
+    if screen.attach.selected > screen.attachments.len() {
+        screen.attach.selected = screen.attachments.len();
+    }
+    let attach_rows: u16 = if attach_focused {
+        // N attachment rows + 1 (sentinel OR — when adding — the inline
+        // input row that replaces it).
+        (screen.attachments.len() as u16).saturating_add(1)
+    } else {
+        1
+    };
+    // 5 fixed rows + 2 border lines = 7; plus the attach row(s).
+    let header_height: u16 = 7u16.saturating_add(attach_rows);
     let outer = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(3),
@@ -530,7 +678,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     f.render_widget(header_block, header_area);
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1); 5];
-    if show_attachments {
+    for _ in 0..attach_rows {
         constraints.push(Constraint::Length(1));
     }
     let rows = Layout::vertical(constraints).split(header_inner);
@@ -570,8 +718,10 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         &screen.subject,
         screen.focused == ComposeField::Subject,
     );
-    if show_attachments {
-        render_attachments_row(f, rows[5], &screen.attachments);
+    if attach_focused {
+        render_attach_expanded(f, &rows[5..], &screen.attachments, &screen.attach);
+    } else {
+        render_attach_collapsed(f, rows[5], &screen.attachments);
     }
 
     let editing = screen.editor.is_some();
@@ -644,6 +794,13 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
             native_body_hint(&screen.body),
             Style::default().fg(Color::DarkGray),
         ))
+    } else if attach_focused {
+        let text = if screen.attach.adding.is_some() {
+            " type path  Enter add  Esc cancel  ~/ expands to $HOME "
+        } else {
+            " j/k navigate  Enter/a add  d/x remove  Tab next  Ctrl-J body "
+        };
+        Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
     } else if screen.focused == ComposeField::From {
         Line::from(Span::styled(
             " Enter/Alt-f pick account  Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
@@ -812,28 +969,136 @@ fn render_field(f: &mut Frame, area: Rect, label: &str, input: &TextInput, focus
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Read-only "Attachments:" row. Lists each queued file as
-/// `<1-based-index>: <basename>` so the user can target `:detach <n>`.
-/// Truncation is implicit — ratatui's `Paragraph` clips at the row
-/// edge, which is fine here since the list is informational.
-fn render_attachments_row(f: &mut Frame, area: Rect, attachments: &[PathBuf]) {
+/// Unfocused single-line view. Empty shows a dim `(none)`; non-empty
+/// shows `Attach:  1: a.pdf, 2: b.png` for `:detach <n>` targeting. The
+/// row is always present so the user can Tab to it — no more "where do
+/// I add the first attachment?" mystery.
+fn render_attach_collapsed(f: &mut Frame, area: Rect, attachments: &[PathBuf]) {
     let label_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
+    if attachments.is_empty() {
+        let spans = vec![
+            Span::styled("Attach:  ", label_style),
+            Span::styled("(none)", Style::default().fg(Color::DarkGray)),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let body: String = attachments
         .iter()
         .enumerate()
-        .map(|(i, p)| {
-            let name = p
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.display().to_string());
-            format!("{}: {}", i + 1, name)
-        })
+        .map(|(i, p)| format!("{}: {}", i + 1, filename(p)))
         .collect::<Vec<_>>()
         .join(", ");
     let spans = vec![Span::styled("Attach:  ", label_style), Span::raw(body)];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Focused multi-line view: one row per attached file (highlight on the
+/// selected one), trailed by a `+ Add attachment...` sentinel — or, in
+/// adding mode, an inline path input that replaces the sentinel.
+fn render_attach_expanded(
+    f: &mut Frame,
+    rows: &[Rect],
+    attachments: &[PathBuf],
+    state: &AttachState,
+) {
+    let label_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let highlight = Style::default()
+        .bg(Color::Blue)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    // 9 columns: matches the "Attach:▼ " label width so continuation
+    // rows line up under the field content (same indent the other
+    // header fields use — see render_field's label widths).
+    const INDENT: &str = "         ";
+
+    for (i, path) in attachments.iter().enumerate() {
+        let Some(area) = rows.get(i) else { continue };
+        let label = if i == 0 { "Attach:▼ " } else { INDENT };
+        let selected = state.adding.is_none() && state.selected == i;
+        let row_style = if selected {
+            highlight
+        } else {
+            Style::default()
+        };
+        let (size_text, missing) = match std::fs::metadata(path) {
+            Ok(m) => (human_bytes(m.len()), false),
+            Err(_) => ("(missing)".to_string(), true),
+        };
+        let size_style = if missing {
+            Style::default().fg(Color::Red)
+        } else {
+            dim
+        };
+        let spans = vec![
+            Span::styled(label.to_string(), label_style),
+            Span::styled(format!("[{}] {} ", i + 1, filename(path)), row_style),
+            Span::styled(size_text, size_style),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), *area);
+    }
+
+    let sentinel_idx = attachments.len();
+    let Some(area) = rows.get(sentinel_idx) else {
+        return;
+    };
+    let label = if attachments.is_empty() {
+        "Attach:▼ "
+    } else {
+        INDENT
+    };
+
+    if let Some(input) = state.adding.as_ref() {
+        let buf = input.as_str();
+        let (before, after) = buf.split_at(input.cursor());
+        let spans = vec![
+            Span::styled(label.to_string(), label_style),
+            Span::styled("> ", Style::default().fg(Color::Yellow)),
+            Span::raw(before.to_string()),
+            Span::styled(
+                "_",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
+            Span::raw(after.to_string()),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), *area);
+    } else {
+        let style = if state.selected == sentinel_idx {
+            highlight
+        } else {
+            dim
+        };
+        let spans = vec![
+            Span::styled(label.to_string(), label_style),
+            Span::styled("+ Add attachment...", style),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), *area);
+    }
+}
+
+fn filename(p: &Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if n < KB {
+        format!("({n} B)")
+    } else if n < MB {
+        format!("({:.1} KB)", n as f64 / KB as f64)
+    } else {
+        format!("({:.1} MB)", n as f64 / MB as f64)
+    }
 }
 
 fn split_addresses(raw: &str) -> Vec<String> {
@@ -898,6 +1163,75 @@ mod tests {
     }
 
     #[test]
+    fn attach_sentinel_enter_opens_adding_mode() {
+        let mut s = blank();
+        s.set_focus(ComposeField::Attach);
+        // Empty list: sentinel is the only row, selected starts at 0.
+        let cfg = Config::default();
+        let out = handle_key(&mut s, key(KeyCode::Enter, KeyModifiers::NONE), &cfg);
+        assert!(matches!(out, KeyOutcome::Consumed));
+        assert!(s.attach.adding.is_some(), "Enter on sentinel opens input");
+    }
+
+    #[test]
+    fn attach_adding_enter_validates_and_pushes() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut s = blank();
+        s.set_focus(ComposeField::Attach);
+        let cfg = Config::default();
+        // Open the inline input.
+        handle_key(&mut s, key(KeyCode::Enter, KeyModifiers::NONE), &cfg);
+
+        // Write a real file and type its path.
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"x").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        for c in path.chars() {
+            handle_key(&mut s, key(KeyCode::Char(c), KeyModifiers::NONE), &cfg);
+        }
+        handle_key(&mut s, key(KeyCode::Enter, KeyModifiers::NONE), &cfg);
+
+        assert!(s.attach.adding.is_none(), "input closes after commit");
+        assert_eq!(s.attachments.len(), 1);
+        assert_eq!(s.attach.selected, 0, "lands on the new row");
+        let msg = s.pending_status.as_deref().unwrap_or("");
+        assert!(msg.starts_with("attached:"), "status: {msg}");
+    }
+
+    #[test]
+    fn attach_d_removes_selected_row() {
+        let mut s = blank();
+        s.attachments.push(PathBuf::from("/tmp/a.txt"));
+        s.attachments.push(PathBuf::from("/tmp/b.txt"));
+        s.set_focus(ComposeField::Attach);
+        s.attach.selected = 0;
+        let cfg = Config::default();
+        handle_key(&mut s, key(KeyCode::Char('d'), KeyModifiers::NONE), &cfg);
+        assert_eq!(s.attachments.len(), 1);
+        assert_eq!(
+            s.attachments[0],
+            PathBuf::from("/tmp/b.txt"),
+            "first row removed, second slides up"
+        );
+        let msg = s.pending_status.as_deref().unwrap_or("");
+        assert!(msg.starts_with("detached:"), "status: {msg}");
+    }
+
+    #[test]
+    fn attach_adding_esc_cancels() {
+        let mut s = blank();
+        s.set_focus(ComposeField::Attach);
+        let cfg = Config::default();
+        handle_key(&mut s, key(KeyCode::Enter, KeyModifiers::NONE), &cfg);
+        assert!(s.attach.adding.is_some());
+        handle_key(&mut s, key(KeyCode::Esc, KeyModifiers::NONE), &cfg);
+        assert!(s.attach.adding.is_none());
+        assert!(s.attachments.is_empty());
+    }
+
+    #[test]
     fn tab_through_headers_updates_last_header_focused() {
         let mut s = blank();
         // To → Cc → Bcc via Tab.
@@ -905,11 +1239,13 @@ mod tests {
         s.focus_next();
         assert_eq!(s.focused, ComposeField::Bcc);
         assert_eq!(s.last_header_focused, ComposeField::Bcc);
-        // Tab to Subject then Body — Body shouldn't overwrite the
-        // last_header_focused marker.
+        // Tab through Subject, Attach, then Body — Body shouldn't
+        // overwrite the last_header_focused marker, so it pins on the
+        // last header we visited (Attach).
+        s.focus_next();
         s.focus_next();
         s.focus_next();
         assert_eq!(s.focused, ComposeField::Body);
-        assert_eq!(s.last_header_focused, ComposeField::Subject);
+        assert_eq!(s.last_header_focused, ComposeField::Attach);
     }
 }

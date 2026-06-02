@@ -325,6 +325,39 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (y, m, d)
 }
 
+/// Expand a leading `~/` or a bare `~` to `$HOME`. Anything else passes
+/// through unchanged. Mid-path `~user` is intentionally not supported —
+/// the cmdline isn't a shell.
+pub fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    if s == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home);
+    }
+    PathBuf::from(s)
+}
+
+/// Tilde-expand `raw` and verify it points at a regular file. Returns
+/// the resolved `PathBuf` or a human-readable error suitable for the
+/// status row (no command prefix — callers add their own).
+pub fn validate_attachment(raw: &str) -> Result<PathBuf, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("missing path".into());
+    }
+    let path = expand_tilde(raw);
+    match fs::metadata(&path) {
+        Ok(m) if m.is_file() => Ok(path),
+        Ok(_) => Err(format!("{} is not a file", path.display())),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 /// Best-effort content type from the path extension. Extensionless or
 /// unknown paths fall back to `application/octet-stream`, which is what
 /// receivers expect for an opaque blob — they'll just download it.

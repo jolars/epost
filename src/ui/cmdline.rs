@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -256,17 +254,12 @@ pub fn trash_selected(app: &mut App, cfg: &Config) {
 /// the attachment list is just a `Vec<PathBuf>` until `:send`.
 fn attach_path(app: &mut App, full_cmd: &str) {
     let raw = full_cmd.trim().strip_prefix("attach").unwrap_or("").trim();
-    if raw.is_empty() {
-        app.status_error = Some("attach: missing path".into());
-        return;
-    }
-    let path = expand_tilde(raw);
     let Some(c) = app.active_compose_mut() else {
         app.status_error = Some("attach: not on a compose tab".into());
         return;
     };
-    match std::fs::metadata(&path) {
-        Ok(m) if m.is_file() => {
+    match mail_compose::validate_attachment(raw) {
+        Ok(path) => {
             let name = path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -275,12 +268,7 @@ fn attach_path(app: &mut App, full_cmd: &str) {
             let n = c.attachments.len();
             app.status_error = Some(format!("attached: {name} ({n} total)"));
         }
-        Ok(_) => {
-            app.status_error = Some(format!("attach: {} is not a file", path.display()));
-        }
-        Err(e) => {
-            app.status_error = Some(format!("attach: {}: {e}", path.display()));
-        }
+        Err(e) => app.status_error = Some(format!("attach: {e}")),
     }
 }
 
@@ -313,23 +301,6 @@ fn detach_index(app: &mut App, parts: &mut std::str::SplitWhitespace) {
         .unwrap_or_else(|| removed.display().to_string());
     let rem = c.attachments.len();
     app.status_error = Some(format!("detached: {name} ({rem} remaining)"));
-}
-
-/// Expand a leading `~/` or a bare `~` to `$HOME`. Anything else passes
-/// through unchanged. Mid-path `~user` is intentionally not supported —
-/// the cmdline isn't a shell.
-fn expand_tilde(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    if s == "~"
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home);
-    }
-    PathBuf::from(s)
 }
 
 fn dispatch_sync(app: &mut App, cfg: &Config) {

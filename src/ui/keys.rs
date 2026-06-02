@@ -136,7 +136,15 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
     // swallow `:` as a literal / selection key. Normal-mode body
     // editor returns PassThrough for `:` so the cmdline still works.
     if let Some(Screen::Compose(c)) = app.screens.get_mut(app.active) {
-        match compose::handle_key(c, k, cfg) {
+        let outcome = compose::handle_key(c, k, cfg);
+        // The inline attachment flow stages user-facing messages here so
+        // the host loop can mirror them into `app.status_error` (same
+        // place `:attach` writes), without plumbing `&mut App` through
+        // compose-mode key dispatch.
+        if let Some(msg) = c.pending_status.take() {
+            app.status_error = Some(msg);
+        }
+        match outcome {
             compose::KeyOutcome::Consumed => return,
             compose::KeyOutcome::CloseTab => {
                 // The close-confirm "Discard" arm. The prompt already
