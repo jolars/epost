@@ -356,6 +356,13 @@ pub struct InboxScreen {
     /// visual-char selection on the first `Drag`; cleared on `Up`.
     /// `None` between gestures. Body-relative (line, col).
     pub mouse_drag_anchor: Option<(u16, u16)>,
+    /// Transient highlight on the just-yanked region. `Some` between
+    /// `yp` / `yl` / visual-mode `y` firing and `expires_at` lapsing.
+    /// The painter flips `Modifier::REVERSED` on covered cells each
+    /// frame; `tick` clears the entry once expired. Mirrors vim's
+    /// `vim-highlightedyank`. Lives next to the visual state because
+    /// both are reader-pane transients keyed by the same coord space.
+    pub yank_highlight: Option<crate::ui::reader::YankHighlight>,
     pub scan: ScanState,
     pub selected: usize,
     /// Boxed so its size doesn't bloat `Screen::Inbox` past the
@@ -1186,6 +1193,7 @@ impl InboxScreen {
             last_reader_inner_width: 0,
             last_reader_inner: None,
             mouse_drag_anchor: None,
+            yank_highlight: None,
             scan,
             selected: 0,
             parsed: None,
@@ -1368,6 +1376,7 @@ impl InboxScreen {
         self.reader_cursor_col = 0;
         self.visual = None;
         self.mouse_drag_anchor = None;
+        self.yank_highlight = None;
         let Some(path) = self.selected_path() else {
             self.parsed = None;
             self.evict_image_cache(old_msgid.as_deref(), &msgid);
@@ -1954,6 +1963,7 @@ impl InboxScreen {
         self.reader_cursor_col = 0;
         self.visual = None;
         self.mouse_drag_anchor = None;
+        self.yank_highlight = None;
         self.parsed = None;
         self.last_parsed_msgid = None;
         self.prev_parsed_msgid = None;

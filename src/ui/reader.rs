@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -9,6 +11,22 @@ use crate::mail::html::{Block, Inline, InlineStyle};
 use crate::ui::app::{InboxScreen, Mode, Pane, ParsedBody, ScanState, VisualKind, VisualState};
 use crate::ui::images::ImageKey;
 use crate::ui::style::{pane_block, pane_scrollbar};
+
+/// Brief "highlight on yank" state. After `yp` / `yl` / a visual-mode `y`
+/// fires, the yanked region's body-relative cell ranges are stashed here
+/// alongside an `Instant` deadline; the next `tick` re-runs layout, paints
+/// `Modifier::REVERSED` over the covered cells, and clears the highlight
+/// once `expires_at` is past. Mirrors vim's `vim-highlightedyank`.
+///
+/// Ranges are body-relative (`line_text` row, char cols) so a scroll
+/// after the yank still lands the flash in the right place — the painter
+/// translates to absolute rows via `header_offset` + `scroll` each
+/// frame.
+#[derive(Debug)]
+pub struct YankHighlight {
+    pub ranges: Vec<(u16, u16, u16)>,
+    pub expires_at: Instant,
+}
 
 /// Marker text the pass-1 walker stamps into a single sentinel `Line`
 /// for each `Block::Image`. The pass-2 expansion finds these lines, pulls
@@ -216,6 +234,43 @@ impl LaidOutBody {
                     .any(|seg| seg.line >= top && seg.line < bot)
             })
             .count()
+    }
+
+    /// Cell ranges for every line whose `line_block_idx` matches
+    /// `block_idx`. Each entry is `(line, 0, line_width_chars)`. Used by
+    /// the yank-highlight painter for `yp` so the flash covers the full
+    /// resolved paragraph regardless of the cursor's column.
+    pub fn block_ranges(&self, block_idx: usize) -> Vec<(u16, u16, u16)> {
+        let mut out = Vec::new();
+        for (i, bi) in self.line_block_idx.iter().enumerate() {
+            if *bi == Some(block_idx) {
+                let width = self
+                    .line_text
+                    .get(i)
+                    .map(|s| s.chars().count() as u16)
+                    .unwrap_or(0);
+                if width > 0 {
+                    out.push((i as u16, 0, width));
+                }
+            }
+        }
+        out
+    }
+
+    /// Cell ranges for each segment of a single `LinkSlot`. Mirrors the
+    /// in-buffer ranges OSC 8 already uses so the yank-highlight flash
+    /// lines up exactly with the link text.
+    pub fn link_segment_ranges(slot: &LinkSlot) -> Vec<(u16, u16, u16)> {
+        slot.segments
+            .iter()
+            .filter_map(|seg| {
+                if seg.col_end > seg.col_start {
+                    Some((seg.line as u16, seg.col_start, seg.col_end))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -465,6 +520,17 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                 },
             );
         }
+        if let Some(hl) = inbox.yank_highlight.as_ref()
+            && hl.expires_at > Instant::now()
+        {
+            paint_yank_highlight(
+                f.buffer_mut(),
+                inner,
+                &hl.ranges,
+                inbox.last_reader_header_offset,
+                inbox.reader_scroll,
+            );
+        }
         let mut drawn: Vec<Rect> = Vec::new();
         for slot in &laid.images {
             let Some(resolved) = inbox.resolved_image(&slot.key) else {
@@ -629,6 +695,45 @@ fn paint_selection(
             let mut style = cell.style();
             style = style.add_modifier(Modifier::REVERSED);
             cell.set_style(style);
+        }
+    }
+}
+
+/// Paint a transient yank highlight by flipping `Modifier::REVERSED`
+/// on every cell covered by `ranges`. Same coordinate convention as
+/// `paint_selection`: ranges are body-relative `(line, col_start,
+/// col_end_excl)`, translated to absolute rows via `header_offset` +
+/// `scroll`. No cursor cell — the highlight is purely the yanked
+/// region, no extending end-point to advertise.
+fn paint_yank_highlight(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    ranges: &[(u16, u16, u16)],
+    header_offset: u16,
+    scroll: u16,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let scroll = scroll as i32;
+    for (body_line, c_start, c_end_excl) in ranges {
+        let abs_line = header_offset as i32 + *body_line as i32;
+        let row_signed = abs_line - scroll;
+        if row_signed < 0 || row_signed >= inner.height as i32 {
+            continue;
+        }
+        let row = inner.y + row_signed as u16;
+        let x_start = inner.x.saturating_add(*c_start).min(inner.x + inner.width);
+        let x_end = inner
+            .x
+            .saturating_add(*c_end_excl)
+            .min(inner.x + inner.width);
+        for x in x_start..x_end {
+            if let Some(cell) = buf.cell_mut((x, row)) {
+                let mut style = cell.style();
+                style = style.add_modifier(Modifier::REVERSED);
+                cell.set_style(style);
+            }
         }
     }
 }
@@ -1466,6 +1571,78 @@ mod tests {
     fn remote_image_renders_placeholder() {
         let lines = layout_first_para(r#"<img src="https://x.example/p" alt="pixel">"#, 40);
         assert!(lines.iter().any(|l| l.contains("[remote image: pixel]")));
+    }
+
+    #[test]
+    fn block_ranges_covers_all_lines_tagged_with_block_idx() {
+        // Two paragraphs → two top-level blocks. block_ranges(1) should
+        // return ranges only for lines whose line_block_idx is Some(1).
+        let blocks = html::parse("<p>one</p><p>two three</p>");
+        let laid = layout(&blocks, 80, None);
+        let r0 = laid.block_ranges(0);
+        let r1 = laid.block_ranges(1);
+        assert!(!r0.is_empty(), "block 0 should have ranges");
+        assert!(!r1.is_empty(), "block 1 should have ranges");
+        // Each entry is (line, 0, width) — col_start is always 0 for
+        // whole-block highlighting.
+        for (_, c_start, _) in r0.iter().chain(r1.iter()) {
+            assert_eq!(*c_start, 0);
+        }
+        // Ranges for the two blocks must not overlap on the same line.
+        let lines0: Vec<u16> = r0.iter().map(|(l, _, _)| *l).collect();
+        let lines1: Vec<u16> = r1.iter().map(|(l, _, _)| *l).collect();
+        for l in &lines1 {
+            assert!(!lines0.contains(l), "line {l} in both blocks");
+        }
+    }
+
+    #[test]
+    fn block_ranges_widths_match_line_text_char_counts() {
+        let blocks = html::parse("<p>hello</p>");
+        let laid = layout(&blocks, 80, None);
+        let ranges = laid.block_ranges(0);
+        for (line, _, width) in &ranges {
+            let actual = laid.line_text[*line as usize].chars().count() as u16;
+            assert_eq!(*width, actual, "line {line} width drift");
+        }
+    }
+
+    #[test]
+    fn link_segment_ranges_maps_to_segments() {
+        // Link spans one row; ranges should mirror the LinkSegment.
+        let blocks = html::parse(r#"<p>see <a href="https://x">this</a></p>"#);
+        let laid = layout(&blocks, 80, None);
+        let slot = laid.links.first().expect("link slot");
+        let ranges = LaidOutBody::link_segment_ranges(slot);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0],
+            (0u16, slot.segments[0].col_start, slot.segments[0].col_end)
+        );
+    }
+
+    #[test]
+    fn link_segment_ranges_skips_zero_width_segments() {
+        // Build a LinkSlot by hand with one valid + one degenerate
+        // segment; the helper should drop the empty one.
+        let slot = LinkSlot {
+            id: 1,
+            href: "https://x".into(),
+            segments: vec![
+                LinkSegment {
+                    line: 0,
+                    col_start: 0,
+                    col_end: 5,
+                },
+                LinkSegment {
+                    line: 1,
+                    col_start: 3,
+                    col_end: 3,
+                },
+            ],
+        };
+        let ranges = LaidOutBody::link_segment_ranges(&slot);
+        assert_eq!(ranges, vec![(0u16, 0u16, 5u16)]);
     }
 
     #[test]

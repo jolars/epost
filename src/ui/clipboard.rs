@@ -14,6 +14,11 @@
 //!   stdin on a `std::thread` worker. Mirrors `store::sync::start_worker`
 //!   so the polling pattern is identical: `mpsc::Receiver` + an
 //!   `AppEvent::Wake` on completion.
+//!
+//! When epost runs inside tmux or GNU screen the OSC 52 sequence is
+//! wrapped in the multiplexer's DCS passthrough so the outer terminal
+//! actually sees it; without the wrap, tmux eats the sequence by default
+//! and the user pastes nothing. Detection is per-call on `$TMUX` / `$STY`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -25,9 +30,21 @@ use base64::engine::general_purpose::STANDARD;
 use crate::config::Config;
 use crate::ui::events::AppEvent;
 
+/// Soft ceiling on the OSC 52 byte stream (envelope + base64 payload,
+/// after any multiplexer wrap). Terminals silently truncate above their
+/// own internal limit and the user finds out by pasting a partial blob —
+/// kitty's default is ~74KB, foot ~100KB, wezterm uncapped, but tmux's
+/// historical default was 1KB and other relays vary, so we pick a
+/// conservative threshold that's still comfortably bigger than any
+/// realistic structural yank. Past this size we route through the
+/// configured `[reader].clipboard` fallback if one exists, or surface a
+/// clear error so the user knows OSC 52 isn't the right path.
+const OSC52_MAX_BYTES: usize = 100_000;
+
 /// What `yank` returned and what (if anything) the caller needs to
 /// store. The OSC 52 path completes synchronously; the fallback path
 /// hands back a receiver for `poll_clipboard` to drain.
+#[derive(Debug)]
 pub enum YankOutcome {
     /// OSC 52 emitted directly. No further work for the caller.
     Sent,
@@ -46,12 +63,27 @@ pub type ClipboardResult = Result<usize, String>;
 /// based on `[reader].clipboard`. `event_tx` is cloned into the worker
 /// so completion wakes the main loop without waiting on the idle
 /// heartbeat (same shape as `store::sync::start_worker`).
+///
+/// Large payloads (encoded sequence above `OSC52_MAX_BYTES`) route
+/// through the configured fallback when one exists; otherwise they
+/// return `Failed` with a hint to set `[reader].clipboard`. The
+/// multiplexer detection is done once per call against the live env so
+/// tests can flip `TMUX` / `STY` between calls.
 pub fn yank(text: &str, cfg: &Config, event_tx: Option<&Sender<AppEvent>>) -> YankOutcome {
-    if let Some(cmd) = cfg.reader.clipboard.as_ref().filter(|c| !c.is_empty()) {
+    let fallback = cfg.reader.clipboard.as_ref().filter(|c| !c.is_empty());
+    if let Some(cmd) = fallback {
         let rx = spawn_fallback(cmd.clone(), text.to_string(), event_tx.cloned());
         return YankOutcome::Spawned(rx);
     }
-    match emit_osc52(text) {
+    let mux = detect_multiplexer();
+    let seq = wrap_for_multiplexer(&build_osc52(text), mux);
+    if seq.len() > OSC52_MAX_BYTES {
+        return YankOutcome::Failed(format!(
+            "payload too large for OSC 52 ({} bytes); set [reader].clipboard for large yanks",
+            seq.len()
+        ));
+    }
+    match write_to_stdout(&seq) {
         Ok(_) => YankOutcome::Sent,
         Err(e) => YankOutcome::Failed(e),
     }
@@ -66,8 +98,41 @@ fn build_osc52(text: &str) -> String {
     format!("\x1b]52;c;{b64}\x1b\\")
 }
 
-fn emit_osc52(text: &str) -> Result<(), String> {
-    let seq = build_osc52(text);
+/// Active terminal multiplexer, derived from `$TMUX` / `$STY`. Read at
+/// call-time so tests can flip the env without restarting the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Multiplexer {
+    None,
+    Tmux,
+    Screen,
+}
+
+fn detect_multiplexer() -> Multiplexer {
+    if std::env::var("TMUX").is_ok_and(|v| !v.is_empty()) {
+        return Multiplexer::Tmux;
+    }
+    if std::env::var("STY").is_ok_and(|v| !v.is_empty()) {
+        return Multiplexer::Screen;
+    }
+    Multiplexer::None
+}
+
+/// Wrap a raw OSC sequence in the active multiplexer's DCS passthrough.
+/// tmux requires doubling every `ESC` inside the payload (its parser
+/// re-strips one layer); screen passes the payload through as-is. With
+/// `Multiplexer::None` the sequence is returned untouched.
+fn wrap_for_multiplexer(seq: &str, mux: Multiplexer) -> String {
+    match mux {
+        Multiplexer::None => seq.to_string(),
+        Multiplexer::Tmux => {
+            let inner = seq.replace('\x1b', "\x1b\x1b");
+            format!("\x1bPtmux;{inner}\x1b\\")
+        }
+        Multiplexer::Screen => format!("\x1bP{seq}\x1b\\"),
+    }
+}
+
+fn write_to_stdout(seq: &str) -> Result<(), String> {
     let mut out = std::io::stdout().lock();
     out.write_all(seq.as_bytes())
         .map_err(|e| format!("write osc52: {e}"))?;
@@ -200,5 +265,82 @@ mod tests {
             matches!(out, Err(ref s) if s.contains("not found")),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn multiplexer_wrap_none_is_passthrough() {
+        let seq = build_osc52("hi");
+        assert_eq!(wrap_for_multiplexer(&seq, Multiplexer::None), seq);
+    }
+
+    #[test]
+    fn multiplexer_wrap_tmux_doubles_esc() {
+        let seq = build_osc52("hi");
+        let wrapped = wrap_for_multiplexer(&seq, Multiplexer::Tmux);
+        assert!(wrapped.starts_with("\x1bPtmux;"), "bad prefix: {wrapped:?}");
+        assert!(wrapped.ends_with("\x1b\\"), "bad terminator: {wrapped:?}");
+        // Original sequence has two ESCs (start `\x1b]…` and ST `\x1b\\`).
+        // tmux passthrough should double every inner ESC, so the payload
+        // between the outer DCS markers contains four ESCs.
+        let inner = &wrapped["\x1bPtmux;".len()..wrapped.len() - "\x1b\\".len()];
+        assert_eq!(
+            inner.matches('\x1b').count(),
+            seq.matches('\x1b').count() * 2,
+            "inner: {inner:?}"
+        );
+        assert!(inner.contains("\x1b\x1b]52;c;"), "inner: {inner:?}");
+    }
+
+    #[test]
+    fn multiplexer_wrap_screen_no_doubling() {
+        let seq = build_osc52("hi");
+        let wrapped = wrap_for_multiplexer(&seq, Multiplexer::Screen);
+        assert!(
+            wrapped.starts_with("\x1bP\x1b]52;c;"),
+            "bad prefix: {wrapped:?}"
+        );
+        assert!(wrapped.ends_with("\x1b\\"), "bad terminator: {wrapped:?}");
+        // Inner ESC count == outer wrap markers (two) + the original
+        // sequence's ESCs unchanged.
+        let inner = &wrapped["\x1bP".len()..wrapped.len() - "\x1b\\".len()];
+        assert_eq!(inner, seq);
+    }
+
+    #[test]
+    fn oversize_payload_without_fallback_fails() {
+        let cfg: Config = toml::from_str("").unwrap();
+        // Build a payload large enough that even the bare envelope blows
+        // past OSC52_MAX_BYTES. base64 expands 4/3; pad with a known size.
+        let big = "x".repeat(OSC52_MAX_BYTES);
+        match yank(&big, &cfg, None) {
+            YankOutcome::Failed(msg) => {
+                assert!(msg.contains("too large"), "got: {msg}");
+                assert!(msg.contains("[reader].clipboard"), "got: {msg}");
+            }
+            other => panic!("expected Failed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversize_payload_with_fallback_spawns_worker() {
+        // Fallback path bypasses the OSC 52 size guard — when the user
+        // has configured a real clipboard binary, large yanks should hit
+        // it unconditionally instead of failing.
+        let cfg: Config = toml::from_str(
+            r#"
+            [reader]
+            clipboard = ["/bin/sh", "-c", "cat > /dev/null"]
+            "#,
+        )
+        .unwrap();
+        let big = "x".repeat(OSC52_MAX_BYTES);
+        match yank(&big, &cfg, None) {
+            YankOutcome::Spawned(rx) => {
+                // Worker should complete cleanly (Ok with bytes written).
+                let out = recv_blocking(rx);
+                assert!(matches!(out, Ok(n) if n == big.len()), "{out:?}");
+            }
+            other => panic!("expected Spawned, got: {other:?}"),
+        }
     }
 }

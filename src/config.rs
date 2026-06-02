@@ -101,6 +101,14 @@ pub struct Reader {
     /// is no useful default.
     #[serde(default)]
     pub drag: Option<Vec<String>>,
+    /// Milliseconds to flash the yanked region after `yp` / `yl` / a
+    /// visual-mode `y`. Mirrors vim's `vim-highlightedyank` plugin —
+    /// since the cmdline status row is easy to miss, the brief REVERSED
+    /// flash confirms both that the yank fired and what was copied (the
+    /// latter matters because `yp` infers the paragraph from cursor
+    /// position). `0` disables the flash.
+    #[serde(default = "default_yank_highlight_ms")]
+    pub yank_highlight_ms: u16,
 }
 
 impl Default for Reader {
@@ -111,8 +119,13 @@ impl Default for Reader {
             clipboard: None,
             mouse: true,
             drag: None,
+            yank_highlight_ms: default_yank_highlight_ms(),
         }
     }
+}
+
+fn default_yank_highlight_ms() -> u16 {
+    150
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -710,6 +723,24 @@ mod tests {
     fn reader_drag_defaults_to_none() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.reader.drag.is_none());
+    }
+
+    #[test]
+    fn reader_yank_highlight_ms_defaults_to_150() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.reader.yank_highlight_ms, 150);
+    }
+
+    #[test]
+    fn reader_yank_highlight_ms_parses_override() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [reader]
+            yank_highlight_ms = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reader.yank_highlight_ms, 0);
     }
 
     #[test]

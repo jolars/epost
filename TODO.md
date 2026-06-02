@@ -35,19 +35,6 @@ usability gap.
   to Sent" path doesn't have a clear meaning if Sent labels differ across
   accounts. Audit and document.
 
-## Reader selection / yank (vim-light)
-
-Deferring copy to the host terminal isn't acceptable: terminal-native
-drag-select grabs pane borders, sidebar contents, and list-pane chrome, so the
-paste is full of artifacts. The model is in-app, app-rendered selection.
-
-- **OSC 52 structural yanks.** Cheapest 80%-case first, before the selection
-  engine: `Y` (whole body), `yp` (paragraph under reader cursor), `yl` (link
-  under reader cursor). Emits `ESC ] 52 ; c ; <base64> ESC \` to stdout. No
-  selection rendering, no cursor logic. Fallback path for terminals without OSC
-  52: shell out to `xclip` / `wl-copy` via a configured `[reader].clipboard`
-  command.
-
 ## Dev fixtures
 
 - **HTML table fixture** --- `dev/maildir/README.md` still flags the

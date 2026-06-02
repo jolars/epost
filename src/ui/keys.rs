@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::Config;
@@ -5,6 +7,7 @@ use crate::mail::text;
 use crate::ui::app::{App, Mode, Pane, Screen};
 use crate::ui::clipboard::{self, YankOutcome};
 use crate::ui::motion;
+use crate::ui::reader::{LaidOutBody, YankHighlight};
 use crate::ui::{cmdline, compose};
 
 pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
@@ -449,18 +452,20 @@ pub(crate) fn yank_visual(app: &mut App, cfg: &Config) {
     let cursor_line = inbox.reader_cursor_line;
     let cursor_col = inbox.reader_cursor_col;
     let width = inbox.last_reader_inner_width.max(8);
-    let text = match app.inbox_parsed() {
+    let (text, ranges) = match app.inbox_parsed() {
         Some(p) => {
             let laid = crate::ui::reader::layout(&p.blocks, width, None);
-            laid.extract_selection(
+            let text = laid.extract_selection(
                 sel.anchor_line,
                 sel.anchor_col,
                 cursor_line,
                 cursor_col,
                 sel.kind,
-            )
+            );
+            let ranges = laid.selection_cell_ranges(&sel, cursor_line, cursor_col);
+            (text, ranges)
         }
-        None => String::new(),
+        None => (String::new(), Vec::new()),
     };
     app.exit_visual();
     if text.is_empty() {
@@ -471,6 +476,7 @@ pub(crate) fn yank_visual(app: &mut App, cfg: &Config) {
         crate::ui::app::VisualKind::Char => "selection",
         crate::ui::app::VisualKind::Line => "lines",
     };
+    set_yank_highlight(app, cfg, ranges);
     dispatch_yank(app, cfg, text, format!("yanked {kind}"));
 }
 
@@ -580,15 +586,15 @@ fn yank_paragraph(app: &mut App, cfg: &Config) {
     let inbox = app.inbox();
     let width = inbox.last_reader_inner_width.max(8);
     let cursor = inbox.reader_cursor_line;
-    let text = match app.inbox_parsed() {
+    let (text, ranges) = match app.inbox_parsed() {
         Some(p) if !p.blocks.is_empty() => {
             let laid = crate::ui::reader::layout(&p.blocks, width, None);
             match laid.block_at(cursor) {
-                Some(idx) => text::extract_block(&p.blocks[idx]),
-                None => String::new(),
+                Some(idx) => (text::extract_block(&p.blocks[idx]), laid.block_ranges(idx)),
+                None => (String::new(), Vec::new()),
             }
         }
-        Some(_) => String::new(),
+        Some(_) => (String::new(), Vec::new()),
         None => {
             app.status_error = Some("yp: no parsed body".into());
             return;
@@ -598,6 +604,7 @@ fn yank_paragraph(app: &mut App, cfg: &Config) {
         app.status_error = Some("yp: no paragraph at cursor".into());
         return;
     }
+    set_yank_highlight(app, cfg, ranges);
     dispatch_yank(app, cfg, text, "yanked paragraph".to_string());
 }
 
@@ -612,13 +619,17 @@ fn yank_link(app: &mut App, cfg: &Config) {
         .reader_scroll
         .saturating_sub(inbox.last_reader_header_offset);
     let viewport_h = inbox.last_reader_inner_height;
-    let (href, visible) = match app.inbox_parsed() {
+    let (href, visible, ranges) = match app.inbox_parsed() {
         Some(p) => {
             let laid = crate::ui::reader::layout(&p.blocks, width, None);
             let visible = laid.visible_link_count(scroll_body, viewport_h);
             match laid.first_link_at_or_after(cursor) {
-                Some(slot) => (slot.href.clone(), visible),
-                None => (String::new(), visible),
+                Some(slot) => (
+                    slot.href.clone(),
+                    visible,
+                    LaidOutBody::link_segment_ranges(slot),
+                ),
+                None => (String::new(), visible, Vec::new()),
             }
         }
         None => {
@@ -635,7 +646,21 @@ fn yank_link(app: &mut App, cfg: &Config) {
     } else {
         "yanked link".to_string()
     };
+    set_yank_highlight(app, cfg, ranges);
     dispatch_yank(app, cfg, href, status);
+}
+
+/// Arm a transient yank highlight over `ranges` (body-relative cell
+/// tuples). Honors `[reader].yank_highlight_ms = 0` as the disable
+/// switch — an empty range vec also no-ops, so callers don't have to
+/// pre-check before computing. Cleared on body change / scope switch
+/// (see `InboxScreen`) and on expiry from `tick`.
+fn set_yank_highlight(app: &mut App, cfg: &Config, ranges: Vec<(u16, u16, u16)>) {
+    if cfg.reader.yank_highlight_ms == 0 || ranges.is_empty() {
+        return;
+    }
+    let expires_at = Instant::now() + Duration::from_millis(cfg.reader.yank_highlight_ms as u64);
+    app.inbox_mut().yank_highlight = Some(YankHighlight { ranges, expires_at });
 }
 
 /// Shared sink for the three yank entry points. Routes to OSC 52 vs

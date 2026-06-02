@@ -2,7 +2,7 @@ use std::io::{self, BufWriter, Stdout, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -116,7 +116,11 @@ fn run(
         // bytes, or the idle heartbeat (so initial scan results get
         // picked up even though `scan::start_inbox_worker` and
         // `start_catchup_worker` don't push to the event channel yet).
-        match event_rx.recv_timeout(IDLE_TICK) {
+        // While a yank-highlight is active, tighten the deadline so the
+        // expiry sweep in `tick` fires within the configured window
+        // (default 150 ms) instead of waiting for the 250 ms idle tick.
+        let timeout = yank_highlight_deadline(&app).unwrap_or(IDLE_TICK);
+        match event_rx.recv_timeout(timeout) {
             Ok(ev) => process_event(&mut app, cfg, ev),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -130,6 +134,36 @@ fn run(
         tick(terminal, &mut app, cfg, &event_tx)?;
     }
     Ok(())
+}
+
+/// Clear the inbox's yank-highlight once its deadline has passed. Called
+/// from `tick` before the draw so a frame after the deadline paints
+/// without the REVERSED overlay.
+fn expire_yank_highlight(app: &mut App) {
+    let inbox = app.inbox_mut();
+    if inbox
+        .yank_highlight
+        .as_ref()
+        .is_some_and(|h| h.expires_at <= Instant::now())
+    {
+        inbox.yank_highlight = None;
+    }
+}
+
+/// Time until the active yank-highlight expires, or `None` when no
+/// highlight is active. Clamped to `IDLE_TICK` so a long-lived highlight
+/// can't push the recv deadline past the heartbeat that picks up scan
+/// results.
+fn yank_highlight_deadline(app: &App) -> Option<Duration> {
+    let hl = app.inbox().yank_highlight.as_ref()?;
+    let remaining = hl
+        .expires_at
+        .saturating_duration_since(Instant::now())
+        .min(IDLE_TICK);
+    // Floor at 1 ms — `recv_timeout(Duration::ZERO)` returns
+    // Disconnected on closed channels but Timeout instantly on open
+    // ones; preserve the heartbeat semantics by always sleeping a beat.
+    Some(remaining.max(Duration::from_millis(1)))
 }
 
 fn process_event(app: &mut App, cfg: &Config, ev: AppEvent) {
@@ -156,6 +190,7 @@ fn tick(
     app.poll_pending_sends();
     app.poll_sync();
     app.poll_clipboard();
+    expire_yank_highlight(app);
     app.ensure_body_for_selection();
 
     finalize_finished_editors(app);
