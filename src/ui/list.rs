@@ -7,10 +7,16 @@ use ratatui::widgets::{List, ListItem, ListState};
 use crate::store::index::MessageRow;
 use crate::store::thread::ThreadedRow;
 use crate::ui::app::{InboxScreen, Pane, ScanState};
-use crate::ui::search::{SearchKind, SearchState};
+use crate::ui::search::SearchKind;
 use crate::ui::style::{pane_block, pane_scrollbar};
 
-pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
+/// Cells of margin to keep visible above / below the selected row.
+/// Vim's `scrolloff` semantic: walking the cursor *inside* the viewport
+/// doesn't move the viewport, but once the cursor lands within this band
+/// of the edge the viewport scrolls to maintain the margin.
+const SCROLL_PADDING: usize = 2;
+
+pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen) {
     let focused = inbox.focus == Pane::List;
     let block = pane_block("Messages", focused);
 
@@ -18,10 +24,14 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
     // threading — fzf-style. Each row prefixed with the folder (and
     // account when the scope crosses accounts) so cross-folder mixes
     // stay readable.
-    if let Some(s) = inbox.search.as_ref() {
-        draw_search(f, area, inbox, s, block, focused);
+    if inbox.search.is_some() {
+        draw_search(f, area, inbox, block, focused);
         return;
     }
+
+    let initial_offset = inbox.list_offset;
+    let selected_in = inbox.selected;
+    let mut new_offset = initial_offset;
 
     match &inbox.scan {
         ScanState::Scanning => {
@@ -69,68 +79,87 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
             let widget = List::new(items)
                 .block(block)
                 .highlight_style(highlight)
-                .highlight_symbol("▌ ");
+                .highlight_symbol("▌ ")
+                .scroll_padding(SCROLL_PADDING);
             let mut state = ListState::default();
-            let selected = inbox.selected.min(rows.len().saturating_sub(1));
+            *state.offset_mut() = initial_offset;
+            let selected = selected_in.min(rows.len().saturating_sub(1));
             state.select(Some(selected));
             f.render_stateful_widget(widget, area, &mut state);
+            new_offset = state.offset();
             pane_scrollbar(f, area, selected, rows.len(), focused);
         }
     }
+
+    inbox.list_offset = new_offset;
 }
 
 fn draw_search(
     f: &mut Frame,
     area: Rect,
-    inbox: &InboxScreen,
-    s: &SearchState,
+    inbox: &mut InboxScreen,
     block: ratatui::widgets::Block<'static>,
     focused: bool,
 ) {
-    if s.results.is_empty() {
-        let msg = if s.query.is_empty() {
-            "no messages in scope"
+    let initial_offset = inbox.list_offset;
+    let selected_in = inbox.selected;
+    let mut new_offset = initial_offset;
+    {
+        let s = inbox
+            .search
+            .as_ref()
+            .expect("draw_search called without an active search");
+        if s.results.is_empty() {
+            let msg = if s.query.is_empty() {
+                "no messages in scope"
+            } else {
+                "no matches"
+            };
+            let widget = List::new(vec![ListItem::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(Color::DarkGray),
+            )))])
+            .block(block);
+            f.render_widget(widget, area);
         } else {
-            "no matches"
-        };
-        let widget = List::new(vec![ListItem::new(Line::from(Span::styled(
-            msg,
-            Style::default().fg(Color::DarkGray),
-        )))])
-        .block(block);
-        f.render_widget(widget, area);
-        return;
+            // Account prefix only when the haystack spans accounts (`g/` from
+            // `[all]`, or local `/` from `[all]`). Otherwise account is
+            // redundant — the badge already names it.
+            let show_account = match &s.kind {
+                SearchKind::Local { account, .. } | SearchKind::Global { account, .. } => {
+                    account.is_none()
+                }
+            };
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let items: Vec<ListItem> = s
+                .results
+                .iter()
+                .filter_map(|(i, _)| s.haystack.get(*i))
+                .map(|row| ListItem::new(render_search_row(row, show_account, inner_width)))
+                .collect();
+            let highlight = if focused {
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(Color::DarkGray).fg(Color::Gray)
+            };
+            let widget = List::new(items)
+                .block(block)
+                .highlight_style(highlight)
+                .highlight_symbol("▌ ")
+                .scroll_padding(SCROLL_PADDING);
+            let mut state = ListState::default();
+            *state.offset_mut() = initial_offset;
+            let selected = selected_in.min(s.results.len().saturating_sub(1));
+            state.select(Some(selected));
+            f.render_stateful_widget(widget, area, &mut state);
+            new_offset = state.offset();
+            pane_scrollbar(f, area, selected, s.results.len(), focused);
+        }
     }
-    // Account prefix only when the haystack spans accounts (`g/` from
-    // `[all]`, or local `/` from `[all]`). Otherwise account is
-    // redundant — the badge already names it.
-    let show_account = match &s.kind {
-        SearchKind::Local { account, .. } | SearchKind::Global { account, .. } => account.is_none(),
-    };
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let items: Vec<ListItem> = s
-        .results
-        .iter()
-        .filter_map(|(i, _)| s.haystack.get(*i))
-        .map(|row| ListItem::new(render_search_row(row, show_account, inner_width)))
-        .collect();
-    let highlight = if focused {
-        Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().bg(Color::DarkGray).fg(Color::Gray)
-    };
-    let widget = List::new(items)
-        .block(block)
-        .highlight_style(highlight)
-        .highlight_symbol("▌ ");
-    let mut state = ListState::default();
-    let selected = inbox.selected.min(s.results.len().saturating_sub(1));
-    state.select(Some(selected));
-    f.render_stateful_widget(widget, area, &mut state);
-    pane_scrollbar(f, area, selected, s.results.len(), focused);
+    inbox.list_offset = new_offset;
 }
 
 /// Flat search-result row. Layout: `YYYY-MM-DD  acct/Folder  From            Subject`.

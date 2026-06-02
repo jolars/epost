@@ -365,6 +365,15 @@ pub struct InboxScreen {
     pub yank_highlight: Option<crate::ui::reader::YankHighlight>,
     pub scan: ScanState,
     pub selected: usize,
+    /// Persisted top-row offset for the messages list. Without this,
+    /// every render starts from `offset = 0` and ratatui re-derives the
+    /// offset from `selected` alone — which scrolls the viewport back
+    /// when the cursor walks up from a previously-scrolled position.
+    /// Combined with `List::scroll_padding`, this gives vim-style
+    /// `scrolloff` behavior: the cursor moves freely inside the
+    /// viewport, and only triggers a scroll when it gets within the
+    /// padding band of the top/bottom edge.
+    pub list_offset: usize,
     /// Boxed so its size doesn't bloat `Screen::Inbox` past the
     /// `large_enum_variant` threshold (same reason `search` is boxed).
     pub parsed: Option<Box<ParsedBody>>,
@@ -1196,6 +1205,7 @@ impl InboxScreen {
             yank_highlight: None,
             scan,
             selected: 0,
+            list_offset: 0,
             parsed: None,
             last_parsed_msgid: None,
             image_cache: HashMap::new(),
