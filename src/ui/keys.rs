@@ -200,6 +200,10 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             KeyCode::Char('j') => app.focus_down(),
             KeyCode::Char('k') => app.focus_up(),
             KeyCode::Char('l') => app.focus_right(),
+            // Vim convention: Ctrl-r is redo. Plain `u` (undo) lives in
+            // the universal section just below — both walk the same
+            // stack so the user expects them to fire from any focus.
+            KeyCode::Char('r') => app.redo(cfg),
             _ => {}
         }
         return;
@@ -234,6 +238,13 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
         }
         KeyCode::Char('n') => {
             cmdline::open_blank_compose_external(app, cfg);
+            return;
+        }
+        // `u` walks the undo stack; the Ctrl-r redo counterpart lives in
+        // the Ctrl-handler above. Both work in any focus so the user
+        // doesn't have to switch panes to reverse a misfired action.
+        KeyCode::Char('u') => {
+            app.undo(cfg);
             return;
         }
         _ => {}

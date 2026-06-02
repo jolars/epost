@@ -271,7 +271,12 @@ impl Index {
         }
     }
 
-    #[cfg(test)]
+    /// Look up a single row by message-id. `msgid` is the stable primary
+    /// key — paths and folder labels drift on every sync, but msgid is
+    /// the email header value, so this is the canonical "find this
+    /// message wherever it lives now" entry point. Used by undo/redo to
+    /// re-locate a previously-moved message before applying the inverse
+    /// rename.
     pub fn get(&self, msgid: &str) -> Result<Option<MessageRow>> {
         use rusqlite::OptionalExtension;
         self.conn

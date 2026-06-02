@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
@@ -94,6 +94,100 @@ pub enum ScanState {
     Failed(String),
 }
 
+/// One reversible message-view mutation, recorded on the undo stack so
+/// `u` / `Ctrl-r` can replay the inverse. Identity is the stable
+/// `msgid`, never a maildir path — paths drift on every mbsync run.
+///
+/// `Move` and `Flag` cover the entirety of the message-view mutation
+/// surface (`a` / `D` / `:archive` / `:spam` / `:trash` / `:mv` and
+/// `m` / `*` / `d`). Composer text editing is intentionally out of
+/// scope — `$EDITOR` owns its own undo buffer inside the pty.
+#[derive(Debug, Clone)]
+pub enum UndoAction {
+    Move {
+        msgid: String,
+        src_account: String,
+        src_folder: String,
+        /// Recorded for status text ("undid: move to Archive") and for
+        /// the redo direction. Identifies the post-action location.
+        dst_folder: String,
+    },
+    Flag {
+        msgid: String,
+        flag: char,
+        /// Whether the flag was set *before* the user's action. Drives
+        /// `FlagOp::Add` (restore set) or `FlagOp::Remove` (restore
+        /// unset) on undo; explicit Add/Remove instead of Toggle so a
+        /// concurrent sync flipping the flag in between can't double
+        /// our work.
+        was_set: bool,
+    },
+}
+
+/// In-memory undo/redo stacks for message-view mutations. Bounded so a
+/// long session doesn't accumulate stale entries; lost on restart by
+/// design (the index is truth, the stack is convenience).
+#[derive(Debug, Default)]
+pub struct UndoStack {
+    undo: VecDeque<UndoAction>,
+    redo: VecDeque<UndoAction>,
+}
+
+impl UndoStack {
+    const CAP: usize = 50;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a new user-initiated action. Clears the redo trail —
+    /// pressing `u` then taking a fresh action invalidates the
+    /// redo branch (standard editor convention).
+    pub fn record(&mut self, action: UndoAction) {
+        if self.undo.len() == Self::CAP {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(action);
+        self.redo.clear();
+    }
+
+    pub fn pop_undo(&mut self) -> Option<UndoAction> {
+        self.undo.pop_back()
+    }
+
+    pub fn pop_redo(&mut self) -> Option<UndoAction> {
+        self.redo.pop_back()
+    }
+
+    /// Push the inverse onto the redo stack after a successful undo.
+    /// Does not clear; redo→undo→redo cycles must be lossless.
+    pub fn push_redo(&mut self, action: UndoAction) {
+        if self.redo.len() == Self::CAP {
+            self.redo.pop_front();
+        }
+        self.redo.push_back(action);
+    }
+
+    /// Push the inverse onto the undo stack after a successful redo.
+    /// Does not clear redo.
+    pub fn push_undo(&mut self, action: UndoAction) {
+        if self.undo.len() == Self::CAP {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(action);
+    }
+
+    #[cfg(test)]
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    #[cfg(test)]
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
+    }
+}
+
 /// Top-level UI state. Holds the modal layer, cmdline buffer, status row,
 /// and the list of screens (Step 1 has only the inbox; tabs land in Step 2).
 /// App also owns process-global resources screens consult — the image
@@ -168,6 +262,11 @@ pub struct App {
     /// haven't emitted a native-editor shape yet (or it has since been
     /// reset to the terminal default).
     pub native_cursor_shape_emitted: Option<u16>,
+    /// Undo/redo for message-view mutations (moves + flag flips).
+    /// Recorded by the user-initiated wrappers (`toggle_flag_selected_user`,
+    /// `move_selected_to_user`) — internal callsites like auto-Seen
+    /// bypass it on purpose.
+    pub undo_stack: UndoStack,
 }
 
 /// A user-visible screen with its own tab in the strip and its own
@@ -376,6 +475,7 @@ impl App {
             event_tx,
             cursor_style_reset_pending: false,
             native_cursor_shape_emitted: None,
+            undo_stack: UndoStack::new(),
         }
     }
 
@@ -605,44 +705,239 @@ impl App {
 
     /// Toggle a maildir flag (`S` / `F` / `T`) on the selected row.
     /// Drives the user-facing flag bindings: `m` → Seen, `*` → Flagged,
-    /// `d` → Trashed.
+    /// `d` → Trashed. Pushes an undo entry on success — the internal
+    /// auto-Seen path lives on `InboxScreen::try_mark_seen` and bypasses
+    /// this method on purpose (so opening a message doesn't pollute the
+    /// undo stack).
     pub fn toggle_flag_selected(&mut self, flag: char) {
-        let Self {
-            screens,
-            cache_path,
-            self_writes,
-            status_error,
-            ..
-        } = self;
-        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
-            unreachable!("inbox is pinned at index 0")
+        let pre: Option<(String, bool)> = self
+            .inbox()
+            .selected_message_row()
+            .map(|r| (r.msgid.clone(), r.flags.contains(flag)));
+        let ok = {
+            let Self {
+                screens,
+                cache_path,
+                self_writes,
+                status_error,
+                ..
+            } = self;
+            let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+                unreachable!("inbox is pinned at index 0")
+            };
+            inbox.toggle_flag(flag, cache_path, self_writes, status_error)
         };
-        inbox.toggle_flag(flag, cache_path, self_writes, status_error);
+        if ok && let Some((msgid, was_set)) = pre {
+            self.undo_stack.record(UndoAction::Flag {
+                msgid,
+                flag,
+                was_set,
+            });
+        }
     }
 
     /// Move the selected row's message file into `target_folder` of the
     /// owning account. Drives `:archive` / `:spam` / `:trash` / `:mv`.
     /// The folder name is the Maildir++ label (e.g. `"Archive"`), not the
     /// on-disk `.Archive` directory. The target maildir is created if
-    /// missing.
+    /// missing. Pushes an undo entry on success.
     pub fn move_selected_to(&mut self, target_folder: &str, cfg: &Config) {
-        let Self {
-            screens,
-            cache_path,
-            self_writes,
-            status_error,
-            ..
-        } = self;
-        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
-            unreachable!("inbox is pinned at index 0")
+        let pre: Option<(String, String, String)> = self
+            .inbox()
+            .selected_message_row()
+            .map(|r| (r.msgid.clone(), r.account.clone(), r.folder.clone()));
+        let ok = {
+            let Self {
+                screens,
+                cache_path,
+                self_writes,
+                status_error,
+                ..
+            } = self;
+            let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+                unreachable!("inbox is pinned at index 0")
+            };
+            inbox.move_selected_to(
+                target_folder,
+                &cfg.accounts,
+                cache_path,
+                self_writes,
+                status_error,
+            )
         };
-        inbox.move_selected_to(
-            target_folder,
-            &cfg.accounts,
-            cache_path,
-            self_writes,
-            status_error,
-        );
+        if ok && let Some((msgid, src_account, src_folder)) = pre {
+            self.undo_stack.record(UndoAction::Move {
+                msgid,
+                src_account,
+                src_folder,
+                dst_folder: target_folder.to_string(),
+            });
+        }
+    }
+
+    /// Pop the most recent message-view mutation off the undo stack and
+    /// apply its inverse. The inverse is pushed onto the redo stack so
+    /// `Ctrl-r` can re-execute the original. Failure modes (msgid not in
+    /// index, src folder no longer configured, rename failed) surface in
+    /// `status_error` and discard the action — they don't re-push.
+    pub fn undo(&mut self, cfg: &Config) {
+        let Some(action) = self.undo_stack.pop_undo() else {
+            self.status_error = Some("nothing to undo".into());
+            return;
+        };
+        if let Some(inverse) = self.apply_inverse(action, cfg, "undid") {
+            self.undo_stack.push_redo(inverse);
+        }
+    }
+
+    /// Mirror of [`App::undo`] for the `Ctrl-r` direction.
+    pub fn redo(&mut self, cfg: &Config) {
+        let Some(action) = self.undo_stack.pop_redo() else {
+            self.status_error = Some("nothing to redo".into());
+            return;
+        };
+        if let Some(inverse) = self.apply_inverse(action, cfg, "redid") {
+            self.undo_stack.push_undo(inverse);
+        }
+    }
+
+    /// Shared body of [`App::undo`] / [`App::redo`]: locate the message
+    /// by msgid via the index (paths drift on sync, msgid is stable),
+    /// replay the inverse rename, update folder stats + in-memory views,
+    /// return the inverse action so the caller can push it onto the
+    /// opposite stack. `verb` shapes the status-line text only.
+    fn apply_inverse(
+        &mut self,
+        action: UndoAction,
+        cfg: &Config,
+        verb: &str,
+    ) -> Option<UndoAction> {
+        let msgid = match &action {
+            UndoAction::Move { msgid, .. } | UndoAction::Flag { msgid, .. } => msgid.clone(),
+        };
+        let current = match Index::open(&self.cache_path).and_then(|idx| idx.get(&msgid)) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.status_error = Some(format!("{verb}: {msgid} no longer indexed"));
+                return None;
+            }
+            Err(e) => {
+                self.status_error = Some(format!("{verb}: index lookup failed: {e:#}"));
+                return None;
+            }
+        };
+        match action {
+            UndoAction::Flag {
+                msgid,
+                flag,
+                was_set,
+            } => {
+                let op = if was_set { FlagOp::Add } else { FlagOp::Remove };
+                match flags::set_flag_recorded(&current.path, flag, op, &self.self_writes) {
+                    Ok((new_path, new_flags)) => {
+                        let Self {
+                            screens,
+                            cache_path,
+                            status_error,
+                            ..
+                        } = self;
+                        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+                            unreachable!("inbox is pinned at index 0")
+                        };
+                        inbox.apply_flag_undo(
+                            &msgid,
+                            &current,
+                            &new_path,
+                            &new_flags,
+                            cache_path,
+                            status_error,
+                        );
+                        *status_error = Some(format!("{verb}: flag {flag}"));
+                        Some(UndoAction::Flag {
+                            msgid,
+                            flag,
+                            was_set: !was_set,
+                        })
+                    }
+                    Err(e) => {
+                        self.status_error = Some(format!("{verb}: {e}"));
+                        None
+                    }
+                }
+            }
+            UndoAction::Move {
+                msgid,
+                src_account,
+                src_folder,
+                dst_folder,
+            } => {
+                let Some(account_cfg) = cfg.accounts.get(&src_account) else {
+                    self.status_error = Some(format!("{verb}: unknown account {src_account}"));
+                    return None;
+                };
+                let spec = AccountSpec::from_account(&src_account, account_cfg);
+                let Some(binding) = spec.binding_by_label(&src_folder) else {
+                    self.status_error = Some(format!(
+                        "{verb}: {src_folder} not configured on {src_account}"
+                    ));
+                    return None;
+                };
+                let folder_root = binding.path.clone();
+                let target_cur = folder_root.join("cur");
+                if let Err(e) = flags::ensure_maildir(&folder_root) {
+                    self.status_error = Some(format!("{verb}: create {src_folder}: {e}"));
+                    return None;
+                }
+                // Idempotent watcher registration so external writes to a
+                // freshly-created source folder still surface.
+                if let Some(w) = self.inbox().watcher.as_ref() {
+                    w.register_folder(&src_account, &src_folder, &folder_root, account_cfg.layout);
+                }
+                match flags::move_to_folder_recorded(
+                    &current.path,
+                    &target_cur,
+                    &current.flags,
+                    &self.self_writes,
+                ) {
+                    Ok(new_path) => {
+                        let original_dst_account = current.account.clone();
+                        let original_dst_folder = current.folder.clone();
+                        let Self {
+                            screens,
+                            cache_path,
+                            status_error,
+                            ..
+                        } = self;
+                        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+                            unreachable!("inbox is pinned at index 0")
+                        };
+                        inbox.apply_move_undo(
+                            &msgid,
+                            &current,
+                            &src_folder,
+                            &new_path,
+                            cache_path,
+                            status_error,
+                        );
+                        *status_error = Some(format!("{verb}: move to {dst_folder}"));
+                        // Inverse: the "src" of the next-direction action is
+                        // where the message is *now* (= the original dst);
+                        // the "dst" is where it was before this undo (= the
+                        // original src). Account doesn't change cross-folder.
+                        Some(UndoAction::Move {
+                            msgid,
+                            src_account: original_dst_account,
+                            src_folder: original_dst_folder,
+                            dst_folder: src_folder,
+                        })
+                    }
+                    Err(e) => {
+                        self.status_error = Some(format!("{verb}: {e}"));
+                        None
+                    }
+                }
+            }
+        }
     }
 
     // --- Convenience pass-throughs so keys.rs doesn't reach into inbox
@@ -1133,26 +1428,31 @@ impl InboxScreen {
         }
     }
 
+    /// Returns `true` iff the rename succeeded — the App-level wrapper
+    /// uses that to decide whether to push an undo entry. Early returns
+    /// for "no selection" / "no row" / rename failure all yield `false`.
     pub fn toggle_flag(
         &mut self,
         flag: char,
         cache_path: &Path,
         self_writes: &SelfWrites,
         status_error: &mut Option<String>,
-    ) {
+    ) -> bool {
         let Some(msgid) = self.selected_msgid() else {
-            return;
+            return false;
         };
         let Some(row) = self.find_row(&msgid) else {
-            return;
+            return false;
         };
         let path = row.path.clone();
         match flags::set_flag_recorded(&path, flag, FlagOp::Toggle, self_writes) {
             Ok((new_path, new_flags)) => {
                 self.apply_flag_change(&msgid, &new_path, &new_flags, cache_path, status_error);
+                true
             }
             Err(e) => {
                 *status_error = Some(format!("toggle {flag}: {e}"));
+                false
             }
         }
     }
@@ -1161,7 +1461,9 @@ impl InboxScreen {
     /// preserving its flag suffix. On success: records both paths on the
     /// self-write registry (so the future Step 7 watcher will skip its own
     /// echo), drops the row from the in-memory inbox view, and mirrors the
-    /// new folder/path into the SQLite index.
+    /// new folder/path into the SQLite index. Returns `true` iff the rename
+    /// succeeded so the App-level wrapper can decide whether to push an
+    /// undo entry.
     pub fn move_selected_to(
         &mut self,
         target_folder: &str,
@@ -1169,12 +1471,12 @@ impl InboxScreen {
         cache_path: &Path,
         self_writes: &SelfWrites,
         status_error: &mut Option<String>,
-    ) {
+    ) -> bool {
         let Some(msgid) = self.selected_msgid() else {
-            return;
+            return false;
         };
         let Some(row) = self.find_row(&msgid) else {
-            return;
+            return false;
         };
         let account_name = row.account.clone();
         let path = row.path.clone();
@@ -1182,7 +1484,7 @@ impl InboxScreen {
 
         let Some(account) = accounts.get(&account_name) else {
             *status_error = Some(format!("move: unknown account {account_name}"));
-            return;
+            return false;
         };
         // Bindings are config-derived and cheap to rebuild; doing it
         // here avoids threading the AccountSpec map through every
@@ -1196,14 +1498,14 @@ impl InboxScreen {
             *status_error = Some(format!(
                 "move: {target_folder} not configured on {account_name}"
             ));
-            return;
+            return false;
         };
         let folder_root = binding.path.clone();
         let target_cur = folder_root.join("cur");
 
         if let Err(e) = flags::ensure_maildir(&folder_root) {
             *status_error = Some(format!("move: create {target_folder}: {e}"));
-            return;
+            return false;
         }
 
         match flags::move_to_folder_recorded(&path, &target_cur, &row_flags, self_writes) {
@@ -1222,9 +1524,11 @@ impl InboxScreen {
                     status_error,
                 );
                 *status_error = Some(format!("moved to {target_folder}"));
+                true
             }
             Err(e) => {
                 *status_error = Some(format!("move to {target_folder}: {e}"));
+                false
             }
         }
     }
@@ -1295,6 +1599,125 @@ impl InboxScreen {
         if let Err(e) = mirror_to_index(cache_path, &snapshot) {
             *status_error = Some(format!("index mirror failed: {e:#}"));
         }
+    }
+
+    /// Post-rename bookkeeping for an undo flag flip. Same shape as
+    /// [`InboxScreen::apply_flag_change`], but the pre-state comes from
+    /// the index lookup (`current`) instead of `find_row`, so it also
+    /// handles cross-scope undo where the row isn't in any in-memory
+    /// view. Stats are adjusted against `current.account` /
+    /// `current.folder`; in-memory rows are patched when present.
+    fn apply_flag_undo(
+        &mut self,
+        msgid: &str,
+        current: &MessageRow,
+        new_path: &Path,
+        new_flags: &str,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) {
+        let was_unread = !current.flags.contains('S');
+        let now_unread = !new_flags.contains('S');
+        let unread_delta: i64 = match (was_unread, now_unread) {
+            (true, false) => -1,
+            (false, true) => 1,
+            _ => 0,
+        };
+        if unread_delta != 0 {
+            adjust_unread(
+                &mut self.folder_stats,
+                &current.account,
+                &current.folder,
+                unread_delta,
+            );
+        }
+        if let ScanState::Ready(rows) = &mut self.scan
+            && let Some(t) = rows.iter_mut().find(|t| t.row.msgid == msgid)
+        {
+            t.row.path = new_path.to_path_buf();
+            t.row.flags = new_flags.to_string();
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.patch_row(msgid, new_path, new_flags);
+        }
+        let mut snap = current.clone();
+        snap.path = new_path.to_path_buf();
+        snap.flags = new_flags.to_string();
+        if let Err(e) = mirror_to_index(cache_path, &snap) {
+            *status_error = Some(format!("index mirror failed: {e:#}"));
+        }
+    }
+
+    /// Post-rename bookkeeping for an undo move. Same shape as
+    /// [`InboxScreen::drop_row_after_move`], but the pre-state comes
+    /// from the index lookup (`current`) rather than `find_row` —
+    /// after the user's forward move the row was already dropped from
+    /// the in-memory view, so we can't look it up there. Marks
+    /// `src_folder` dirty so the next `poll_watch` tick rescans it,
+    /// which is how the row reappears in scan when the current scope
+    /// is the undo destination.
+    fn apply_move_undo(
+        &mut self,
+        msgid: &str,
+        current: &MessageRow,
+        src_folder: &str,
+        new_path: &Path,
+        cache_path: &Path,
+        status_error: &mut Option<String>,
+    ) {
+        let was_unread = !current.flags.contains('S');
+        let mut snap = current.clone();
+        snap.folder = src_folder.to_string();
+        snap.path = new_path.to_path_buf();
+
+        // Drop from scan if the row happens to be in view (uncommon —
+        // the forward move already dropped it — but defend against the
+        // case where a rescan re-surfaced it under the dst label).
+        if let ScanState::Ready(rows) = &mut self.scan
+            && let Some(i) = rows.iter().position(|t| t.row.msgid == msgid)
+        {
+            rows.remove(i);
+            if self.search.is_none() {
+                if rows.is_empty() {
+                    self.selected = 0;
+                } else if self.selected >= rows.len() {
+                    self.selected = rows.len() - 1;
+                }
+            }
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.drop_msgid(msgid);
+            if s.results.is_empty() {
+                self.selected = 0;
+            } else if self.selected >= s.results.len() {
+                self.selected = s.results.len() - 1;
+            }
+        }
+        adjust_total(
+            &mut self.folder_stats,
+            &current.account,
+            &current.folder,
+            -1,
+        );
+        adjust_total(&mut self.folder_stats, &current.account, src_folder, 1);
+        if was_unread {
+            adjust_unread(
+                &mut self.folder_stats,
+                &current.account,
+                &current.folder,
+                -1,
+            );
+            adjust_unread(&mut self.folder_stats, &current.account, src_folder, 1);
+        }
+        if let Err(e) = mirror_to_index(cache_path, &snap) {
+            *status_error = Some(format!("index mirror failed: {e:#}"));
+        }
+        // Queue a rescan of the destination folder so the row reappears
+        // in scan when the user's current scope == src_folder. Watcher's
+        // self-write suppression eats the rename event, so we have to
+        // mark dirty ourselves.
+        self.pending_dirty
+            .insert((current.account.clone(), src_folder.to_string()));
     }
 
     /// Patch the in-memory row's `path` / `flags` after a successful
@@ -2404,7 +2827,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
 \r\n\
 <p>body</p>\r\n";
 
-    fn drop_message(tmp: &TempDir, dir: &str, basename: &str) -> std::path::PathBuf {
+    pub(super) fn drop_message(tmp: &TempDir, dir: &str, basename: &str) -> std::path::PathBuf {
         let inbox = tmp.path().join("Mail").join("personal");
         fs::create_dir_all(inbox.join("cur")).unwrap();
         fs::create_dir_all(inbox.join("new")).unwrap();
@@ -2413,7 +2836,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         p
     }
 
-    fn one_account_config(tmp: &TempDir) -> Config {
+    pub(super) fn one_account_config(tmp: &TempDir) -> Config {
         let mut cfg = Config::default();
         cfg.accounts.insert(
             "personal".into(),
@@ -2484,7 +2907,7 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
     /// the user on the eager INBOX result alone, but tests want every
     /// folder scanned before they assert — so this helper waits past
     /// both stages.
-    fn drain_scan(app: &mut App, cfg: &Config) {
+    pub(super) fn drain_scan(app: &mut App, cfg: &Config) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             app.poll_scan(cfg);
@@ -2680,7 +3103,11 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         );
     }
 
-    fn account_with_folders(tmp: &TempDir, archive: Option<&str>, trash: Option<&str>) -> Config {
+    pub(super) fn account_with_folders(
+        tmp: &TempDir,
+        archive: Option<&str>,
+        trash: Option<&str>,
+    ) -> Config {
         let mut cfg = Config::default();
         cfg.accounts.insert(
             "personal".into(),
@@ -3350,6 +3777,319 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
                 .pending_dirty
                 .contains(&("personal".into(), "Sent".into())),
             "scanned-folders hit must skip the rescan enqueue"
+        );
+    }
+}
+
+#[cfg(test)]
+mod undo_stack_tests {
+    //! Pure-mechanics tests for the in-memory `UndoStack`. Integration
+    //! tests that exercise the on-disk rename and index mirror live in
+    //! `undo_integration_tests` below.
+
+    use super::*;
+
+    fn flag(msgid: &str, was_set: bool) -> UndoAction {
+        UndoAction::Flag {
+            msgid: msgid.to_string(),
+            flag: 'S',
+            was_set,
+        }
+    }
+
+    #[test]
+    fn record_clears_redo() {
+        let mut s = UndoStack::new();
+        s.record(flag("a", true));
+        let _ = s.pop_undo();
+        s.push_redo(flag("a", false));
+        assert_eq!(s.redo_len(), 1);
+        // A fresh user action should drop the dangling redo branch.
+        s.record(flag("b", true));
+        assert_eq!(s.redo_len(), 0);
+        assert_eq!(s.undo_len(), 1);
+    }
+
+    #[test]
+    fn pop_returns_lifo() {
+        let mut s = UndoStack::new();
+        s.record(flag("a", true));
+        s.record(flag("b", false));
+        let last = s.pop_undo().unwrap();
+        match last {
+            UndoAction::Flag { msgid, .. } => assert_eq!(msgid, "b"),
+            _ => panic!("expected Flag"),
+        }
+    }
+
+    #[test]
+    fn push_redo_does_not_clear() {
+        // The redo direction must be lossless across multiple undos so
+        // a user can `u u Ctrl-r Ctrl-r` back to their starting state.
+        let mut s = UndoStack::new();
+        s.push_redo(flag("a", true));
+        s.push_redo(flag("b", false));
+        assert_eq!(s.redo_len(), 2);
+    }
+
+    #[test]
+    fn cap_evicts_oldest() {
+        let mut s = UndoStack::new();
+        for i in 0..UndoStack::CAP + 5 {
+            s.record(flag(&format!("m{i}"), true));
+        }
+        assert_eq!(s.undo_len(), UndoStack::CAP);
+        // The newest entry must still be on top after eviction.
+        let top = s.pop_undo().unwrap();
+        match top {
+            UndoAction::Flag { msgid, .. } => assert_eq!(msgid, format!("m{}", UndoStack::CAP + 4)),
+            _ => panic!("expected Flag"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod undo_integration_tests {
+    //! End-to-end undo/redo tests against a real on-disk maildir + the
+    //! same SQLite index a live binary uses. Reuses the helpers from
+    //! `flag_integration_tests` for the fixture.
+
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::flag_integration_tests::*;
+    use super::*;
+
+    fn drop_inbox_msg(tmp: &TempDir, basename: &str) -> std::path::PathBuf {
+        let inbox = tmp.path().join("Mail").join("personal");
+        fs::create_dir_all(inbox.join("cur")).unwrap();
+        fs::create_dir_all(inbox.join("new")).unwrap();
+        let p = inbox.join("cur").join(basename);
+        let body = "Message-ID: <m1@example.invalid>\r\n\
+                    From: a@b\r\n\
+                    Subject: hi\r\n\
+                    Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
+                    \r\n\
+                    body\r\n";
+        fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn auto_seen_does_not_pollute_undo_stack() {
+        // Opening a message implicitly marks it Seen via try_mark_seen,
+        // which bypasses the App-level wrapper. Confirms that internal
+        // flag flips don't show up on the user-visible undo stack.
+        let tmp = TempDir::new().unwrap();
+        let _src = drop_inbox_msg(&tmp, "x1");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+        app.ensure_body_for_selection();
+        assert_eq!(
+            app.undo_stack.undo_len(),
+            0,
+            "auto-seen must not push to undo stack"
+        );
+    }
+
+    #[test]
+    fn flag_toggle_records_then_undo_restores() {
+        let tmp = TempDir::new().unwrap();
+        let _src = drop_inbox_msg(&tmp, "x1:2,S");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        // Capture pre-state.
+        let pre_flags = app
+            .inbox()
+            .threaded()
+            .first()
+            .expect("row")
+            .row
+            .flags
+            .clone();
+        assert!(pre_flags.contains('S'), "fixture must start Seen");
+
+        // Forward action.
+        app.toggle_flag_selected('S');
+        let mid_flags = app
+            .inbox()
+            .threaded()
+            .first()
+            .expect("row")
+            .row
+            .flags
+            .clone();
+        assert!(!mid_flags.contains('S'), "S must be cleared after toggle");
+        assert_eq!(app.undo_stack.undo_len(), 1, "toggle must record undo");
+        assert_eq!(app.undo_stack.redo_len(), 0);
+
+        // Undo restores the prior state.
+        app.undo(&cfg);
+        let after_flags = app
+            .inbox()
+            .threaded()
+            .first()
+            .expect("row")
+            .row
+            .flags
+            .clone();
+        assert!(
+            after_flags.contains('S'),
+            "undo must put S back, got {after_flags:?}"
+        );
+        assert_eq!(app.undo_stack.undo_len(), 0);
+        assert_eq!(app.undo_stack.redo_len(), 1, "undo must push redo entry");
+
+        // Redo re-clears it.
+        app.redo(&cfg);
+        let redone_flags = app
+            .inbox()
+            .threaded()
+            .first()
+            .expect("row")
+            .row
+            .flags
+            .clone();
+        assert!(
+            !redone_flags.contains('S'),
+            "redo must re-clear S, got {redone_flags:?}"
+        );
+        assert_eq!(app.undo_stack.undo_len(), 1);
+        assert_eq!(app.undo_stack.redo_len(), 0);
+    }
+
+    #[test]
+    fn empty_undo_emits_status() {
+        let tmp = TempDir::new().unwrap();
+        let _ = drop_inbox_msg(&tmp, "x1:2,S");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        app.undo(&cfg);
+        assert_eq!(app.status_error.as_deref(), Some("nothing to undo"));
+        app.redo(&cfg);
+        assert_eq!(app.status_error.as_deref(), Some("nothing to redo"));
+    }
+
+    #[test]
+    fn fresh_action_clears_redo() {
+        let tmp = TempDir::new().unwrap();
+        let _ = drop_inbox_msg(&tmp, "x1:2,S");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        app.toggle_flag_selected('S');
+        app.undo(&cfg);
+        assert_eq!(app.undo_stack.redo_len(), 1, "undo populates redo");
+        // Fresh action invalidates the redo branch.
+        app.toggle_flag_selected('F');
+        assert_eq!(
+            app.undo_stack.redo_len(),
+            0,
+            "new mutation must clear redo trail"
+        );
+        assert_eq!(app.undo_stack.undo_len(), 1);
+    }
+
+    #[test]
+    fn was_set_captured_pre_toggle() {
+        // Pre-state must be captured BEFORE the toggle fires, otherwise
+        // the recorded `was_set` reflects post-toggle state and undo
+        // becomes a no-op.
+        let tmp = TempDir::new().unwrap();
+        let _ = drop_inbox_msg(&tmp, "x1:2,S");
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        app.toggle_flag_selected('F');
+        match app.undo_stack.pop_undo().expect("recorded") {
+            UndoAction::Flag { flag, was_set, .. } => {
+                assert_eq!(flag, 'F');
+                assert!(!was_set, "F was not set before user pressed *");
+            }
+            _ => panic!("expected Flag"),
+        }
+    }
+
+    #[test]
+    fn archive_then_undo_returns_file_to_inbox() {
+        let tmp = TempDir::new().unwrap();
+        let _ = drop_inbox_msg(&tmp, "x1:2,S");
+        let cfg = account_with_folders(&tmp, Some("Archive"), None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+        let msgid = app.inbox().selected_msgid().expect("a selected row");
+
+        // Forward: archive.
+        cmdline::dispatch("archive", &mut app, &cfg);
+        let archived = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join(".Archive")
+            .join("cur")
+            .join("x1:2,S");
+        assert!(archived.exists(), "archive must place file in .Archive/cur");
+        assert_eq!(app.undo_stack.undo_len(), 1);
+
+        // Undo: file should be back in INBOX/cur. Path may differ from
+        // the original due to filename canonicalization, but msgid lookup
+        // tells us where it landed.
+        app.undo(&cfg);
+        assert!(!archived.exists(), "undo must remove file from Archive");
+        let idx = Index::open(&app.cache_path).unwrap();
+        let row = idx.get(&msgid).unwrap().expect("row still indexed");
+        assert_eq!(row.folder, "INBOX");
+        assert!(row.path.exists(), "undo-restored file must exist on disk");
+        assert!(
+            row.path
+                .starts_with(tmp.path().join("Mail").join("personal").join("cur"))
+        );
+        assert_eq!(app.undo_stack.undo_len(), 0);
+        assert_eq!(app.undo_stack.redo_len(), 1);
+    }
+
+    #[test]
+    fn move_undo_marks_src_folder_dirty() {
+        // The watcher's self-write suppression eats the rename event, so
+        // the undo path is responsible for queuing a rescan. Confirms
+        // src_folder lands in pending_dirty so the row re-surfaces in
+        // the in-memory view.
+        let tmp = TempDir::new().unwrap();
+        let _ = drop_inbox_msg(&tmp, "x1:2,S");
+        let cfg = account_with_folders(&tmp, Some("Archive"), None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        cmdline::dispatch("archive", &mut app, &cfg);
+        app.inbox_mut().pending_dirty.clear();
+        app.undo(&cfg);
+        assert!(
+            app.inbox()
+                .pending_dirty
+                .contains(&("personal".to_string(), "INBOX".to_string())),
+            "undo of archive must queue a rescan of INBOX"
         );
     }
 }
