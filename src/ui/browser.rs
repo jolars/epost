@@ -110,6 +110,47 @@ pub fn open_attachment(att: &Attachment, cmd: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Spawn a drag-and-drop source for the attachment. Mirrors
+/// `open_attachment` (tempfile preserves the extension, command runs on
+/// a detached worker thread, tempfile lives until the OS cleans /tmp)
+/// — the only difference is the configured command (`dragon` /
+/// `dragon-drop` / Wayland equivalent), which stays open until the user
+/// drops the file. Errors when the command is unset or empty so the
+/// user sees `:drag` fail in the status row rather than silently doing
+/// nothing.
+pub fn drag_attachment(att: &Attachment, cmd: Option<&[String]>) -> Result<()> {
+    let cmd = match cmd {
+        Some(c) if !c.is_empty() => c,
+        _ => return Err(anyhow!("drag command not configured ([reader].drag)")),
+    };
+    let ext = std::path::Path::new(&att.filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| format!(".{s}"))
+        .unwrap_or_else(|| ".bin".to_string());
+    let mut tmp = Builder::new()
+        .prefix("epost-att-")
+        .suffix(&ext)
+        .tempfile()
+        .context("creating attachment tempfile")?;
+    tmp.write_all(&att.bytes)
+        .context("writing attachment tempfile")?;
+    tmp.disable_cleanup(true);
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let cmd = cmd.to_vec();
+    std::thread::spawn(move || {
+        let mut c = Command::new(&cmd[0]);
+        for arg in &cmd[1..] {
+            c.arg(arg);
+        }
+        c.arg(&path);
+        let _ = c.status();
+    });
+    Ok(())
+}
+
 pub fn open_url(href: &str, cmd: &[String]) -> Result<()> {
     if cmd.is_empty() {
         return Err(anyhow!("no browser command configured"));
@@ -233,5 +274,41 @@ mod tests {
         assert!(last.ends_with(".pdf"), "argv last={last:?}");
         let bytes = fs::read(&last).unwrap_or_default();
         assert_eq!(bytes, b"%PDF-1.4 stub");
+    }
+
+    #[test]
+    fn drag_attachment_writes_tempfile_and_invokes_command() {
+        let out = "/tmp/epost-test-drag-att";
+        let cmd = run_stub(out);
+        let att = Attachment {
+            filename: "logo.png".into(),
+            bytes: b"\x89PNG stub".to_vec(),
+        };
+        drag_attachment(&att, Some(&cmd)).unwrap();
+        let argv_path = PathBuf::from(format!("{out}/argv.txt"));
+        for _ in 0..40 {
+            if argv_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let lines = read_lines(argv_path);
+        let last = lines.last().cloned().unwrap_or_default();
+        assert!(last.ends_with(".png"), "argv last={last:?}");
+        let bytes = fs::read(&last).unwrap_or_default();
+        assert_eq!(bytes, b"\x89PNG stub");
+    }
+
+    #[test]
+    fn drag_attachment_unset_command_errors() {
+        let att = Attachment {
+            filename: "x.txt".into(),
+            bytes: b"hi".to_vec(),
+        };
+        let err = drag_attachment(&att, None).unwrap_err().to_string();
+        assert!(err.contains("not configured"), "{err}");
+        let empty: Vec<String> = Vec::new();
+        let err = drag_attachment(&att, Some(&empty)).unwrap_err().to_string();
+        assert!(err.contains("not configured"), "{err}");
     }
 }

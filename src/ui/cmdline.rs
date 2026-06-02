@@ -158,6 +158,7 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
         "detach" => detach_index(app, &mut parts),
         "save" => save_attachment(app, cmd),
         "open-attachment" => open_attachment(app, &mut parts, cfg),
+        "drag" => drag_attachment_cmd(app, &mut parts, cfg),
         "from" => switch_from(app, cfg, parts.next()),
         "account" => match parts.next() {
             None | Some("all") => app.switch_to_scope(None, "INBOX"),
@@ -351,6 +352,39 @@ fn save_attachment(app: &mut App, full_cmd: &str) {
         return;
     }
     app.status_error = Some(format!("saved: {}", target.display()));
+}
+
+/// `:drag <n>` — write the attachment to a tempfile and hand it to the
+/// `[reader].drag` command (typically `dragon` / `dragon-drop`). The
+/// command stays open until the user drops the file into another app;
+/// the worker thread runs detached and the tempfile lives until the OS
+/// cleans /tmp. Errors when `[reader].drag` is unset.
+fn drag_attachment_cmd(app: &mut App, parts: &mut std::str::SplitWhitespace, cfg: &Config) {
+    let Some(arg) = parts.next() else {
+        app.status_error = Some("drag: missing index".into());
+        return;
+    };
+    let Ok(n) = arg.parse::<usize>() else {
+        app.status_error = Some(format!("drag: not a number: {arg}"));
+        return;
+    };
+    let Some(parsed) = app.inbox_parsed() else {
+        app.status_error = Some("drag: no parsed body".into());
+        return;
+    };
+    if n == 0 || n > parsed.attachments.len() {
+        app.status_error = Some(format!(
+            "drag: index {n} out of range (have {})",
+            parsed.attachments.len()
+        ));
+        return;
+    }
+    let att = parsed.attachments[n - 1].clone();
+    if let Err(e) = browser::drag_attachment(&att, cfg.reader.drag.as_deref()) {
+        app.status_error = Some(format!("drag: {e:#}"));
+        return;
+    }
+    app.status_error = Some(format!("dragging: {}", att.filename));
 }
 
 /// `:open-attachment <n>` — write the attachment to a tempfile preserving
@@ -946,5 +980,21 @@ mod tests {
         dispatch("open-attachment", &mut app, &cfg);
         let err = app.status_error.as_deref().expect("status");
         assert!(err.contains("missing index"), "got {err:?}");
+    }
+
+    #[test]
+    fn dispatch_drag_missing_index_reports_error() {
+        let (mut app, cfg) = test_app();
+        dispatch("drag", &mut app, &cfg);
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("missing index"), "got {err:?}");
+    }
+
+    #[test]
+    fn dispatch_drag_with_no_body_reports_error() {
+        let (mut app, cfg) = test_app();
+        dispatch("drag 1", &mut app, &cfg);
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("no parsed body"), "got {err:?}");
     }
 }

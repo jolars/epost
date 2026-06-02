@@ -94,6 +94,13 @@ pub struct Reader {
     /// terminal's native selection.
     #[serde(default = "yes")]
     pub mouse: bool,
+    /// Drag-and-drop opener for `:drag <n>`. Receives the attachment
+    /// tempfile path as a trailing argv. Typically `["dragon",
+    /// "--and-exit"]` (X11) or a Wayland equivalent. Unset = `:drag`
+    /// errors out — different distros ship different binaries, so there
+    /// is no useful default.
+    #[serde(default)]
+    pub drag: Option<Vec<String>>,
 }
 
 impl Default for Reader {
@@ -103,6 +110,7 @@ impl Default for Reader {
             browser: default_browser(),
             clipboard: None,
             mouse: true,
+            drag: None,
         }
     }
 }
@@ -660,6 +668,27 @@ mod tests {
             cfg.reader.clipboard.as_deref(),
             Some(["wl-copy".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn parses_reader_drag_command() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [reader]
+            drag = ["dragon", "--and-exit"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.reader.drag.as_deref(),
+            Some(["dragon".to_string(), "--and-exit".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn reader_drag_defaults_to_none() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.reader.drag.is_none());
     }
 
     #[test]
