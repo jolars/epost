@@ -148,7 +148,15 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             app.status_error = Some(msg);
         }
         match outcome {
-            compose::KeyOutcome::Consumed => return,
+            compose::KeyOutcome::Consumed => {
+                // After every consumed compose key, re-derive the
+                // address-completion popup state. This is where the
+                // popup opens (token grew past min_chars), closes
+                // (focus moved off a recipient field), or rearms its
+                // external debounce.
+                app.refresh_address_complete(cfg);
+                return;
+            }
             compose::KeyOutcome::CloseTab => {
                 // The close-confirm "Discard" arm. The prompt already
                 // cleared `confirm_close`; just drop the tab. The

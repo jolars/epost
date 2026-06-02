@@ -1,3 +1,5 @@
+pub mod addressbook;
+pub mod addressbook_external;
 pub mod compose;
 pub mod flags;
 pub mod html;

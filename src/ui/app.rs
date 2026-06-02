@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::picker::Picker;
 
 use crate::config::{Account, Config};
+use crate::mail::addressbook::{self, AddressBook, AddressBookResult};
+use crate::mail::addressbook_external::{self, ExtResult};
 use crate::mail::compose::{SendOutcome, SendResult};
 use crate::mail::flags::{self, FlagOp};
 use crate::mail::html::{self, Block};
@@ -18,8 +20,9 @@ use crate::store::scan::{self, AccountFolderStats, ScanResult};
 use crate::store::sync::SyncResult;
 use crate::store::thread::{ThreadedRow, build_threads};
 use crate::store::watch::{self, SelfWrites, Watcher, WatcherConfig, WatcherEvent};
+use crate::ui::address_complete::{self, AddressCompleteState};
 use crate::ui::clipboard::ClipboardResult;
-use crate::ui::compose::ComposeScreen;
+use crate::ui::compose::{ComposeField, ComposeScreen};
 use crate::ui::events::AppEvent;
 use crate::ui::images::{self, ImageKey, ResolvedImage};
 use crate::ui::motion::MotionTarget;
@@ -244,6 +247,33 @@ pub struct App {
     /// receivers and the most recent one wins for status display —
     /// fine because real fallback commands return in milliseconds.
     pub clipboard_rx: Option<Receiver<ClipboardResult>>,
+    /// Native address-book cache (recipients harvested from each
+    /// account's Sent folder at startup). Empty until
+    /// `address_book_rx` reports back; the compose popup just sees no
+    /// native matches in the meantime.
+    pub address_book: AddressBook,
+    /// Startup-walk receiver for the native address book. `Some` until
+    /// the worker drops its single message; then cleared. Only one
+    /// startup run per session.
+    pub address_book_rx: Option<Receiver<AddressBookResult>>,
+    /// Per-keystroke external `query_command` receiver. Exactly one in
+    /// flight at a time; subsequent queries land in
+    /// `address_pending_query` and dispatch when the in-flight worker
+    /// completes (or the debounce elapses, whichever is later).
+    pub address_ext_rx: Option<Receiver<ExtResult>>,
+    /// Query string the currently-in-flight external worker is
+    /// resolving. `None` when nothing is running. Used to dedupe the
+    /// dispatcher and to filter stale results.
+    pub address_in_flight_query: Option<String>,
+    /// Query the user has typed and we have *not yet* dispatched —
+    /// either because the debounce hasn't fired, or because an in-flight
+    /// worker is still running on an older query.
+    pub address_pending_query: Option<String>,
+    /// Earliest time the debounce permits dispatching
+    /// `address_pending_query`. The main loop clamps `recv_timeout` to
+    /// this deadline so the worker fires on schedule without busy
+    /// polling.
+    pub address_debounce_until: Option<Instant>,
     /// Clone of the unified event channel so the sync worker (and any
     /// future workers spawned from cmdline dispatch) can push
     /// `AppEvent::Wake` events. `None` in tests where no event loop is
@@ -474,6 +504,19 @@ impl App {
         let self_writes = SelfWrites::new();
         let inbox = InboxScreen::new(cfg, &cache_path, self_writes.clone(), event_tx.clone());
         let watcher_warning = inbox.watcher_warning.clone();
+        // Kick off the native-address-book startup walk now so the
+        // popup has data by the time the user opens their first
+        // compose tab. Worker pushes a single result into
+        // `address_book_rx`; the per-tick `poll_address_book` drains
+        // it into `address_book`.
+        let address_book_rx = {
+            let specs = account_specs(cfg);
+            if specs.is_empty() {
+                None
+            } else {
+                Some(addressbook::start_addressbook_worker(specs))
+            }
+        };
         Self {
             mode: Mode::Normal,
             cmdline: TextInput::new(),
@@ -491,6 +534,12 @@ impl App {
             sync_rx: None,
             pending_sends: Vec::new(),
             clipboard_rx: None,
+            address_book: AddressBook::new(),
+            address_book_rx,
+            address_ext_rx: None,
+            address_in_flight_query: None,
+            address_pending_query: None,
+            address_debounce_until: None,
             event_tx,
             cursor_style_reset_pending: false,
             native_cursor_shape_emitted: None,
@@ -612,6 +661,238 @@ impl App {
                 self.status_error = Some("sync: worker died".into());
             }
         }
+    }
+
+    /// Per-tick maintenance for address completion: ingest the
+    /// startup-walk result into the native cache, drain any external
+    /// `query_command` worker that finished, and dispatch a pending
+    /// query if the debounce has elapsed and no worker is in flight.
+    /// Mirrors `poll_sync` / `poll_clipboard`'s receiver-drain shape;
+    /// the dispatch path is the extra bit specific to this subsystem.
+    pub fn poll_address_book(&mut self, cfg: &Config) {
+        // Drain the startup walk's single result. Worker exits after
+        // sending; either branch clears the receiver.
+        if let Some(rx) = self.address_book_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.address_book.set_native(result.contacts);
+                    self.address_book_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.address_book_rx = None;
+                }
+            }
+        }
+
+        // Drain external `query_command` result, if any.
+        if let Some(rx) = self.address_ext_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(ExtResult { query, outcome }) => {
+                    self.address_ext_rx = None;
+                    self.address_in_flight_query = None;
+                    match outcome {
+                        Ok(contacts) => self.apply_external_results(&query, contacts),
+                        Err(e) => {
+                            self.status_error = Some(format!("query_command: {e}"));
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.address_ext_rx = None;
+                    self.address_in_flight_query = None;
+                }
+            }
+        }
+
+        // Dispatch a queued query when debounce has elapsed and no
+        // worker is in flight. Note: keeping the deadline armed while
+        // a worker is running means the next query won't fire until
+        // the current one completes; that bounds the dispatch rate at
+        // one in-flight worker without per-keystroke process kills.
+        let ready = self
+            .address_debounce_until
+            .is_some_and(|d| Instant::now() >= d);
+        if !ready || self.address_ext_rx.is_some() || self.address_pending_query.is_none() {
+            return;
+        }
+        let Some(raw) = cfg.compose.address_book.query_command.as_deref() else {
+            // query_command got cleared after we armed the timer; drop
+            // the pending request silently.
+            self.address_pending_query = None;
+            self.address_debounce_until = None;
+            return;
+        };
+        let argv: Vec<String> = raw.split_whitespace().map(String::from).collect();
+        if argv.is_empty() {
+            self.address_pending_query = None;
+            self.address_debounce_until = None;
+            return;
+        }
+        let query = self.address_pending_query.take().expect("checked above");
+        self.address_debounce_until = None;
+        self.address_in_flight_query = Some(query.clone());
+        self.address_ext_rx = Some(addressbook_external::start_query_worker(
+            argv,
+            query,
+            self.event_tx.clone(),
+        ));
+    }
+
+    /// Refresh the active compose tab's popup state after a TextInput
+    /// edit. Called by the host loop after `compose::handle_key`
+    /// consumes a key; closes the popup when focus moved off a
+    /// recipient field or the token is too short, opens/refreshes it
+    /// otherwise. Arms the external debounce when `query_command` is
+    /// configured and the user has typed a new prefix.
+    pub fn refresh_address_complete(&mut self, cfg: &Config) {
+        let Self {
+            screens,
+            active,
+            address_book,
+            address_in_flight_query,
+            address_pending_query,
+            address_debounce_until,
+            ..
+        } = self;
+        let Some(Screen::Compose(c)) = screens.get_mut(*active) else {
+            return;
+        };
+        // Higher-priority overlays preempt the popup.
+        if c.confirm_close.is_some() || c.from_picker.is_some() {
+            c.address_complete = None;
+            return;
+        }
+        let field = c.focused;
+        let input = match field {
+            ComposeField::To => &c.to,
+            ComposeField::Cc => &c.cc,
+            ComposeField::Bcc => &c.bcc,
+            _ => {
+                c.address_complete = None;
+                return;
+            }
+        };
+        let Some((token_start, token)) = address_complete::extract_token(input) else {
+            c.address_complete = None;
+            c.address_complete_suppressed = None;
+            return;
+        };
+        let token_lc = token.to_ascii_lowercase();
+        if token_lc.chars().count() < cfg.compose.address_book.min_chars {
+            c.address_complete = None;
+            c.address_complete_suppressed = None;
+            return;
+        }
+        // Esc-dismissal park: refuse to reopen on the same prefix the
+        // user just dismissed. Token divergence (next keystroke)
+        // clears the park.
+        match c.address_complete_suppressed.as_deref() {
+            Some(parked) if parked == token_lc => {
+                c.address_complete = None;
+                return;
+            }
+            Some(_) => c.address_complete_suppressed = None,
+            None => {}
+        }
+        // Preserve previously-fetched external items for the *same*
+        // token so a fresh native re-query doesn't drop them.
+        let prev_external: Vec<addressbook::Contact> = c
+            .address_complete
+            .as_ref()
+            .filter(|s| s.field == field && s.token == token_lc)
+            .map(|s| {
+                s.items
+                    .iter()
+                    .filter(|c| c.source == addressbook::Source::External)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let native = address_book.query_native(&token_lc, address_complete::MAX_ITEMS * 2);
+        let items = addressbook::merge(prev_external, native, address_complete::MAX_ITEMS);
+        // Preserve selection by email when possible so an item the
+        // user was about to accept doesn't slide under their cursor.
+        let new_selected = c
+            .address_complete
+            .as_ref()
+            .and_then(|s| s.items.get(s.selected))
+            .and_then(|prev| items.iter().position(|x| x.email_lc == prev.email_lc))
+            .unwrap_or(0);
+        c.address_complete = Some(AddressCompleteState {
+            field,
+            token_start,
+            token: token_lc.clone(),
+            items,
+            selected: new_selected,
+        });
+
+        // External dispatch: only arm when configured, and only when
+        // the token differs from whatever the running worker is
+        // already chasing (or what's already queued).
+        if cfg
+            .compose
+            .address_book
+            .query_command
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            let in_flight = address_in_flight_query.as_deref() == Some(token_lc.as_str());
+            let pending = address_pending_query.as_deref() == Some(token_lc.as_str());
+            if !in_flight && !pending {
+                *address_pending_query = Some(token_lc);
+                *address_debounce_until = Some(
+                    Instant::now() + Duration::from_millis(cfg.compose.address_book.debounce_ms),
+                );
+            }
+        }
+    }
+
+    /// Splice an external worker's result into the active compose
+    /// tab's popup, if it's still relevant (same field, same token).
+    /// Stale results are silently dropped — the user has already
+    /// typed past whatever query produced them.
+    fn apply_external_results(&mut self, query: &str, external: Vec<addressbook::Contact>) {
+        let Self {
+            screens,
+            active,
+            address_book,
+            ..
+        } = self;
+        let Some(Screen::Compose(c)) = screens.get_mut(*active) else {
+            return;
+        };
+        let Some(state) = c.address_complete.as_mut() else {
+            return;
+        };
+        if state.token != query {
+            return;
+        }
+        let native = address_book.query_native(&state.token, address_complete::MAX_ITEMS * 2);
+        let items = addressbook::merge(external, native, address_complete::MAX_ITEMS);
+        // Preserve selection by email.
+        let new_selected = state
+            .items
+            .get(state.selected)
+            .and_then(|prev| items.iter().position(|x| x.email_lc == prev.email_lc))
+            .unwrap_or(0);
+        state.items = items;
+        state.selected = new_selected;
+    }
+
+    /// Earliest wake the address-book subsystem cares about — the
+    /// debounce deadline when one is armed and a worker isn't in
+    /// flight. Returned to the main loop so `recv_timeout` clamps to
+    /// it and the query dispatcher fires within the configured window.
+    pub fn address_debounce_remaining(&self) -> Option<Duration> {
+        let deadline = self.address_debounce_until?;
+        if self.address_ext_rx.is_some() {
+            // A worker is already running; the deadline will be
+            // re-evaluated when the worker completes and pushes Wake.
+            return None;
+        }
+        Some(deadline.saturating_duration_since(Instant::now()))
     }
 
     /// Drain the in-flight clipboard fallback worker (when a yank chose

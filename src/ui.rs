@@ -1,3 +1,4 @@
+pub mod address_complete;
 pub mod app;
 pub mod browser;
 pub mod clipboard;

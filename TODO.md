@@ -21,9 +21,14 @@ usability gap.
 - **Drafts/cur persistence across restart.** Serialize `Draft` into
   `Drafts/cur/<unique>:2,` on editor exit; restore on `:compose`. Wipe on
   successful `:send`.
-- **Address (recipient) completion.** Walk `Sent/cur` at startup to build a
-  `HashSet<String>` of past recipients; popup completion on the To/Cc/Bcc
-  fields. Naive prefix match is fine for v1.
+- **Address completion follow-ups.** v1 lands with prefix-match + Sent harvest
+  + mutt `query_command`; remaining work:
+    - live re-harvest (today the native cache is startup-only; new Sent mail
+      surfaces only after restart);
+    - substring / fuzzy matching;
+    - frecency-weighted ranking inside the native source (most-recent / most-
+      frequent first), or pull through the index instead of walking on each
+      startup.
 
 ## Multi-account follow-ups
 

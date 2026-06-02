@@ -246,6 +246,12 @@ pub struct Compose {
     /// behaviour). Default 10s.
     #[serde(default = "default_send_delay_secs")]
     pub send_delay_secs: u64,
+    /// Inline address completion for To / Cc / Bcc. Two sources, both
+    /// optional: a startup walk of each account's Sent folder (always on)
+    /// and an external mutt-style `query_command`. Results merge with
+    /// external first, then native, deduped by lowercase email.
+    #[serde(default)]
+    pub address_book: AddressBook,
 }
 
 impl Default for Compose {
@@ -254,12 +260,58 @@ impl Default for Compose {
             mode: ComposeMode::default(),
             editor: None,
             send_delay_secs: default_send_delay_secs(),
+            address_book: AddressBook::default(),
         }
     }
 }
 
 fn default_send_delay_secs() -> u64 {
     10
+}
+
+/// Address-completion knobs for the compose tab's To / Cc / Bcc fields.
+/// `query_command` follows the mutt `query_command` protocol: the query
+/// is passed as the trailing argv element (no `%s` substitution), stdout
+/// is tab-separated `email[TAB name[TAB extra…]]` lines, the first line
+/// is treated as a status header and skipped, and an empty stdout means
+/// "no matches" (not an error).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressBook {
+    /// External address-book command (e.g. `"khard email --parsable"`).
+    /// `None` (default) disables the external source; the native Sent
+    /// scan still runs.
+    #[serde(default)]
+    pub query_command: Option<String>,
+    /// Milliseconds between the last keystroke and the external command
+    /// firing. Bounds the worst-case rate at one process per
+    /// `debounce_ms`, so even slow address books (khard with a network
+    /// CardDAV backend) don't get spammed.
+    #[serde(default = "default_ab_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Token length that opens the popup and triggers a query. Below
+    /// this, the popup is closed. Default 2 keeps single-letter typos
+    /// from popping the picker.
+    #[serde(default = "default_ab_min_chars")]
+    pub min_chars: usize,
+}
+
+impl Default for AddressBook {
+    fn default() -> Self {
+        Self {
+            query_command: None,
+            debounce_ms: default_ab_debounce_ms(),
+            min_chars: default_ab_min_chars(),
+        }
+    }
+}
+
+fn default_ab_debounce_ms() -> u64 {
+    150
+}
+
+fn default_ab_min_chars() -> usize {
+    2
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -566,6 +618,46 @@ mod tests {
     fn primary_account_none_for_empty_config() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(primary_account_name(&cfg).is_none());
+    }
+
+    #[test]
+    fn compose_address_book_defaults_to_native_only() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.compose.address_book.query_command.is_none());
+        assert_eq!(cfg.compose.address_book.debounce_ms, 150);
+        assert_eq!(cfg.compose.address_book.min_chars, 2);
+    }
+
+    #[test]
+    fn parses_compose_address_book_overrides() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [compose.address_book]
+            query_command = "khard email --parsable"
+            debounce_ms = 250
+            min_chars = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.compose.address_book.query_command.as_deref(),
+            Some("khard email --parsable")
+        );
+        assert_eq!(cfg.compose.address_book.debounce_ms, 250);
+        assert_eq!(cfg.compose.address_book.min_chars, 3);
+    }
+
+    #[test]
+    fn unknown_key_in_compose_address_book_fails() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [compose.address_book]
+            query_command = "khard"
+            mystery = 7
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mystery"));
     }
 
     #[test]

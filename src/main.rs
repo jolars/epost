@@ -119,7 +119,7 @@ fn run(
         // While a yank-highlight is active, tighten the deadline so the
         // expiry sweep in `tick` fires within the configured window
         // (default 150 ms) instead of waiting for the 250 ms idle tick.
-        let timeout = yank_highlight_deadline(&app).unwrap_or(IDLE_TICK);
+        let timeout = next_deadline(&app).unwrap_or(IDLE_TICK);
         match event_rx.recv_timeout(timeout) {
             Ok(ev) => process_event(&mut app, cfg, ev),
             Err(RecvTimeoutError::Timeout) => {}
@@ -166,6 +166,24 @@ fn yank_highlight_deadline(app: &App) -> Option<Duration> {
     Some(remaining.max(Duration::from_millis(1)))
 }
 
+/// Earliest deadline the main loop has to honour: the shorter of the
+/// yank-highlight expiry and the address-completion debounce. `None`
+/// when neither is armed — caller falls back to `IDLE_TICK`. Both
+/// individual sources are independently clamped to a 1ms floor so a
+/// just-expired deadline still wakes the loop instead of spinning.
+fn next_deadline(app: &App) -> Option<Duration> {
+    let yh = yank_highlight_deadline(app);
+    let ab = app
+        .address_debounce_remaining()
+        .map(|d| d.min(IDLE_TICK).max(Duration::from_millis(1)));
+    match (yh, ab) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 fn process_event(app: &mut App, cfg: &Config, ev: AppEvent) {
     match ev {
         AppEvent::Input(Event::Key(k)) if k.kind == KeyEventKind::Press => {
@@ -190,6 +208,7 @@ fn tick(
     app.poll_pending_sends();
     app.poll_sync();
     app.poll_clipboard();
+    app.poll_address_book(cfg);
     expire_yank_highlight(app);
     app.ensure_body_for_selection();
 

@@ -56,6 +56,20 @@ mode = "native"
 # window. `0` disables the delay (dispatch immediately). Default 10.
 # send_delay_secs = 10
 
+# Address completion for To / Cc / Bcc. The native source (Sent-folder
+# harvest at startup) is always on; the external source is opt-in via
+# `query_command`. Protocol: command is invoked with the query as the
+# trailing argv element; stdout is tab-separated
+# `email[TAB name[TAB extra…]]`, first line dropped as a status header.
+# Compatible with khard (`khard email --parsable`), abook, goobook,
+# notmuch-addrlookup, mu — anything that follows mutt's `query_command`
+# convention. Default behaviour (this block omitted entirely) is
+# native-only.
+[compose.address_book]
+# query_command = "khard email --parsable"
+# debounce_ms = 150
+# min_chars = 2
+
 # Three dev accounts pointing at scratch maildirs. `dev/maildir/`,
 # `dev/maildir-work/`, and `dev/maildir-verbatim/` are the tracked,
 # immutable fixtures; `task dev` / `task run` mirror them into

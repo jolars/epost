@@ -134,6 +134,24 @@ impl TextInput {
         std::mem::take(&mut self.buf)
     }
 
+    /// Replace `range` with `text` and move the cursor to `new_cursor`.
+    /// Used by the address-completion popup to swap a partial token
+    /// (`"ali"`) for the rendered contact (`"Alice <alice@…>, "`) in
+    /// one shot, without dropping out of TextInput's cursor-boundary
+    /// invariant. Caller must provide a `new_cursor` that lands on a
+    /// UTF-8 boundary in the resulting buffer; address strings are
+    /// ASCII so the popup never crosses that line in practice.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str, new_cursor: usize) {
+        self.buf.replace_range(range, text);
+        let n = self.buf.len();
+        self.cursor = new_cursor.min(n);
+        // Snap onto the nearest char boundary at-or-before, so callers
+        // with off-by-one math don't trip the invariant.
+        while self.cursor > 0 && !self.buf.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
+    }
+
     /// Dispatch a key event to the standard set of editing operations.
     /// Returns true if the key was consumed. Modal callers should
     /// intercept Esc / Enter / mode-exit chords before calling.
@@ -263,6 +281,36 @@ mod tests {
         t.delete_left();
         assert_eq!(t.as_str(), "a");
         assert_eq!(t.cursor(), 1);
+    }
+
+    #[test]
+    fn replace_range_swaps_text_and_places_cursor() {
+        let mut t = TextInput::from_string("ali");
+        t.replace_range(0..3, "Alice <alice@example.com>", 25);
+        assert_eq!(t.as_str(), "Alice <alice@example.com>");
+        assert_eq!(t.cursor(), 25);
+    }
+
+    #[test]
+    fn replace_range_in_middle_keeps_tail() {
+        // "ali, bob@x" — replace the first three chars with the
+        // canonical contact, cursor lands at the end of the insertion.
+        let mut t = TextInput::from_string("ali, bob@x");
+        t.replace_range(0..3, "Alice <alice@example.com>", 25);
+        assert_eq!(t.as_str(), "Alice <alice@example.com>, bob@x");
+        assert_eq!(t.cursor(), 25);
+    }
+
+    #[test]
+    fn replace_range_snaps_cursor_to_char_boundary() {
+        // Buffer ends in a multi-byte char; an out-of-range cursor
+        // gets clamped, and onto a UTF-8 boundary.
+        let mut t = TextInput::from_string("ali");
+        t.replace_range(0..3, "héllo", 999);
+        assert_eq!(t.as_str(), "héllo");
+        let n = t.as_str().len();
+        assert_eq!(t.cursor(), n);
+        assert!(t.as_str().is_char_boundary(t.cursor()));
     }
 
     #[test]

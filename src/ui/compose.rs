@@ -20,6 +20,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 use crate::config::Config;
 use crate::mail::compose as mail_compose;
 use crate::mail::compose::Draft;
+use crate::ui::address_complete::{self, AddressCompleteState};
 pub use crate::ui::compose_body::KeyOutcome;
 use crate::ui::compose_body::{BodyEditor, BodyMode, VisualKind};
 use crate::ui::embed::EditorSession;
@@ -125,6 +126,21 @@ pub struct ComposeScreen {
     /// Cancel" overlay is up; `None` ambient. Set by `:close` when the
     /// composer is dirty; cleared by Cancel (or by Save on success).
     pub confirm_close: Option<CloseConfirm>,
+    /// Inline address-completion popup for To / Cc / Bcc. `Some` while
+    /// the user has typed at least `[compose.address_book].min_chars`
+    /// into one of those fields and there's at least one matching
+    /// contact (or the external worker is still pending). Driven by
+    /// `address_complete::refresh` after every keystroke.
+    pub address_complete: Option<AddressCompleteState>,
+    /// After the user dismisses the popup with Esc, the closed-out
+    /// token is parked here; `refresh_address_complete` then refuses
+    /// to re-open the popup on the exact same prefix. Cleared as soon
+    /// as the user types another character (token diverges).
+    pub address_complete_suppressed: Option<String>,
+    /// Last rect the focused To / Cc / Bcc row rendered on, captured
+    /// per-draw so the popup overlay knows where to anchor. `None`
+    /// when focus is elsewhere or the field hasn't drawn yet.
+    pub last_complete_anchor: Option<Rect>,
 }
 
 /// State for the close-confirm overlay. Currently a unit struct used
@@ -192,6 +208,9 @@ impl ComposeScreen {
             from_picker: None,
             origin_draft_path: None,
             confirm_close: None,
+            address_complete: None,
+            address_complete_suppressed: None,
+            last_complete_anchor: None,
         })
     }
 
@@ -335,6 +354,44 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
     if screen.from_picker.is_some() {
         handle_from_picker_key(screen, k);
         return KeyOutcome::Consumed;
+    }
+
+    // Address-completion popup intercepts navigation + accept keys
+    // before the TextInput sees them. PassThrough falls through to
+    // the rest of the handler; the host calls `refresh_address_complete`
+    // after we return so the popup keeps in step with whatever the
+    // TextInput typed.
+    if let Some(state) = screen.address_complete.as_mut() {
+        use address_complete::KeyDispatch;
+        match address_complete::handle_key(state, k) {
+            KeyDispatch::Consumed => {
+                if k.code == KeyCode::Esc {
+                    // Park the dismissed token so refresh-after-key
+                    // doesn't immediately reopen the popup on the
+                    // same prefix. Cleared once the user types
+                    // another character (token diverges).
+                    let parked = state.token.clone();
+                    screen.address_complete = None;
+                    screen.address_complete_suppressed = Some(parked);
+                }
+                return KeyOutcome::Consumed;
+            }
+            KeyDispatch::Accept => {
+                // Apply the chosen contact into the focused field.
+                let state = screen.address_complete.take().expect("checked above");
+                let input = match state.field {
+                    ComposeField::To => &mut screen.to,
+                    ComposeField::Cc => &mut screen.cc,
+                    ComposeField::Bcc => &mut screen.bcc,
+                    _ => return KeyOutcome::Consumed,
+                };
+                address_complete::accept_into(input, &state);
+                return KeyOutcome::Consumed;
+            }
+            KeyDispatch::PassThrough => {
+                // Fall through to the regular field handler.
+            }
+        }
     }
 
     // Alt-e drops into `$EDITOR` from any field. Same end result as
@@ -711,6 +768,15 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         &screen.bcc,
         screen.focused == ComposeField::Bcc,
     );
+    // Stash the focused-recipient row so the address-completion
+    // popup can hang off it. Refreshed every frame; cleared whenever
+    // focus isn't on a recipient field.
+    screen.last_complete_anchor = match screen.focused {
+        ComposeField::To => Some(rows[1]),
+        ComposeField::Cc => Some(rows[2]),
+        ComposeField::Bcc => Some(rows[3]),
+        _ => None,
+    };
     render_field(
         f,
         rows[4],
@@ -822,6 +888,20 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     // rendered $EDITOR or body preview doesn't bleed through the popup.
     if let Some(picker) = screen.from_picker.as_ref() {
         draw_from_picker(f, from_row, picker, area);
+    }
+
+    // Address-completion popup hangs off the focused recipient row.
+    // Suppressed under from_picker / confirm_close so overlays don't
+    // stack; refresh in the host loop is the one that clears state
+    // when those modals open.
+    if screen.from_picker.is_none()
+        && screen.confirm_close.is_none()
+        && let (Some(state), Some(anchor)) = (
+            screen.address_complete.as_ref(),
+            screen.last_complete_anchor,
+        )
+    {
+        address_complete::draw(f, anchor, state, area);
     }
 
     // The Save / Discard / Cancel prompt sits in front of everything
