@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::mail::compose::{self as mail_compose, Draft};
 use crate::mail::parse;
 use crate::store::sync as store_sync;
-use crate::ui::app::{App, Mode, PendingSend, Screen};
+use crate::ui::app::{App, Mode, PendingSend, Screen, UndoAction};
 use crate::ui::browser;
 use crate::ui::compose::{self, ComposeScreen};
 
@@ -243,6 +243,100 @@ pub fn archive_selected(app: &mut App, cfg: &Config) {
 
 pub fn trash_selected(app: &mut App, cfg: &Config) {
     move_named(app, cfg, MoveKind::Trash);
+}
+
+/// Trash every message in the same thread as the current selection.
+///
+/// The visible inbox is laid out by `build_threads` as flat thread
+/// blocks (root at `depth == 0` followed by all descendants), so the
+/// thread is the slice from the nearest preceding `depth == 0` up to
+/// the next one. Cross-folder routing is per-row: each message's own
+/// account decides which Trash folder it lands in. Messages on accounts
+/// without a configured `trash_folder` are skipped (and counted in the
+/// status row) rather than failing the whole batch. The collected moves
+/// land as a single `UndoAction::Batch` so `u` restores the entire
+/// thread in one step.
+///
+/// Disabled in `/` search mode — search results are flat (not threaded)
+/// so "the thread" isn't a meaningful concept; the user can `d`
+/// individual rows or escape search first.
+pub fn trash_thread_selected(app: &mut App, cfg: &Config) {
+    if app.inbox().search.is_some() {
+        app.status_error = Some("trash-thread: not available in search".into());
+        return;
+    }
+    let (start, members) = {
+        let inbox = app.inbox();
+        let threaded = inbox.threaded();
+        if threaded.is_empty() {
+            app.status_error = Some("trash-thread: no message selected".into());
+            return;
+        }
+        let sel = inbox.selected.min(threaded.len() - 1);
+        // Walk back to the thread root (first `depth == 0` at or before
+        // the selection); walk forward until the next root (exclusive).
+        let start = (0..=sel)
+            .rev()
+            .find(|&i| threaded[i].depth == 0)
+            .unwrap_or(0);
+        let end = threaded[start + 1..]
+            .iter()
+            .position(|t| t.depth == 0)
+            .map(|p| start + 1 + p)
+            .unwrap_or(threaded.len());
+        let members: Vec<(String, String)> = threaded[start..end]
+            .iter()
+            .map(|t| (t.row.msgid.clone(), t.row.account.clone()))
+            .collect();
+        (start, members)
+    };
+    // Filter out messages on accounts without a configured Trash; report
+    // them as skipped so the user knows what didn't move.
+    let mut targets: Vec<String> = Vec::with_capacity(members.len());
+    let mut skipped = 0usize;
+    for (msgid, account_name) in &members {
+        let Some(account) = cfg.accounts.get(account_name) else {
+            skipped += 1;
+            continue;
+        };
+        if account
+            .role_disk_name(crate::config::FolderRole::Trash)
+            .is_none()
+        {
+            skipped += 1;
+            continue;
+        }
+        targets.push(msgid.clone());
+    }
+    if targets.is_empty() {
+        app.status_error = Some(format!(
+            "trash-thread: no trash configured for any of the {} message(s)",
+            members.len()
+        ));
+        return;
+    }
+    // Park the selection at the thread's start row. After each per-row
+    // drop, the row that was below slides into this index, so by the
+    // end the cursor lands on the row that replaced the thread (or the
+    // last surviving row if the thread sat at the end of the list).
+    app.inbox_mut().selected = start;
+    let target = MoveKind::Trash.role().label().to_string();
+    let mut actions: Vec<UndoAction> = Vec::with_capacity(targets.len());
+    for msgid in &targets {
+        if let Some(action) = app.move_msgid_to(msgid, &target, cfg) {
+            actions.push(action);
+        }
+    }
+    let moved = actions.len();
+    let total = members.len();
+    if !actions.is_empty() {
+        app.undo_stack.record(UndoAction::Batch(actions));
+    }
+    app.status_error = Some(if skipped == 0 {
+        format!("trashed thread ({moved} of {total})")
+    } else {
+        format!("trashed thread ({moved} of {total}, skipped {skipped})")
+    });
 }
 
 /// Spawn the `[sync].command` worker if one isn't already running.

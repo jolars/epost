@@ -102,9 +102,11 @@ pub enum ScanState {
 /// `msgid`, never a maildir path — paths drift on every mbsync run.
 ///
 /// `Move` and `Flag` cover the entirety of the message-view mutation
-/// surface (`a` / `D` / `:archive` / `:spam` / `:trash` / `:mv` and
-/// `m` / `*` / `d`). Composer text editing is intentionally out of
-/// scope — `$EDITOR` owns its own undo buffer inside the pty.
+/// surface (`a` / `d` / `D` / `:archive` / `:spam` / `:trash` / `:mv` and
+/// `m` / `*` / `x`). `Batch` groups several leaf actions so a multi-row
+/// operation like `D` (trash thread) lands as a single undo step.
+/// Composer text editing is intentionally out of scope — `$EDITOR` owns
+/// its own undo buffer inside the pty.
 #[derive(Debug, Clone)]
 pub enum UndoAction {
     Move {
@@ -125,6 +127,13 @@ pub enum UndoAction {
         /// our work.
         was_set: bool,
     },
+    /// Group of leaf actions that should be undone/redone as a unit.
+    /// Children are applied in forward order; on undo, the inverse is
+    /// applied in reverse order and the collected inverses form a new
+    /// `Batch` for the opposite stack. Children whose inverse fails are
+    /// skipped — their failures surface in the status row but don't
+    /// strand the rest of the group.
+    Batch(Vec<UndoAction>),
 }
 
 /// In-memory undo/redo stacks for message-view mutations. Bounded so a
@@ -1042,10 +1051,29 @@ impl App {
     /// on-disk `.Archive` directory. The target maildir is created if
     /// missing. Pushes an undo entry on success.
     pub fn move_selected_to(&mut self, target_folder: &str, cfg: &Config) {
-        let pre: Option<(String, String, String)> = self
+        let Some(msgid) = self.inbox().selected_msgid() else {
+            return;
+        };
+        if let Some(action) = self.move_msgid_to(&msgid, target_folder, cfg) {
+            self.undo_stack.record(action);
+        }
+    }
+
+    /// Move-by-msgid variant that returns the would-be `UndoAction`
+    /// instead of recording it. Multi-row callers (trash-thread) collect
+    /// these into a single `UndoAction::Batch` so the whole operation
+    /// undoes in one `u`. Single-row callers should prefer
+    /// [`App::move_selected_to`], which records for them.
+    pub fn move_msgid_to(
+        &mut self,
+        msgid: &str,
+        target_folder: &str,
+        cfg: &Config,
+    ) -> Option<UndoAction> {
+        let pre: (String, String) = self
             .inbox()
-            .selected_message_row()
-            .map(|r| (r.msgid.clone(), r.account.clone(), r.folder.clone()));
+            .find_row(msgid)
+            .map(|r| (r.account.clone(), r.folder.clone()))?;
         let ok = {
             let Self {
                 screens,
@@ -1057,21 +1085,25 @@ impl App {
             let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
                 unreachable!("inbox is pinned at index 0")
             };
-            inbox.move_selected_to(
+            inbox.move_msgid_to(
                 target_folder,
+                msgid,
                 &cfg.accounts,
                 cache_path,
                 self_writes,
                 status_error,
             )
         };
-        if ok && let Some((msgid, src_account, src_folder)) = pre {
-            self.undo_stack.record(UndoAction::Move {
-                msgid,
+        if ok {
+            let (src_account, src_folder) = pre;
+            Some(UndoAction::Move {
+                msgid: msgid.to_string(),
                 src_account,
                 src_folder,
                 dst_folder: target_folder.to_string(),
-            });
+            })
+        } else {
+            None
         }
     }
 
@@ -1112,8 +1144,28 @@ impl App {
         cfg: &Config,
         verb: &str,
     ) -> Option<UndoAction> {
+        if let UndoAction::Batch(children) = action {
+            // Undo children in reverse order — the last action applied
+            // is the first to be reversed. Inverses accumulate in the
+            // order they're produced, then get reversed once at the end
+            // so the resulting Batch replays correctly in the opposite
+            // direction. Per-child failures surface in `status_error`
+            // but don't strand the rest of the batch.
+            let total = children.len();
+            let mut inverses: Vec<UndoAction> = Vec::with_capacity(total);
+            for child in children.into_iter().rev() {
+                if let Some(inv) = self.apply_inverse(child, cfg, verb) {
+                    inverses.push(inv);
+                }
+            }
+            inverses.reverse();
+            let done = inverses.len();
+            self.status_error = Some(format!("{verb}: {done} of {total}"));
+            return Some(UndoAction::Batch(inverses));
+        }
         let msgid = match &action {
             UndoAction::Move { msgid, .. } | UndoAction::Flag { msgid, .. } => msgid.clone(),
+            UndoAction::Batch(_) => unreachable!("handled above"),
         };
         let current = match Index::open(&self.cache_path).and_then(|idx| idx.get(&msgid)) {
             Ok(Some(row)) => row,
@@ -1237,6 +1289,7 @@ impl App {
                     }
                 }
             }
+            UndoAction::Batch(_) => unreachable!("Batch is dispatched at the top of apply_inverse"),
         }
     }
 
@@ -1760,25 +1813,25 @@ impl InboxScreen {
         }
     }
 
-    /// Rename the selected row's file into `<account_maildir>/.<folder>/cur/`,
+    /// Rename `msgid`'s file into `<account_maildir>/.<folder>/cur/`,
     /// preserving its flag suffix. On success: records both paths on the
     /// self-write registry (so the future Step 7 watcher will skip its own
     /// echo), drops the row from the in-memory inbox view, and mirrors the
     /// new folder/path into the SQLite index. Returns `true` iff the rename
     /// succeeded so the App-level wrapper can decide whether to push an
-    /// undo entry.
-    pub fn move_selected_to(
+    /// undo entry. The msgid is taken explicitly (rather than read from
+    /// `selected_msgid`) so multi-row callers like trash-thread can drive
+    /// several moves from one operation without rotating the selection.
+    pub fn move_msgid_to(
         &mut self,
         target_folder: &str,
+        msgid: &str,
         accounts: &HashMap<String, Account>,
         cache_path: &Path,
         self_writes: &SelfWrites,
         status_error: &mut Option<String>,
     ) -> bool {
-        let Some(msgid) = self.selected_msgid() else {
-            return false;
-        };
-        let Some(row) = self.find_row(&msgid) else {
+        let Some(row) = self.find_row(msgid) else {
             return false;
         };
         let account_name = row.account.clone();
@@ -1819,13 +1872,7 @@ impl InboxScreen {
                 if let Some(w) = self.watcher.as_ref() {
                     w.register_folder(&account_name, target_folder, &folder_root, account.layout);
                 }
-                self.drop_row_after_move(
-                    &msgid,
-                    target_folder,
-                    &new_path,
-                    cache_path,
-                    status_error,
-                );
+                self.drop_row_after_move(msgid, target_folder, &new_path, cache_path, status_error);
                 *status_error = Some(format!("moved to {target_folder}"));
                 true
             }
@@ -2686,7 +2733,7 @@ impl InboxScreen {
     /// haystack (when search is active). Used by flag-toggle / move
     /// callsites that must keep the in-memory rows consistent regardless
     /// of which view is current.
-    fn find_row(&self, msgid: &str) -> Option<&MessageRow> {
+    pub fn find_row(&self, msgid: &str) -> Option<&MessageRow> {
         if let ScanState::Ready(rows) = &self.scan
             && let Some(t) = rows.iter().find(|t| t.row.msgid == msgid)
         {
@@ -4395,6 +4442,145 @@ mod undo_integration_tests {
                 .pending_dirty
                 .contains(&("personal".to_string(), "INBOX".to_string())),
             "undo of archive must queue a rescan of INBOX"
+        );
+    }
+
+    /// Helper: drop a maildir message with a custom msgid + optional
+    /// In-Reply-To / References, so a test can build a small thread.
+    fn drop_thread_msg(
+        tmp: &TempDir,
+        basename: &str,
+        msgid: &str,
+        in_reply: Option<&str>,
+        date: &str,
+    ) {
+        let inbox = tmp.path().join("Mail").join("personal");
+        fs::create_dir_all(inbox.join("cur")).unwrap();
+        fs::create_dir_all(inbox.join("new")).unwrap();
+        let mut body =
+            format!("Message-ID: <{msgid}>\r\nFrom: a@b\r\nSubject: hi\r\nDate: {date}\r\n");
+        if let Some(p) = in_reply {
+            body.push_str(&format!("In-Reply-To: <{p}>\r\nReferences: <{p}>\r\n"));
+        }
+        body.push_str("\r\nbody\r\n");
+        fs::write(inbox.join("cur").join(basename), body).unwrap();
+    }
+
+    #[test]
+    fn trash_thread_moves_every_member_and_undoes_as_one() {
+        // Three-message thread (root + reply + reply-of-reply). `D`
+        // should move all three to Trash, push a single Batch undo so
+        // one `u` brings the whole thread back, and clear the visible
+        // list in between.
+        let tmp = TempDir::new().unwrap();
+        drop_thread_msg(
+            &tmp,
+            "r:2,S",
+            "root",
+            None,
+            "Thu, 28 May 2026 12:00:00 +0000",
+        );
+        drop_thread_msg(
+            &tmp,
+            "a:2,S",
+            "reply1",
+            Some("root"),
+            "Thu, 28 May 2026 12:01:00 +0000",
+        );
+        drop_thread_msg(
+            &tmp,
+            "b:2,S",
+            "reply2",
+            Some("reply1"),
+            "Thu, 28 May 2026 12:02:00 +0000",
+        );
+
+        let cfg = account_with_folders(&tmp, None, Some("Trash"));
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        assert_eq!(app.inbox().threaded().len(), 3, "thread should have 3 rows");
+
+        cmdline::trash_thread_selected(&mut app, &cfg);
+
+        // All three files now live under .Trash/cur; the in-memory
+        // INBOX view drained to empty.
+        let trash_cur = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join(".Trash")
+            .join("cur");
+        let count = fs::read_dir(&trash_cur).unwrap().count();
+        assert_eq!(count, 3, "all three files should land in .Trash/cur");
+        assert_eq!(app.inbox().threaded().len(), 0, "INBOX should be empty");
+
+        // Single batched undo restores the whole thread in one step.
+        assert_eq!(
+            app.undo_stack.undo_len(),
+            1,
+            "trash-thread must record exactly one undo entry"
+        );
+        match app.undo_stack.pop_undo().expect("recorded") {
+            UndoAction::Batch(ref children) => {
+                assert_eq!(children.len(), 3, "batch should hold 3 leaves");
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trash_thread_undo_restores_all_three_to_inbox() {
+        // Companion to the move test: drive the full forward/undo cycle
+        // through `D` and confirm `u` brings every member back to the
+        // INBOX (the index resolves the new paths after rescan).
+        let tmp = TempDir::new().unwrap();
+        drop_thread_msg(
+            &tmp,
+            "r:2,S",
+            "root",
+            None,
+            "Thu, 28 May 2026 12:00:00 +0000",
+        );
+        drop_thread_msg(
+            &tmp,
+            "a:2,S",
+            "reply1",
+            Some("root"),
+            "Thu, 28 May 2026 12:01:00 +0000",
+        );
+        drop_thread_msg(
+            &tmp,
+            "b:2,S",
+            "reply2",
+            Some("reply1"),
+            "Thu, 28 May 2026 12:02:00 +0000",
+        );
+
+        let cfg = account_with_folders(&tmp, None, Some("Trash"));
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        cmdline::trash_thread_selected(&mut app, &cfg);
+        app.undo(&cfg);
+
+        let inbox_cur = tmp.path().join("Mail").join("personal").join("cur");
+        let count = fs::read_dir(&inbox_cur).unwrap().count();
+        assert_eq!(count, 3, "undo must restore all three files to INBOX/cur");
+        // Redo must be queued so Ctrl-r re-trashes.
+        assert_eq!(
+            app.undo_stack.undo_len(),
+            0,
+            "undo consumes the batch entry"
+        );
+        assert_eq!(
+            app.undo_stack.redo_len(),
+            1,
+            "undo of batch must push a single redo entry"
         );
     }
 }
