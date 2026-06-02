@@ -8,7 +8,7 @@ use crate::store::index::MessageRow;
 use crate::store::thread::ThreadedRow;
 use crate::ui::app::{InboxScreen, Pane, ScanState};
 use crate::ui::search::{SearchKind, SearchState};
-use crate::ui::style::pane_block;
+use crate::ui::style::{pane_block, pane_scrollbar};
 
 pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
     let focused = inbox.focus == Pane::List;
@@ -71,8 +71,10 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
                 .highlight_style(highlight)
                 .highlight_symbol("▌ ");
             let mut state = ListState::default();
-            state.select(Some(inbox.selected.min(rows.len().saturating_sub(1))));
+            let selected = inbox.selected.min(rows.len().saturating_sub(1));
+            state.select(Some(selected));
             f.render_stateful_widget(widget, area, &mut state);
+            pane_scrollbar(f, area, selected, rows.len(), focused);
         }
     }
 }
@@ -125,8 +127,10 @@ fn draw_search(
         .highlight_style(highlight)
         .highlight_symbol("▌ ");
     let mut state = ListState::default();
-    state.select(Some(inbox.selected.min(s.results.len().saturating_sub(1))));
+    let selected = inbox.selected.min(s.results.len().saturating_sub(1));
+    state.select(Some(selected));
     f.render_stateful_widget(widget, area, &mut state);
+    pane_scrollbar(f, area, selected, s.results.len(), focused);
 }
 
 /// Flat search-result row. Layout: `YYYY-MM-DD  acct/Folder  From            Subject`.

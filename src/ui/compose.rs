@@ -23,7 +23,7 @@ use crate::mail::compose::Draft;
 pub use crate::ui::compose_body::KeyOutcome;
 use crate::ui::compose_body::{BodyEditor, BodyMode, VisualKind};
 use crate::ui::embed::EditorSession;
-use crate::ui::style::pane_block;
+use crate::ui::style::{pane_block, pane_scrollbar};
 use crate::ui::text_input::TextInput;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,10 +767,12 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         // will see a brief cursor-position drift until the next motion;
         // acceptable v1 trade-off vs poking at tui-textarea internals.
         f.render_widget(&screen.body.textarea, body_inner);
+        let (cursor_row, col) = screen.body.textarea.cursor();
+        let line_count = screen.body.textarea.lines().len();
+        pane_scrollbar(f, body_area, cursor_row, line_count, body_focused);
         if body_focused {
-            let (row, col) = screen.body.textarea.cursor();
             let x = body_inner.x.saturating_add(col as u16);
-            let y = body_inner.y.saturating_add(row as u16);
+            let y = body_inner.y.saturating_add(cursor_row as u16);
             if x < body_inner.x.saturating_add(body_inner.width)
                 && y < body_inner.y.saturating_add(body_inner.height)
             {

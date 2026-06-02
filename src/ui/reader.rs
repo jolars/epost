@@ -8,7 +8,7 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use crate::mail::html::{Block, Inline, InlineStyle};
 use crate::ui::app::{InboxScreen, Mode, Pane, ParsedBody, ScanState, VisualKind, VisualState};
 use crate::ui::images::ImageKey;
-use crate::ui::style::pane_block;
+use crate::ui::style::{pane_block, pane_scrollbar};
 
 /// Marker text the pass-1 walker stamps into a single sentinel `Line`
 /// for each `Block::Image`. The pass-2 expansion finds these lines, pulls
@@ -400,11 +400,13 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
         }
     }
 
+    let total_lines = lines.len();
     let widget = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((inbox.reader_scroll, 0))
         .block(block);
     f.render_widget(widget, area);
+    pane_scrollbar(f, area, inbox.reader_scroll as usize, total_lines, focused);
 
     // Overlay any resolved images on top of the paragraph at their
     // reserved rects. SlicedProtocol clips top/bottom automatically when
