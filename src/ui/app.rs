@@ -84,6 +84,7 @@ pub struct ParsedBody {
     pub raw_html: Option<String>,
     pub plain_fallback: Option<String>,
     pub cid_parts: HashMap<String, Vec<u8>>,
+    pub attachments: Vec<parse::Attachment>,
 }
 
 #[derive(Debug)]
@@ -1091,6 +1092,7 @@ impl InboxScreen {
                     raw_html: body.html,
                     plain_fallback: body.plain,
                     cid_parts: body.cid_parts,
+                    attachments: body.attachments,
                 }));
                 self.evict_image_cache(old_msgid.as_deref(), &msgid);
                 self.try_mark_seen(&msgid, cache_path, self_writes, status_error);

@@ -1,0 +1,29 @@
+Return-Path: <bob@example.net>
+Delivered-To: dev@example.invalid
+Message-ID: <attach-fixture-001@example.net>
+From: Bob <bob@example.net>
+To: Dev <dev@example.invalid>
+Subject: Report and logo
+Date: Wed, 27 May 2026 10:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd"
+
+--bnd
+Content-Type: text/plain; charset=utf-8
+
+See attached: the trip notes plus the new logo.
+
+— Bob
+--bnd
+Content-Type: text/plain
+Content-Disposition: attachment; filename="notes.txt"
+Content-Transfer-Encoding: base64
+
+aGVsbG8gZnJvbSBhdHRhY2htZW50LnR4dAo=
+--bnd
+Content-Type: image/png
+Content-Disposition: attachment; filename="logo.png"
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=
+--bnd--

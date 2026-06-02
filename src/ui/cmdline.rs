@@ -156,6 +156,8 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
         }
         "attach" => attach_path(app, cmd),
         "detach" => detach_index(app, &mut parts),
+        "save" => save_attachment(app, cmd),
+        "open-attachment" => open_attachment(app, &mut parts, cfg),
         "from" => switch_from(app, cfg, parts.next()),
         "account" => match parts.next() {
             None | Some("all") => app.switch_to_scope(None, "INBOX"),
@@ -301,6 +303,115 @@ fn detach_index(app: &mut App, parts: &mut std::str::SplitWhitespace) {
         .unwrap_or_else(|| removed.display().to_string());
     let rem = c.attachments.len();
     app.status_error = Some(format!("detached: {name} ({rem} remaining)"));
+}
+
+/// `:save <n> [path]` — write the inbox-side attachment at index `n` to
+/// disk. With no `path`, writes to the current working directory using the
+/// attachment's filename. With a directory path, appends the filename;
+/// with a full file path, uses it verbatim. Refuses to overwrite an
+/// existing file — caller can pick an explicit non-colliding path.
+fn save_attachment(app: &mut App, full_cmd: &str) {
+    let raw = full_cmd.trim().strip_prefix("save").unwrap_or("").trim();
+    let mut parts = raw.splitn(2, char::is_whitespace);
+    let Some(idx_arg) = parts.next().filter(|s| !s.is_empty()) else {
+        app.status_error = Some("save: missing index".into());
+        return;
+    };
+    let Ok(n) = idx_arg.parse::<usize>() else {
+        app.status_error = Some(format!("save: not a number: {idx_arg}"));
+        return;
+    };
+    let dest_arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
+
+    let Some(parsed) = app.inbox_parsed() else {
+        app.status_error = Some("save: no parsed body".into());
+        return;
+    };
+    if n == 0 || n > parsed.attachments.len() {
+        app.status_error = Some(format!(
+            "save: index {n} out of range (have {})",
+            parsed.attachments.len()
+        ));
+        return;
+    }
+    let att = parsed.attachments[n - 1].clone();
+    let target = match resolve_save_path(dest_arg, &att.filename) {
+        Ok(p) => p,
+        Err(e) => {
+            app.status_error = Some(format!("save: {e}"));
+            return;
+        }
+    };
+    if target.exists() {
+        app.status_error = Some(format!("save: refusing to overwrite {}", target.display()));
+        return;
+    }
+    if let Err(e) = std::fs::write(&target, &att.bytes) {
+        app.status_error = Some(format!("save: write {}: {e}", target.display()));
+        return;
+    }
+    app.status_error = Some(format!("saved: {}", target.display()));
+}
+
+/// `:open-attachment <n>` — write the attachment to a tempfile preserving
+/// its extension and hand the path to `[reader].browser` (which is the
+/// same xdg-open-style command used by `:open`). The tempfile is left in
+/// place because the spawn returns before the viewer reads it.
+fn open_attachment(app: &mut App, parts: &mut std::str::SplitWhitespace, cfg: &Config) {
+    let Some(arg) = parts.next() else {
+        app.status_error = Some("open-attachment: missing index".into());
+        return;
+    };
+    let Ok(n) = arg.parse::<usize>() else {
+        app.status_error = Some(format!("open-attachment: not a number: {arg}"));
+        return;
+    };
+    let Some(parsed) = app.inbox_parsed() else {
+        app.status_error = Some("open-attachment: no parsed body".into());
+        return;
+    };
+    if n == 0 || n > parsed.attachments.len() {
+        app.status_error = Some(format!(
+            "open-attachment: index {n} out of range (have {})",
+            parsed.attachments.len()
+        ));
+        return;
+    }
+    let att = parsed.attachments[n - 1].clone();
+    if let Err(e) = browser::open_attachment(&att, &cfg.reader.browser) {
+        app.status_error = Some(format!("open-attachment: {e:#}"));
+        return;
+    }
+    app.status_error = Some(format!("opening: {}", att.filename));
+}
+
+/// Resolve the destination path for `:save`. Tilde-expands a leading `~/`.
+/// If `dest` is `None`, returns `<cwd>/<filename>`. If `dest` is a directory,
+/// returns `<dest>/<filename>`. Otherwise returns `dest` as-is.
+fn resolve_save_path(dest: Option<&str>, filename: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::PathBuf;
+    let base_name = std::path::Path::new(filename)
+        .file_name()
+        .map(|s| s.to_owned())
+        .ok_or_else(|| format!("attachment has no usable filename: {filename:?}"))?;
+    let Some(dest) = dest else {
+        let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+        return Ok(cwd.join(base_name));
+    };
+    let expanded: PathBuf = if let Some(rest) = dest.strip_prefix("~/") {
+        let home =
+            std::env::var_os("HOME").ok_or_else(|| "HOME not set, cannot expand ~/".to_string())?;
+        PathBuf::from(home).join(rest)
+    } else if dest == "~" {
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| "HOME not set".to_string())?)
+    } else {
+        PathBuf::from(dest)
+    };
+    if expanded.is_dir() {
+        Ok(expanded.join(base_name))
+    } else {
+        Ok(expanded)
+    }
 }
 
 fn dispatch_sync(app: &mut App, cfg: &Config) {
@@ -787,5 +898,53 @@ mod tests {
         let err = app.status_error.as_deref().expect("status");
         assert!(err.starts_with("sync failed:"), "got {err:?}");
         assert!(err.contains("exit 3"), "got {err:?}");
+    }
+
+    #[test]
+    fn resolve_save_path_defaults_to_cwd() {
+        let p = resolve_save_path(None, "report.pdf").unwrap();
+        assert!(p.ends_with("report.pdf"), "{p:?}");
+        assert!(p.is_absolute(), "{p:?}");
+    }
+
+    #[test]
+    fn resolve_save_path_appends_filename_to_directory() {
+        let tmp = std::env::temp_dir().join("epost-test-save-dir");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = resolve_save_path(Some(tmp.to_str().unwrap()), "report.pdf").unwrap();
+        assert_eq!(p, tmp.join("report.pdf"));
+    }
+
+    #[test]
+    fn resolve_save_path_uses_explicit_path_verbatim() {
+        let tmp = std::env::temp_dir().join("epost-test-explicit.pdf");
+        let _ = std::fs::remove_file(&tmp);
+        let p = resolve_save_path(Some(tmp.to_str().unwrap()), "report.pdf").unwrap();
+        assert_eq!(p, tmp);
+    }
+
+    #[test]
+    fn dispatch_save_with_no_body_reports_error() {
+        let (mut app, cfg) = test_app();
+        dispatch("save 1", &mut app, &cfg);
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("no parsed body"), "got {err:?}");
+    }
+
+    #[test]
+    fn dispatch_save_missing_index_reports_error() {
+        let (mut app, cfg) = test_app();
+        dispatch("save", &mut app, &cfg);
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("missing index"), "got {err:?}");
+    }
+
+    #[test]
+    fn dispatch_open_attachment_missing_index_reports_error() {
+        let (mut app, cfg) = test_app();
+        dispatch("open-attachment", &mut app, &cfg);
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("missing index"), "got {err:?}");
     }
 }

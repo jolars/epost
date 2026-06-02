@@ -265,6 +265,17 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     };
     let block = pane_block(&title, focused);
 
+    // Reserve a one-row interior strip at the bottom of the bordered pane
+    // when the current message carries attachments. The body's inner area
+    // shrinks by `strip_height` so the Paragraph doesn't draw into the
+    // strip row, and the scrollbar is shortened to match.
+    let attachment_count = inbox
+        .parsed
+        .as_ref()
+        .map(|p| p.attachments.len())
+        .unwrap_or(0);
+    let strip_height: u16 = if attachment_count > 0 { 1 } else { 0 };
+
     let inner_width = area.width.saturating_sub(2);
 
     // Body changed since last frame — clear any rects we drew images
@@ -348,7 +359,8 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     // layout. Counts pre-wrap `Line`s — heavy CSS wrap undershoots,
     // but `j` from there is fine.
     inbox.last_reader_body_lines = lines.len().min(u16::MAX as usize) as u16;
-    inbox.last_reader_inner_height = area.height.saturating_sub(2);
+    let pane_inner_height = area.height.saturating_sub(2);
+    inbox.last_reader_inner_height = pane_inner_height.saturating_sub(strip_height);
     inbox.last_reader_inner_width = inner_width;
     inbox.last_reader_header_offset = header_offset_this_frame;
     inbox.last_reader_body_only_lines = body_only_lines_this_frame;
@@ -356,7 +368,7 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
         x: area.x + 1,
         y: area.y + 1,
         width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+        height: pane_inner_height.saturating_sub(strip_height),
     });
     // Clamp the body-relative cursor into the visible viewport so it
     // tracks "topmost visible body line" until visual mode introduces
@@ -401,22 +413,35 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     }
 
     let total_lines = lines.len();
-    let widget = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((inbox.reader_scroll, 0))
-        .block(block);
-    f.render_widget(widget, area);
-    pane_scrollbar(f, area, inbox.reader_scroll as usize, total_lines, focused);
-
-    // Overlay any resolved images on top of the paragraph at their
-    // reserved rects. SlicedProtocol clips top/bottom automatically when
-    // the image straddles the pane boundary after scroll.
-    let inner = Rect {
+    // Render the pane border first, then the body Paragraph (no block)
+    // into the carved inner so the bottom attachment strip claims its
+    // own row without the body drawing over it.
+    let pane_inner = Rect {
         x: area.x + 1,
         y: area.y + 1,
         width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+        height: pane_inner_height,
     };
+    let inner = Rect {
+        height: pane_inner.height.saturating_sub(strip_height),
+        ..pane_inner
+    };
+    f.render_widget(block, area);
+    let widget = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((inbox.reader_scroll, 0));
+    f.render_widget(widget, inner);
+    let scrollbar_area = Rect {
+        height: area.height.saturating_sub(strip_height),
+        ..area
+    };
+    pane_scrollbar(
+        f,
+        scrollbar_area,
+        inbox.reader_scroll as usize,
+        total_lines,
+        focused,
+    );
     if let Some(laid) = laid {
         let scroll = inbox.reader_scroll as i32;
         emit_osc8_hyperlinks(f.buffer_mut(), inner, &laid.links, scroll);
@@ -476,6 +501,59 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
         }
         inbox.last_image_rects = drawn;
     }
+
+    if strip_height > 0 {
+        let strip_rect = Rect {
+            x: pane_inner.x,
+            y: pane_inner.y + pane_inner.height.saturating_sub(1),
+            width: pane_inner.width,
+            height: 1,
+        };
+        render_attachment_strip(f, strip_rect, inbox, focused);
+    }
+}
+
+/// One-row strip rendered along the bottom interior row of the reader pane
+/// when the open message has attachments. Lists `[n] filename` chips
+/// comma-separated, with overflow truncated by a trailing `…`. The chips
+/// drive the `:save <n>` / `:open-attachment <n>` cmdline verbs.
+fn render_attachment_strip(f: &mut Frame, area: Rect, inbox: &InboxScreen, focused: bool) {
+    let Some(parsed) = inbox.parsed.as_deref() else {
+        return;
+    };
+    if parsed.attachments.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let label_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(parsed.attachments.len() * 2 + 1);
+    spans.push(Span::styled(
+        "Attach: ",
+        label_style.add_modifier(Modifier::BOLD),
+    ));
+    for (i, a) in parsed.attachments.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!("[{}] ", i + 1),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::raw(a.filename.clone()));
+    }
+    let line = Line::from(spans);
+    // Paragraph with no wrap so a long attachment list truncates at the
+    // pane edge rather than spilling into a phantom second row.
+    let widget = Paragraph::new(line)
+        .wrap(Wrap { trim: false })
+        .scroll((0, 0));
+    // Clear first so the body's bottom-row residue (if any drew here in a
+    // prior frame before the strip's height was reserved) is gone.
+    f.render_widget(Clear, area);
+    f.render_widget(widget, area);
 }
 
 /// Paint the visual-mode selection by flipping `Modifier::REVERSED` on

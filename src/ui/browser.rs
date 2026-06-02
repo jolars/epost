@@ -15,6 +15,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow};
 use tempfile::Builder;
 
+use crate::mail::parse::Attachment;
 use crate::ui::app::ParsedBody;
 
 pub fn open_message(body: &ParsedBody, cmd: &[String]) -> Result<()> {
@@ -64,6 +65,46 @@ pub fn open_message(body: &ParsedBody, cmd: &[String]) -> Result<()> {
             c.arg(arg);
         }
         c.arg(&html_path);
+        let _ = c.status();
+    });
+    Ok(())
+}
+
+/// Write an attachment to a tempfile preserving its extension, then hand
+/// the path to the configured browser/opener command on a worker thread.
+/// The tempfile is intentionally left in place (`disable_cleanup`) — the
+/// spawn returns before the viewer actually reads the file, so we'd race
+/// a delete otherwise; the OS cleans /tmp periodically.
+pub fn open_attachment(att: &Attachment, cmd: &[String]) -> Result<()> {
+    if cmd.is_empty() {
+        return Err(anyhow!("no opener command configured"));
+    }
+    // Carry the original extension so viewers (xdg-open, mailcap-aware
+    // launchers) can dispatch on it. Fall back to `.bin` when the
+    // attachment filename has none.
+    let ext = std::path::Path::new(&att.filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| format!(".{s}"))
+        .unwrap_or_else(|| ".bin".to_string());
+    let mut tmp = Builder::new()
+        .prefix("epost-att-")
+        .suffix(&ext)
+        .tempfile()
+        .context("creating attachment tempfile")?;
+    tmp.write_all(&att.bytes)
+        .context("writing attachment tempfile")?;
+    tmp.disable_cleanup(true);
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let cmd = cmd.to_vec();
+    std::thread::spawn(move || {
+        let mut c = Command::new(&cmd[0]);
+        for arg in &cmd[1..] {
+            c.arg(arg);
+        }
+        c.arg(&path);
         let _ = c.status();
     });
     Ok(())
@@ -154,6 +195,7 @@ mod tests {
             raw_html: Some("<p>hello</p>".into()),
             plain_fallback: None,
             cid_parts: HashMap::new(),
+            attachments: Vec::new(),
         };
         open_message(&body, &cmd).unwrap();
         let argv_path = PathBuf::from(format!("{out}/argv.txt"));
@@ -168,5 +210,28 @@ mod tests {
         assert!(last.ends_with(".html"), "argv last={last:?}");
         let html_at_path = fs::read_to_string(&last).unwrap_or_default();
         assert!(html_at_path.contains("hello"), "{html_at_path}");
+    }
+
+    #[test]
+    fn open_attachment_writes_tempfile_with_extension() {
+        let out = "/tmp/epost-test-open-att";
+        let cmd = run_stub(out);
+        let att = Attachment {
+            filename: "report.pdf".into(),
+            bytes: b"%PDF-1.4 stub".to_vec(),
+        };
+        open_attachment(&att, &cmd).unwrap();
+        let argv_path = PathBuf::from(format!("{out}/argv.txt"));
+        for _ in 0..40 {
+            if argv_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let lines = read_lines(argv_path);
+        let last = lines.last().cloned().unwrap_or_default();
+        assert!(last.ends_with(".pdf"), "argv last={last:?}");
+        let bytes = fs::read(&last).unwrap_or_default();
+        assert_eq!(bytes, b"%PDF-1.4 stub");
     }
 }

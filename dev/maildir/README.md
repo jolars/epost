@@ -38,3 +38,6 @@ files placed under `cur/` or `.Sent/cur/`.
 - [ ] Outlook-style table layout
 - [ ] Long subject + long sender name (list-pane truncation)
 - [x] Non-ASCII subject + body (UTF-8 round-trip) — `new/1778850000…utf8…`
+- [x] `multipart/mixed` with two `Content-Disposition: attachment` parts
+      (exercises the reader's bottom strip + `:save` / `:open-attachment`)
+      — `cur/1779264000…attach-fixture…`

@@ -31,6 +31,18 @@ pub struct Body {
     /// Populated even when step 3 only emits placeholders; step 4 (inline
     /// images) and `:open` (cid rewriting) consume this directly.
     pub cid_parts: HashMap<String, Vec<u8>>,
+    /// Non-inline attachment parts in the order `mail-parser` yields them.
+    /// Drives the reader's bottom strip and the `:save` / `:open-attachment`
+    /// verbs.
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    /// Display name. Falls back to `attachment-<n>` when neither
+    /// `Content-Disposition: filename` nor `Content-Type: name` is set.
+    pub filename: String,
+    pub bytes: Vec<u8>,
 }
 
 pub fn read_body(path: &Path) -> Result<Body> {
@@ -67,10 +79,43 @@ pub fn parse_body(bytes: &[u8]) -> Body {
         cid_parts.insert(cid, bytes);
     }
 
+    let mut attachments: Vec<Attachment> = Vec::new();
+    for (i, part) in msg.attachments().enumerate() {
+        // Skip nested message/* parts and any zero-byte oddities — neither
+        // is useful for "save to disk" / "open in viewer". Inline image
+        // parts (which mail-parser may also surface via attachments())
+        // are already exposed through cid_parts; gate them out by
+        // Content-Disposition.
+        if part.is_message() || part.is_multipart() {
+            continue;
+        }
+        // A `Content-ID` means the HTML can reference the part via `cid:`,
+        // so it's already exposed through `cid_parts` (whether or not the
+        // part carries an explicit `Content-Disposition: inline`). Skip
+        // here so it doesn't double-list in the reader strip.
+        if part.content_id().is_some() {
+            continue;
+        }
+        if let Some(cd) = part.content_disposition()
+            && cd.is_inline()
+        {
+            continue;
+        }
+        let filename = part
+            .attachment_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("attachment-{}", i + 1));
+        attachments.push(Attachment {
+            filename,
+            bytes: part.contents().to_vec(),
+        });
+    }
+
     Body {
         html,
         plain,
         cid_parts,
+        attachments,
     }
 }
 
@@ -306,5 +351,44 @@ just text\r\n";
         let body = parse_body(PLAIN_ONLY);
         assert!(body.html.is_none());
         assert_eq!(body.plain.as_deref().unwrap_or("").trim(), "just text");
+    }
+
+    const WITH_ATTACHMENT: &[u8] = b"\
+Message-ID: <atch@example.com>\r\n\
+From: a@example.com\r\n\
+Subject: with attachment\r\n\
+Date: Tue, 26 May 2026 09:00:00 +0000\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"bnd\"\r\n\
+\r\n\
+--bnd\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+body\r\n\
+--bnd\r\n\
+Content-Type: application/pdf\r\n\
+Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+aGVsbG8=\r\n\
+--bnd--\r\n";
+
+    #[test]
+    fn extracts_attachment_filename_type_and_bytes() {
+        let body = parse_body(WITH_ATTACHMENT);
+        assert_eq!(body.attachments.len(), 1);
+        let a = &body.attachments[0];
+        assert_eq!(a.filename, "report.pdf");
+        assert_eq!(a.bytes.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn cid_inline_part_is_not_in_attachments() {
+        // The MULTIPART_WITH_CID fixture's inline image must flow only
+        // through cid_parts; an inline part double-listed under
+        // attachments would surface as a fake attachment in the strip.
+        let body = parse_body(MULTIPART_WITH_CID);
+        assert!(body.cid_parts.contains_key("logo@x"));
+        assert!(body.attachments.is_empty(), "{:?}", body.attachments);
     }
 }
