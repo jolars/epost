@@ -41,6 +41,14 @@ impl Index {
             .with_context(|| format!("opening sqlite index at {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("enabling WAL")?;
+        // Multiple writers race: the main UI thread upserts on flag flips
+        // and moves, while the scan and watcher-driven rescan workers
+        // upsert from their own threads. WAL serializes writers, so
+        // without a busy timeout the loser fails instantly with
+        // SQLITE_BUSY ("database is locked"). 5s is well above any
+        // realistic per-transaction write time.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("setting busy_timeout")?;
         conn.execute_batch(SCHEMA).context("creating schema")?;
         Ok(Self { conn })
     }
