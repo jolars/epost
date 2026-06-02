@@ -14,8 +14,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address;
@@ -410,36 +410,62 @@ fn addrs(list: &[String]) -> Address<'static> {
 /// Result of a send attempt: explicitly separates "sent but no Sent
 /// copy" from "send failed outright" so the UI can render the right
 /// status — the user needs to know the message *did* go out even if
-/// the Sent-folder write failed.
+/// the Sent-folder write failed. `Cancelled` is reserved for the
+/// `[compose].send_delay_secs` "undo send" window: the worker aborts
+/// before invoking msmtp, so nothing went out and there is no Sent
+/// copy to clean up.
 #[derive(Debug)]
 pub enum SendOutcome {
     Sent,
     SentNoCopy(String),
+    Cancelled,
 }
 
 pub type SendResult = Result<SendOutcome, String>;
 
-/// Spawn a worker thread that pipes `bytes` to `smtp_cmd[0] smtp_cmd[1..]`
-/// over stdin and (on success) drops a copy in `sent_cur_dir` with the
-/// `:2,S` info suffix. Returns a one-shot receiver the UI polls each
-/// tick. Mirrors `store::scan::start_worker` so the polling pattern is
-/// identical. When `event_tx` is plumbed in, the worker also pushes an
-/// `AppEvent::Wake` on completion so the main loop surfaces the result
-/// immediately rather than waiting for the next idle heartbeat.
+/// Handle to an in-flight send. The worker waits on `cancel_rx` for up
+/// to `[compose].send_delay_secs` before invoking msmtp; firing the
+/// matching `cancel_tx` during that window aborts the send. After the
+/// window closes the send is already with msmtp and `cancel_tx.send`
+/// becomes a no-op (the receiver has been dropped).
+pub struct SendHandle {
+    pub rx: Receiver<SendResult>,
+    pub cancel_tx: Sender<()>,
+}
+
+/// Spawn a worker thread that waits `delay` (or until `cancel_tx`
+/// fires), then pipes `bytes` to `smtp_cmd[0] smtp_cmd[1..]` over
+/// stdin and (on success) drops a copy in `sent_cur_dir` with the
+/// `:2,S` info suffix. Returns the result receiver paired with a
+/// cancel sender so the UI can abort during the delay window. Mirrors
+/// `store::scan::start_worker` for the polling pattern. When
+/// `event_tx` is plumbed in, the worker also pushes an `AppEvent::Wake`
+/// on completion so the main loop surfaces the result immediately
+/// rather than waiting for the next idle heartbeat.
 pub fn start_send_worker(
     bytes: Vec<u8>,
     smtp_cmd: Vec<String>,
     sent_cur_dir: Option<PathBuf>,
+    delay: Duration,
     event_tx: Option<Sender<crate::ui::events::AppEvent>>,
-) -> Receiver<SendResult> {
+) -> SendHandle {
     let (tx, rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
-        let _ = tx.send(send_blocking(&bytes, &smtp_cmd, sent_cur_dir.as_deref()));
+        let result = match cancel_rx.recv_timeout(delay) {
+            // Cancellation arrived (or the sender was dropped before the
+            // delay elapsed). Either way: abort the send.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => Ok(SendOutcome::Cancelled),
+            Err(RecvTimeoutError::Timeout) => {
+                send_blocking(&bytes, &smtp_cmd, sent_cur_dir.as_deref())
+            }
+        };
+        let _ = tx.send(result);
         if let Some(wake) = event_tx {
             let _ = wake.send(crate::ui::events::AppEvent::Wake);
         }
     });
-    rx
+    SendHandle { rx, cancel_tx }
 }
 
 fn send_blocking(bytes: &[u8], smtp_cmd: &[String], sent_cur_dir: Option<&Path>) -> SendResult {
@@ -815,6 +841,51 @@ mod tests {
         assert!(matches!(out, Ok(SendOutcome::Sent)), "{out:?}");
         let captured: Vec<_> = fs::read_dir(&capture).unwrap().collect();
         assert_eq!(captured.len(), 1, "expected 1 captured eml");
+    }
+
+    #[test]
+    fn start_send_worker_zero_delay_dispatches_immediately() {
+        use std::time::Instant;
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "cat > /dev/null".into()];
+        let started = Instant::now();
+        let handle = start_send_worker(b"x".to_vec(), cmd, None, Duration::ZERO, None);
+        let result = handle.rx.recv().expect("worker reports back");
+        assert!(matches!(result, Ok(SendOutcome::Sent)), "{result:?}");
+        // No artificial wait — the worker should be done well under the
+        // 250ms idle tick. A generous bound keeps the test stable on slow
+        // CI without defeating its purpose.
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn start_send_worker_cancel_within_window_aborts() {
+        // A long-enough delay that we can fire cancel before it elapses,
+        // paired with an SMTP command that would otherwise succeed — so
+        // a missed cancel surfaces as `Sent`, not as a timeout.
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "cat > /dev/null".into()];
+        let handle = start_send_worker(b"x".to_vec(), cmd, None, Duration::from_secs(30), None);
+        handle.cancel_tx.send(()).expect("cancel sender alive");
+        let result = handle
+            .rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker reports back");
+        assert!(matches!(result, Ok(SendOutcome::Cancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn start_send_worker_dropped_cancel_aborts_too() {
+        // Dropping the cancel sender without firing it also aborts —
+        // matches the `RecvTimeoutError::Disconnected` arm. This is the
+        // "host went away while waiting" case (the host UI is gone), so
+        // not sending is the right default.
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "cat > /dev/null".into()];
+        let handle = start_send_worker(b"x".to_vec(), cmd, None, Duration::from_secs(30), None);
+        let SendHandle { rx, cancel_tx } = handle;
+        drop(cancel_tx);
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker reports back");
+        assert!(matches!(result, Ok(SendOutcome::Cancelled)), "{result:?}");
     }
 
     #[test]

@@ -210,7 +210,7 @@ fn default_global_folders() -> Vec<String> {
     ]
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compose {
     /// Editor backend for the body region. `native` (default) uses the
@@ -226,6 +226,27 @@ pub struct Compose {
     /// falls back to `$VISUAL` / `$EDITOR` / `vi` at spawn time.
     #[serde(default)]
     pub editor: Option<String>,
+    /// "Undo send" window in seconds. `:send` hands the MIME bytes to a
+    /// worker that waits this long before invoking `msmtp`; `:cancel-send`
+    /// aborts in-flight sends still inside the window. `0` disables the
+    /// delay (the worker dispatches immediately, same as pre-feature
+    /// behaviour). Default 10s.
+    #[serde(default = "default_send_delay_secs")]
+    pub send_delay_secs: u64,
+}
+
+impl Default for Compose {
+    fn default() -> Self {
+        Self {
+            mode: ComposeMode::default(),
+            editor: None,
+            send_delay_secs: default_send_delay_secs(),
+        }
+    }
+}
+
+fn default_send_delay_secs() -> u64 {
+    10
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]

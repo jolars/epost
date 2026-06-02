@@ -286,9 +286,12 @@ pub enum Screen {
 
 /// One in-flight send worker. Owned by `App` (not the compose tab) so
 /// `:send` can close the tab immediately and the result still surfaces
-/// when the worker reports back.
+/// when the worker reports back. `cancel_tx` fires the "undo send"
+/// window; firing it before `[compose].send_delay_secs` elapses aborts
+/// the send (worker returns `SendOutcome::Cancelled`).
 pub struct PendingSend {
     pub rx: Receiver<SendResult>,
+    pub cancel_tx: Sender<()>,
     pub label: String,
     /// File the composer was loaded from in `Drafts/cur/`, snapshotted
     /// at `:send` time. Deleted on a successful send so the draft
@@ -2403,6 +2406,7 @@ fn format_send_status(label: &str, result: SendResult) -> String {
     match result {
         Ok(SendOutcome::Sent) => format!("sent: {label}"),
         Ok(SendOutcome::SentNoCopy(msg)) => format!("sent: {label} (no Sent copy: {msg})"),
+        Ok(SendOutcome::Cancelled) => format!("cancelled: {label}"),
         Err(e) => format!("send failed ({label}): {e}"),
     }
 }

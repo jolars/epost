@@ -140,6 +140,7 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
             Err(e) => app.status_error = Some(format!("postpone: {e}")),
         },
         "send" => send_active(app, cfg),
+        "cancel-send" => cancel_pending_sends(app),
         "edit" => escape_to_external_editor(app),
         "reply" => open_reply(app, cfg, ReplyKind::Reply),
         "reply-all" => open_reply(app, cfg, ReplyKind::ReplyAll),
@@ -504,9 +505,12 @@ fn send_active(app: &mut App, cfg: &Config) {
         }
     };
     let label = send_label(&draft);
-    let rx = mail_compose::start_send_worker(bytes, smtp_cmd, sent_cur_dir, app.event_tx.clone());
+    let delay = std::time::Duration::from_secs(cfg.compose.send_delay_secs);
+    let handle =
+        mail_compose::start_send_worker(bytes, smtp_cmd, sent_cur_dir, delay, app.event_tx.clone());
     app.pending_sends.push(PendingSend {
-        rx,
+        rx: handle.rx,
+        cancel_tx: handle.cancel_tx,
         label: label.clone(),
         origin_draft_path,
     });
@@ -516,7 +520,40 @@ fn send_active(app: &mut App, cfg: &Config) {
         app.status_error = Some(format!("send: {msg}"));
         return;
     }
-    app.status_error = Some(format!("sending: {label}"));
+    app.status_error = Some(send_pending_status(&label, cfg.compose.send_delay_secs));
+}
+
+/// Initial status message after `:send`. With a non-zero delay, prompt
+/// the user that `:cancel-send` is available; with `0` it's an immediate
+/// dispatch and the existing "sending: …" wording is accurate.
+fn send_pending_status(label: &str, delay_secs: u64) -> String {
+    if delay_secs == 0 {
+        format!("sending: {label}")
+    } else {
+        format!("sending in {delay_secs}s: {label} (:cancel-send to abort)")
+    }
+}
+
+/// `:cancel-send` — fire the cancel signal on every in-flight send.
+/// Workers still inside the delay window abort and return
+/// `SendOutcome::Cancelled`; ones past the window have already invoked
+/// msmtp and the cancel sender is dropped (the `_ =` swallows the
+/// resulting `SendError`). Per-send completion still flows through
+/// `poll_pending_sends`, which writes the final status.
+fn cancel_pending_sends(app: &mut App) {
+    if app.pending_sends.is_empty() {
+        app.status_error = Some("cancel-send: nothing pending".into());
+        return;
+    }
+    let n = app.pending_sends.len();
+    for p in &app.pending_sends {
+        let _ = p.cancel_tx.send(());
+    }
+    app.status_error = Some(if n == 1 {
+        "cancel-send: requested".into()
+    } else {
+        format!("cancel-send: requested ({n})")
+    });
 }
 
 /// Save the active compose tab as a draft in the account's Drafts
@@ -856,6 +893,28 @@ mod tests {
         dispatch("", &mut app, &cfg);
         assert!(app.status_error.is_none());
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn dispatch_cancel_send_without_pending_reports_error() {
+        let (mut app, cfg) = test_app();
+        dispatch("cancel-send", &mut app, &cfg);
+        let err = app.status_error.as_deref().expect("status");
+        assert!(err.contains("nothing pending"), "got {err:?}");
+    }
+
+    #[test]
+    fn send_pending_status_mentions_delay_and_cancel_command() {
+        let s = send_pending_status("Lunch?", 10);
+        assert!(s.contains("10s"), "missing delay: {s:?}");
+        assert!(s.contains(":cancel-send"), "missing hint: {s:?}");
+    }
+
+    #[test]
+    fn send_pending_status_with_zero_delay_omits_cancel_hint() {
+        let s = send_pending_status("Lunch?", 0);
+        assert!(!s.contains(":cancel-send"), "should omit hint: {s:?}");
+        assert!(s.starts_with("sending: "), "got {s:?}");
     }
 
     #[test]

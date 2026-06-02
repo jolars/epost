@@ -51,6 +51,10 @@ mode = "native"
 # Optional override for the external editor command (used by `:edit`
 # and by `mode = "external"`). Unset → `$VISUAL` / `$EDITOR` / `vi`.
 # editor = "nvim -c 'set ft=mail'"
+# "Undo send" delay: `:send` waits this many seconds before invoking
+# msmtp; `:cancel-send` aborts an in-flight send still inside the
+# window. `0` disables the delay (dispatch immediately). Default 10.
+# send_delay_secs = 10
 
 # Three dev accounts pointing at scratch maildirs. `dev/maildir/`,
 # `dev/maildir-work/`, and `dev/maildir-verbatim/` are the tracked,
