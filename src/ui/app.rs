@@ -400,11 +400,12 @@ pub struct InboxScreen {
     /// independent movement.
     pub reader_cursor_line: u16,
     /// Body-relative cursor column. Char index into
-    /// `LaidOutBody.line_text[reader_cursor_line]`. For ASCII this maps
-    /// 1:1 with display columns; CJK / emoji breaks the parity but the
-    /// reader's existing layout already treats one char as one cell
-    /// (see `LineBuilder::line_width`), so visual selection stays
-    /// internally consistent.
+    /// `LaidOutBody.line_text[reader_cursor_line]` — a *logical* position,
+    /// not a display cell. Movement (`h`/`l`/`0`/`$`) and text extraction
+    /// work in this char space; the reader's paint path converts to the
+    /// display cell via `reader::cell_col` (and the mouse converts a
+    /// clicked cell back with `reader::char_at_cell`), so zero-width and
+    /// wide characters land overlays on the right cells.
     pub reader_cursor_col: u16,
     /// Vim-style visual-mode anchor. `Some` iff `Mode::Visual` is the
     /// active mode (strict pairing — see `Mode::Visual` doc). Char-wise
@@ -417,6 +418,13 @@ pub struct InboxScreen {
     /// attachment under the cursor" without re-running layout. Empty when
     /// the open message has no attachments.
     pub last_attachment_lines: Vec<u16>,
+    /// Plain text of each body line (excluding headers) from the last
+    /// reader draw — a clone of the laid-out `LaidOutBody.line_text`.
+    /// Stashed so the mouse handler can map a clicked display cell back
+    /// to a char index (`reader_cursor_col` is a char index), which
+    /// needs the line content and would otherwise require re-running
+    /// layout. Empty when the reader drew no body this frame.
+    pub last_reader_body_line_text: Vec<String>,
     /// Header-row count (From/Subject/Folder/Flags + the blank
     /// separator) from the last reader draw. Stashed so the yank
     /// helpers can translate the absolute viewport scroll into body
@@ -1679,6 +1687,7 @@ impl InboxScreen {
             reader_cursor_col: 0,
             visual: None,
             last_attachment_lines: Vec::new(),
+            last_reader_body_line_text: Vec::new(),
             last_reader_header_offset: 0,
             last_reader_body_only_lines: 0,
             last_reader_inner_width: 0,

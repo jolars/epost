@@ -13,8 +13,9 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::config::Config;
-use crate::ui::app::{App, Mode, Pane, Screen, VisualKind};
+use crate::ui::app::{App, InboxScreen, Mode, Pane, Screen, VisualKind};
 use crate::ui::keys;
+use crate::ui::reader;
 
 /// Per-tick wheel scroll amount, matched to terminal-style "three lines
 /// per notch" feel. Tweaking this is purely cosmetic.
@@ -45,6 +46,20 @@ pub fn handle(app: &mut App, cfg: &Config, ev: MouseEvent) {
     }
 }
 
+/// Map a hit-tested `(body_line, cell_col)` onto the char index the rest
+/// of the reader uses for `reader_cursor_col`. The hit-test yields a
+/// display cell; on a line carrying a zero-width or wide character that's
+/// not the same as the char index, so translate through the stashed body
+/// text. Falls back to the cell value (correct for ASCII) when the line
+/// isn't available.
+fn cell_to_char(inbox: &InboxScreen, line: u16, cell: u16) -> u16 {
+    inbox
+        .last_reader_body_line_text
+        .get(line as usize)
+        .map(|s| reader::char_at_cell(s, cell))
+        .unwrap_or(cell)
+}
+
 fn press(app: &mut App, col: u16, row: u16) {
     let inbox = app.inbox();
     let Some(inner) = inbox.last_reader_inner else {
@@ -53,9 +68,10 @@ fn press(app: &mut App, col: u16, row: u16) {
     let scroll = inbox.reader_scroll;
     let header = inbox.last_reader_header_offset;
     let lines = inbox.last_reader_body_only_lines;
-    let Some((line, col)) = hit_test_body(col, row, inner, scroll, header, lines) else {
+    let Some((line, cell)) = hit_test_body(col, row, inner, scroll, header, lines) else {
         return;
     };
+    let col = cell_to_char(inbox, line, cell);
     // A press while still inside a previous visual selection is a
     // fresh gesture — drop the old selection and re-anchor here.
     if app.mode == Mode::Visual {
@@ -82,7 +98,8 @@ fn drag(app: &mut App, col: u16, row: u16) {
     let scroll = inbox.reader_scroll;
     let header = inbox.last_reader_header_offset;
     let lines = inbox.last_reader_body_only_lines;
-    let (line, col) = hit_test_clamp(col, row, inner, scroll, header, lines);
+    let (line, cell) = hit_test_clamp(col, row, inner, scroll, header, lines);
+    let col = cell_to_char(inbox, line, cell);
     // First drag → promote to Visual::Char at the press cell. The
     // anchor is preserved on InboxScreen.visual.anchor_{line,col}.
     if app.mode != Mode::Visual {

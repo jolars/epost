@@ -688,6 +688,7 @@ dependencies = [
  "toml",
  "tui-term",
  "tui-textarea-2",
+ "unicode-width",
  "vt100",
 ]
 

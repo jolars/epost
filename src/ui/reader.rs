@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
+use unicode_width::UnicodeWidthStr;
 
 use crate::mail::html::{Block, Inline, InlineStyle};
 use crate::ui::app::{InboxScreen, Mode, Pane, ParsedBody, ScanState, VisualKind, VisualState};
@@ -26,6 +27,45 @@ use crate::ui::style::{pane_block, pane_scrollbar};
 pub struct YankHighlight {
     pub ranges: Vec<(u16, u16, u16)>,
     pub expires_at: Instant,
+}
+
+/// Display width, in terminal cells, of `s`. This is the ruler the
+/// terminal and ratatui's `Wrap` actually use — it counts a zero-width
+/// space (U+200B), combining marks, and variation selectors as 0, and a
+/// wide / emoji-presentation grapheme as 2. `chars().count()` is *not*
+/// this width (it miscounts every such codepoint by ±1), and using it as
+/// a column proxy is what drove misaligned wraps, cursors, and OSC 8
+/// anchors on mail that carries those characters.
+pub(crate) fn cells(s: &str) -> u16 {
+    UnicodeWidthStr::width(s).min(u16::MAX as usize) as u16
+}
+
+/// Display column (0-based cell offset) of the char at index `char_idx`
+/// within `line` — i.e. the cell width of the prefix preceding it.
+/// Measured as a *string* prefix rather than a per-char width sum so that
+/// emoji + variation-selector sequences (e.g. `⬆\u{FE0F}`) count once.
+/// Maps a logical cursor / selection char position to the cell it paints.
+pub(crate) fn cell_col(line: &str, char_idx: usize) -> u16 {
+    let byte = line
+        .char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(line.len());
+    cells(&line[..byte])
+}
+
+/// Inverse of `cell_col`: the char index whose cell falls at or just
+/// before display column `target`. Maps a mouse click's cell column back
+/// onto a logical char position so `reader_cursor_col` stays a char index
+/// regardless of where the click landed.
+pub(crate) fn char_at_cell(line: &str, target: u16) -> u16 {
+    let count = line.chars().count();
+    for i in 0..count {
+        if cell_col(line, i + 1) > target {
+            return i as u16;
+        }
+    }
+    count as u16
 }
 
 /// Marker text the pass-1 walker stamps into a single sentinel `Line`
@@ -177,8 +217,9 @@ impl LaidOutBody {
     /// cell range to paint REVERSED. For line-wise, the entire line is
     /// covered (cell range = `0..line_width_cells`). For char-wise:
     /// first/last lines cut at the cursor cols; middles span the whole
-    /// line. Columns are char-counts, consistent with `line_text` and
-    /// the existing cell-counting convention in `LineBuilder`.
+    /// line. Returned columns are display cells (not char indices), so
+    /// the painter aligns with the rendered grid even on lines carrying
+    /// zero-width or wide characters.
     pub fn selection_cell_ranges(
         &self,
         sel: &VisualState,
@@ -198,8 +239,12 @@ impl LaidOutBody {
         let el = (el as usize).min(n - 1);
         let mut out: Vec<(u16, u16, u16)> = Vec::new();
         for li in sl..=el {
-            let line_chars = self.line_text[li].chars().count() as u16;
-            let (a, b) = match sel.kind {
+            let line = &self.line_text[li];
+            let line_chars = line.chars().count() as u16;
+            // Endpoints below are char indices into `line`; convert to
+            // display-cell columns before pushing so the painter lands on
+            // the right cells even past a zero-width / wide character.
+            let (a_char, b_char) = match sel.kind {
                 VisualKind::Line => (0u16, line_chars),
                 VisualKind::Char => {
                     let start = if li == sl { sc } else { 0 };
@@ -213,7 +258,9 @@ impl LaidOutBody {
                     (start.min(line_chars), end_excl)
                 }
             };
-            if a < b {
+            if a_char < b_char {
+                let a = cell_col(line, a_char as usize);
+                let b = cell_col(line, b_char as usize);
                 out.push((li as u16, a, b));
             } else if matches!(sel.kind, VisualKind::Char) && line_chars == 0 {
                 // Empty line under a multi-line selection still gets a
@@ -242,18 +289,14 @@ impl LaidOutBody {
     }
 
     /// Cell ranges for every line whose `line_block_idx` matches
-    /// `block_idx`. Each entry is `(line, 0, line_width_chars)`. Used by
+    /// `block_idx`. Each entry is `(line, 0, line_width_cells)`. Used by
     /// the yank-highlight painter for `yp` so the flash covers the full
     /// resolved paragraph regardless of the cursor's column.
     pub fn block_ranges(&self, block_idx: usize) -> Vec<(u16, u16, u16)> {
         let mut out = Vec::new();
         for (i, bi) in self.line_block_idx.iter().enumerate() {
             if *bi == Some(block_idx) {
-                let width = self
-                    .line_text
-                    .get(i)
-                    .map(|s| s.chars().count() as u16)
-                    .unwrap_or(0);
+                let width = self.line_text.get(i).map(|s| cells(s)).unwrap_or(0);
                 if width > 0 {
                     out.push((i as u16, 0, width));
                 }
@@ -450,6 +493,10 @@ pub fn draw(
     inbox.last_reader_header_offset = header_offset_this_frame;
     inbox.last_reader_body_only_lines = body_only_lines_this_frame;
     inbox.last_attachment_lines = attachment_lines_this_frame;
+    inbox.last_reader_body_line_text = laid
+        .as_ref()
+        .map(|l| l.line_text.clone())
+        .unwrap_or_default();
     inbox.last_reader_inner = Some(Rect {
         x: area.x + 1,
         y: area.y + 1,
@@ -688,21 +735,30 @@ fn paint_cursor_cell(
         return;
     }
     let row = inner.y + row_signed as u16;
-    let line_chars = laid
-        .line_text
-        .get(cursor_line as usize)
-        .map(|s| s.chars().count() as u16)
-        .unwrap_or(0);
+    let line = laid.line_text.get(cursor_line as usize);
+    let line_chars = line.map(|s| s.chars().count() as u16).unwrap_or(0);
+    // `cursor_col` is a char index; cap it to the line then translate to
+    // the display cell it occupies, and reverse the grapheme's full cell
+    // width (2 for a wide char) so the cursor doesn't half-cover it.
     let max_col = line_chars.saturating_sub(1);
     let capped_col = cursor_col.min(max_col);
-    let x = inner
-        .x
-        .saturating_add(capped_col)
-        .min(inner.x + inner.width.saturating_sub(1));
-    if let Some(cell) = buf.cell_mut((x, row)) {
-        let mut style = cell.style();
-        style = style.add_modifier(Modifier::REVERSED);
-        cell.set_style(style);
+    let (cell_start, cell_w) = match line {
+        Some(s) => {
+            let start = cell_col(s, capped_col as usize);
+            let end = cell_col(s, capped_col as usize + 1);
+            (start, end.saturating_sub(start).max(1))
+        }
+        None => (capped_col, 1),
+    };
+    let x0 = inner.x.saturating_add(cell_start);
+    let x_max = inner.x + inner.width.saturating_sub(1);
+    for dx in 0..cell_w {
+        let x = x0.saturating_add(dx).min(x_max);
+        if let Some(cell) = buf.cell_mut((x, row)) {
+            let mut style = cell.style();
+            style = style.add_modifier(Modifier::REVERSED);
+            cell.set_style(style);
+        }
     }
 }
 
@@ -1459,7 +1515,7 @@ impl LineBuilder {
                 lead.to_string(),
                 Style::default().fg(Color::DarkGray),
             ));
-            width += lead.chars().count();
+            width += cells(lead) as usize;
         }
         Self {
             indent,
@@ -1471,7 +1527,7 @@ impl LineBuilder {
     }
 
     fn push_space(&mut self) {
-        if self.line_width > self.indent as usize + self.lead.chars().count() {
+        if self.line_width > self.indent as usize + cells(&self.lead) as usize {
             self.pending_space = true;
         }
     }
@@ -1485,8 +1541,8 @@ impl LineBuilder {
         out_lines: &mut Vec<Line<'static>>,
         links: &mut [LinkSlot],
     ) {
-        let word_w = text.chars().count();
-        let head_w = self.indent as usize + self.lead.chars().count();
+        let word_w = cells(text) as usize;
+        let head_w = self.indent as usize + cells(&self.lead) as usize;
         let space_w = if self.pending_space { 1 } else { 0 };
         if self.line_width + space_w + word_w > max_w && self.line_width > head_w {
             self.flush_line(out_lines);
@@ -1531,9 +1587,9 @@ impl LineBuilder {
         }
         if !self.lead.is_empty() {
             // Continuation lines pad rather than re-print the marker.
-            spans.push(Span::raw(" ".repeat(self.lead.chars().count())));
+            spans.push(Span::raw(" ".repeat(cells(&self.lead) as usize)));
         }
-        self.line_width = self.indent as usize + self.lead.chars().count();
+        self.line_width = self.indent as usize + cells(&self.lead) as usize;
         self.line_spans = spans;
         self.pending_space = false;
     }
@@ -1626,6 +1682,43 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn cells_ignores_zero_width_and_counts_wide() {
+        // Zero-width space contributes 0 cells; emoji + VS16 is one wide
+        // grapheme (2 cells). These are exactly the chars that broke the
+        // old chars().count() width model.
+        assert_eq!(cells("ab"), 2);
+        assert_eq!(cells("a\u{200b}b"), 2, "ZWSP must be width 0");
+        assert_eq!(cells("\u{2b06}\u{fe0f}"), 2, "emoji+VS16 is width 2");
+    }
+
+    #[test]
+    fn cell_col_and_char_at_cell_roundtrip_past_zwsp() {
+        // "a<ZWSP>bc": char indices 0=a 1=ZWSP 2=b 3=c map to cells
+        // 0,1,1,2 — the ZWSP sits at the same cell as the following 'b'.
+        let line = "a\u{200b}bc";
+        assert_eq!(cell_col(line, 0), 0);
+        assert_eq!(cell_col(line, 1), 1); // before ZWSP
+        assert_eq!(cell_col(line, 2), 1); // before 'b' — ZWSP added nothing
+        assert_eq!(cell_col(line, 3), 2); // before 'c'
+        // A click on cell 1 lands on the ZWSP/'b' boundary → char 'b' (2).
+        assert_eq!(char_at_cell(line, 1), 2);
+        assert_eq!(char_at_cell(line, 0), 0);
+    }
+
+    #[test]
+    fn wrapping_uses_display_width_not_char_count() {
+        // A paragraph whose words carry zero-width spaces must wrap by
+        // visible width, so the rendered line never exceeds the pane.
+        let z = "\u{200b}";
+        let html = format!("<p>aa{z} bb{z} cc{z} dd{z} ee{z} ff{z}</p>");
+        let laid = layout(&html::parse(&html), 8, &[], None, None);
+        for line in &laid.lines {
+            let t: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(cells(&t) <= 8, "line exceeds 8 display cells: {t:?}");
+        }
     }
 
     #[test]
