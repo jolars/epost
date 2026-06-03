@@ -91,17 +91,58 @@ pub fn apply_op(current: &str, flag: char, op: FlagOp) -> String {
 /// share this function — that's the whole reason it takes the target
 /// dir as a parameter instead of deriving it.
 pub fn rename_for_flags(current_path: &Path, target_cur_dir: &Path, new_flags: &str) -> PathBuf {
+    dest_path(current_path, target_cur_dir, new_flags, false)
+}
+
+/// Destination path for a *cross-folder move*. Same as
+/// [`rename_for_flags`] but strips mbsync's `,U=<uid>` marker from the
+/// base name. That marker records the message's UID **in its current
+/// folder**; carried into a different folder it collides with the
+/// destination's own UID space, and mbsync aborts that mailbox with
+/// `Maildir error: duplicate UID N`. Dropping it makes the moved file a
+/// fresh local message that mbsync uploads and assigns a new UID. A
+/// same-folder flag flip must *not* strip it (mbsync tracks the message
+/// by that UID), which is why this is move-only.
+pub fn rename_for_move(current_path: &Path, target_cur_dir: &Path, new_flags: &str) -> PathBuf {
+    dest_path(current_path, target_cur_dir, new_flags, true)
+}
+
+fn dest_path(
+    current_path: &Path,
+    target_cur_dir: &Path,
+    new_flags: &str,
+    strip_uid: bool,
+) -> PathBuf {
     let name = current_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
     let base = name.rsplit_once(":2,").map(|(b, _)| b).unwrap_or(name);
-    let new_name = if new_flags.is_empty() {
+    let base = if strip_uid {
+        strip_mbsync_uid(base)
+    } else {
         base.to_string()
+    };
+    let new_name = if new_flags.is_empty() {
+        base
     } else {
         format!("{base}:2,{new_flags}")
     };
     target_cur_dir.join(new_name)
+}
+
+/// Remove mbsync's `,U=<digits>` UID marker from a maildir base name,
+/// leaving any other comma-separated fields (e.g. `,S=<size>`) intact.
+/// No-op when the marker is absent.
+fn strip_mbsync_uid(base: &str) -> String {
+    let Some(pos) = base.find(",U=") else {
+        return base.to_string();
+    };
+    let after = &base[pos + 3..];
+    let digits = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    format!("{}{}", &base[..pos], &after[digits..])
 }
 
 /// Same-folder flag flip: resolve `target_cur_dir` from the file's own
@@ -168,7 +209,7 @@ pub fn move_to_folder(
     target_cur_dir: &Path,
     new_flags: &str,
 ) -> Result<PathBuf, FlagError> {
-    let new_path = rename_for_flags(current_path, target_cur_dir, new_flags);
+    let new_path = rename_for_move(current_path, target_cur_dir, new_flags);
     do_rename(current_path, &new_path)?;
     Ok(new_path)
 }
@@ -204,7 +245,7 @@ pub fn move_to_folder_recorded(
     new_flags: &str,
     sw: &SelfWrites,
 ) -> Result<PathBuf, FlagError> {
-    let new_path = rename_for_flags(current_path, target_cur_dir, new_flags);
+    let new_path = rename_for_move(current_path, target_cur_dir, new_flags);
     sw.record(current_path);
     sw.record(&new_path);
     match do_rename(current_path, &new_path) {
@@ -475,6 +516,45 @@ mod tests {
         assert_eq!(new, archive.join("cur").join("1779.M0P1.host:2,RS"));
         assert!(new.exists());
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn move_strips_mbsync_uid_marker() {
+        // A cross-folder move must drop mbsync's `,U=<uid>` marker so the
+        // moved file doesn't collide with the destination folder's UID
+        // space (which surfaced as `Maildir error: duplicate UID N`).
+        let tmp = TempDir::new().unwrap();
+        let inbox = folder(&tmp, "INBOX");
+        let archive = folder(&tmp, ".Archive");
+        let src = deliver_cur(&inbox, "1779903914.2367185_6557.terra,U=4:2,S");
+
+        let new = move_to_folder(&src, &archive.join("cur"), "S").unwrap();
+        assert_eq!(
+            new,
+            archive
+                .join("cur")
+                .join("1779903914.2367185_6557.terra:2,S"),
+            "the ,U=4 marker must be gone from the destination name"
+        );
+        assert!(new.exists());
+        assert!(!src.exists());
+
+        // A same-folder flag flip keeps the marker (mbsync tracks the
+        // message by it).
+        let same = rename_for_flags(&src, &inbox.join("cur"), "S");
+        assert_eq!(
+            same,
+            inbox
+                .join("cur")
+                .join("1779903914.2367185_6557.terra,U=4:2,S")
+        );
+    }
+
+    #[test]
+    fn strip_mbsync_uid_preserves_other_fields() {
+        assert_eq!(strip_mbsync_uid("a.b.host,U=42"), "a.b.host");
+        assert_eq!(strip_mbsync_uid("a.b.host,U=42,S=900"), "a.b.host,S=900");
+        assert_eq!(strip_mbsync_uid("a.b.host"), "a.b.host");
     }
 
     #[test]

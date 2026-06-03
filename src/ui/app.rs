@@ -107,6 +107,36 @@ pub enum ScanState {
 /// operation like `D` (trash thread) lands as a single undo step.
 /// Composer text editing is intentionally out of scope — `$EDITOR` owns
 /// its own undo buffer inside the pty.
+/// The stable identity of an indexed message: its Message-ID plus the
+/// account and folder it currently lives in. The same Message-ID can
+/// exist in several places at once — Gmail copies one message into both
+/// Inbox and All Mail, and the same list mail is delivered to two
+/// accounts — so msgid alone no longer identifies a row. Flag toggles,
+/// cross-folder moves, and their undo all target the full triple so an
+/// action can never land on a same-msgid copy in a different account or
+/// folder (which previously relocated mail into the wrong account).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MsgRef {
+    pub msgid: String,
+    pub account: String,
+    pub folder: String,
+}
+
+impl MsgRef {
+    pub fn of(row: &MessageRow) -> Self {
+        Self {
+            msgid: row.msgid.clone(),
+            account: row.account.clone(),
+            folder: row.folder.clone(),
+        }
+    }
+
+    /// True iff `row` is the exact copy this ref names.
+    pub fn matches(&self, row: &MessageRow) -> bool {
+        row.msgid == self.msgid && row.account == self.account && row.folder == self.folder
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum UndoAction {
     Move {
@@ -119,6 +149,11 @@ pub enum UndoAction {
     },
     Flag {
         msgid: String,
+        /// Account + folder the flagged message lives in. A flag toggle
+        /// doesn't move the message, so these are stable across the
+        /// undo/redo cycle and pin the exact copy to re-flag.
+        account: String,
+        folder: String,
         flag: char,
         /// Whether the flag was set *before* the user's action. Drives
         /// `FlagOp::Add` (restore set) or `FlagOp::Remove` (restore
@@ -1031,10 +1066,10 @@ impl App {
     /// this method on purpose (so opening a message doesn't pollute the
     /// undo stack).
     pub fn toggle_flag_selected(&mut self, flag: char) {
-        let Some(msgid) = self.inbox().selected_msgid() else {
+        let Some(target) = self.inbox().selected_message_row().map(MsgRef::of) else {
             return;
         };
-        if let Some(action) = self.toggle_flag_msgid(flag, &msgid) {
+        if let Some(action) = self.toggle_flag_msgid(flag, &target) {
             self.undo_stack.record(action);
         }
     }
@@ -1045,10 +1080,10 @@ impl App {
     /// whole selection undoes in one `u`. Mirrors [`App::move_msgid_to`].
     /// Single-row callers should prefer [`App::toggle_flag_selected`],
     /// which records for them.
-    pub fn toggle_flag_msgid(&mut self, flag: char, msgid: &str) -> Option<UndoAction> {
+    pub fn toggle_flag_msgid(&mut self, flag: char, target: &MsgRef) -> Option<UndoAction> {
         let was_set = self
             .inbox()
-            .find_row(msgid)
+            .find_row(target)
             .map(|r| r.flags.contains(flag))?;
         let ok = {
             let Self {
@@ -1061,11 +1096,13 @@ impl App {
             let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
                 unreachable!("inbox is pinned at index 0")
             };
-            inbox.toggle_flag_msgid(flag, msgid, cache_path, self_writes, status_error)
+            inbox.toggle_flag_msgid(flag, target, cache_path, self_writes, status_error)
         };
         if ok {
             Some(UndoAction::Flag {
-                msgid: msgid.to_string(),
+                msgid: target.msgid.clone(),
+                account: target.account.clone(),
+                folder: target.folder.clone(),
                 flag,
                 was_set,
             })
@@ -1096,10 +1133,10 @@ impl App {
     /// on-disk `.Archive` directory. The target maildir is created if
     /// missing. Pushes an undo entry on success.
     pub fn move_selected_to(&mut self, target_folder: &str, cfg: &Config) {
-        let Some(msgid) = self.inbox().selected_msgid() else {
+        let Some(target) = self.inbox().selected_message_row().map(MsgRef::of) else {
             return;
         };
-        if let Some(action) = self.move_msgid_to(&msgid, target_folder, cfg) {
+        if let Some(action) = self.move_msgid_to(&target, target_folder, cfg) {
             self.undo_stack.record(action);
         }
     }
@@ -1111,14 +1148,13 @@ impl App {
     /// [`App::move_selected_to`], which records for them.
     pub fn move_msgid_to(
         &mut self,
-        msgid: &str,
+        target: &MsgRef,
         target_folder: &str,
         cfg: &Config,
     ) -> Option<UndoAction> {
-        let pre: (String, String) = self
-            .inbox()
-            .find_row(msgid)
-            .map(|r| (r.account.clone(), r.folder.clone()))?;
+        // The move's source identity *is* `target`; confirm the row is
+        // actually present before acting.
+        self.inbox().find_row(target)?;
         let ok = {
             let Self {
                 screens,
@@ -1132,7 +1168,7 @@ impl App {
             };
             inbox.move_msgid_to(
                 target_folder,
-                msgid,
+                target,
                 &cfg.accounts,
                 cache_path,
                 self_writes,
@@ -1140,11 +1176,10 @@ impl App {
             )
         };
         if ok {
-            let (src_account, src_folder) = pre;
             Some(UndoAction::Move {
-                msgid: msgid.to_string(),
-                src_account,
-                src_folder,
+                msgid: target.msgid.clone(),
+                src_account: target.account.clone(),
+                src_folder: target.folder.clone(),
                 dst_folder: target_folder.to_string(),
             })
         } else {
@@ -1208,11 +1243,29 @@ impl App {
             self.status_error = Some(format!("{verb}: {done} of {total}"));
             return Some(UndoAction::Batch(inverses));
         }
-        let msgid = match &action {
-            UndoAction::Move { msgid, .. } | UndoAction::Flag { msgid, .. } => msgid.clone(),
+        // Re-locate the exact copy this action touched. A flag toggle
+        // leaves the message in place, so it lives at (account, folder).
+        // A move put it at (src_account, dst_folder) — account is
+        // unchanged cross-folder, and dst_folder is where it sits now —
+        // so that triple locates it for the reverse move.
+        let (msgid, locate_account, locate_folder) = match &action {
+            UndoAction::Flag {
+                msgid,
+                account,
+                folder,
+                ..
+            } => (msgid.clone(), account.clone(), folder.clone()),
+            UndoAction::Move {
+                msgid,
+                src_account,
+                dst_folder,
+                ..
+            } => (msgid.clone(), src_account.clone(), dst_folder.clone()),
             UndoAction::Batch(_) => unreachable!("handled above"),
         };
-        let current = match Index::open(&self.cache_path).and_then(|idx| idx.get(&msgid)) {
+        let current = match Index::open(&self.cache_path)
+            .and_then(|idx| idx.get(&msgid, &locate_account, &locate_folder))
+        {
             Ok(Some(row)) => row,
             Ok(None) => {
                 self.status_error = Some(format!("{verb}: {msgid} no longer indexed"));
@@ -1226,6 +1279,8 @@ impl App {
         match action {
             UndoAction::Flag {
                 msgid,
+                account,
+                folder,
                 flag,
                 was_set,
             } => {
@@ -1242,7 +1297,6 @@ impl App {
                             unreachable!("inbox is pinned at index 0")
                         };
                         inbox.apply_flag_undo(
-                            &msgid,
                             &current,
                             &new_path,
                             &new_flags,
@@ -1252,6 +1306,8 @@ impl App {
                         *status_error = Some(format!("{verb}: flag {flag}"));
                         Some(UndoAction::Flag {
                             msgid,
+                            account,
+                            folder,
                             flag,
                             was_set: !was_set,
                         })
@@ -1309,7 +1365,6 @@ impl App {
                             unreachable!("inbox is pinned at index 0")
                         };
                         inbox.apply_move_undo(
-                            &msgid,
                             &current,
                             &src_folder,
                             &new_path,
@@ -1805,7 +1860,11 @@ impl InboxScreen {
                     attachments: body.attachments,
                 }));
                 self.evict_image_cache(old_msgid.as_deref(), &msgid);
-                self.try_mark_seen(&msgid, cache_path, self_writes, status_error);
+                // Mark the *selected* copy seen — not just any row with this
+                // msgid, which could be a same-id copy in another account.
+                if let Some(target) = self.selected_message_row().map(MsgRef::of) {
+                    self.try_mark_seen(&target, cache_path, self_writes, status_error);
+                }
             }
             Err(e) => {
                 self.parsed = None;
@@ -1821,12 +1880,12 @@ impl InboxScreen {
     /// `status_error`; the rescan reconciles on the next sync.
     fn try_mark_seen(
         &mut self,
-        msgid: &str,
+        target: &MsgRef,
         cache_path: &Path,
         self_writes: &SelfWrites,
         status_error: &mut Option<String>,
     ) {
-        let Some(row) = self.find_row(msgid) else {
+        let Some(row) = self.find_row(target) else {
             return;
         };
         if row.flags.contains('S') {
@@ -1835,7 +1894,7 @@ impl InboxScreen {
         let path = row.path.clone();
         match flags::set_flag_recorded(&path, 'S', FlagOp::Add, self_writes) {
             Ok((new_path, new_flags)) => {
-                self.apply_flag_change(msgid, &new_path, &new_flags, cache_path, status_error);
+                self.apply_flag_change(target, &new_path, &new_flags, cache_path, status_error);
             }
             Err(e) => {
                 *status_error = Some(format!("mark read: {e}"));
@@ -1854,18 +1913,18 @@ impl InboxScreen {
     pub fn toggle_flag_msgid(
         &mut self,
         flag: char,
-        msgid: &str,
+        target: &MsgRef,
         cache_path: &Path,
         self_writes: &SelfWrites,
         status_error: &mut Option<String>,
     ) -> bool {
-        let Some(row) = self.find_row(msgid) else {
+        let Some(row) = self.find_row(target) else {
             return false;
         };
         let path = row.path.clone();
         match flags::set_flag_recorded(&path, flag, FlagOp::Toggle, self_writes) {
             Ok((new_path, new_flags)) => {
-                self.apply_flag_change(msgid, &new_path, &new_flags, cache_path, status_error);
+                self.apply_flag_change(target, &new_path, &new_flags, cache_path, status_error);
                 true
             }
             Err(e) => {
@@ -1887,13 +1946,13 @@ impl InboxScreen {
     pub fn move_msgid_to(
         &mut self,
         target_folder: &str,
-        msgid: &str,
+        target: &MsgRef,
         accounts: &HashMap<String, Account>,
         cache_path: &Path,
         self_writes: &SelfWrites,
         status_error: &mut Option<String>,
     ) -> bool {
-        let Some(row) = self.find_row(msgid) else {
+        let Some(row) = self.find_row(target) else {
             return false;
         };
         let account_name = row.account.clone();
@@ -1904,6 +1963,21 @@ impl InboxScreen {
             *status_error = Some(format!("move: unknown account {account_name}"));
             return false;
         };
+        // Hard guard against cross-account moves. epost has no "move mail
+        // between accounts" operation — every move resolves its
+        // destination against the message's *own* account maildir, so the
+        // source file must already live under that account's root. If it
+        // doesn't, the (account, path) pair is inconsistent and proceeding
+        // would relocate a file into a foreign account's tree (and, on the
+        // next sync, upload it to the wrong provider — exactly how the
+        // Gmail injection happened). Refuse instead.
+        if !path.starts_with(&account.maildir) {
+            *status_error = Some(format!(
+                "move refused: {} is not under account {account_name}'s maildir (cross-account move)",
+                path.display()
+            ));
+            return false;
+        }
         // Bindings are config-derived and cheap to rebuild; doing it
         // here avoids threading the AccountSpec map through every
         // move callsite. The binding's `path` carries the on-disk
@@ -1934,7 +2008,13 @@ impl InboxScreen {
                 if let Some(w) = self.watcher.as_ref() {
                     w.register_folder(&account_name, target_folder, &folder_root, account.layout);
                 }
-                self.drop_row_after_move(msgid, target_folder, &new_path, cache_path, status_error);
+                self.drop_row_after_move(
+                    target,
+                    target_folder,
+                    &new_path,
+                    cache_path,
+                    status_error,
+                );
                 *status_error = Some(format!("moved to {target_folder}"));
                 true
             }
@@ -1952,7 +2032,7 @@ impl InboxScreen {
     /// surfaced but don't roll back — the next rescan reconciles.
     fn drop_row_after_move(
         &mut self,
-        msgid: &str,
+        source: &MsgRef,
         target_folder: &str,
         new_path: &Path,
         cache_path: &Path,
@@ -1962,7 +2042,7 @@ impl InboxScreen {
         // the row. Scan is preferred when both hold it (local search +
         // current folder), but global search may only have it in the
         // haystack.
-        let Some(snapshot_base) = self.find_row(msgid).cloned() else {
+        let Some(snapshot_base) = self.find_row(source).cloned() else {
             return;
         };
         let src_folder = snapshot_base.folder.clone();
@@ -1976,7 +2056,7 @@ impl InboxScreen {
         // selection (no search), clamp selected against the new len.
         let mut scan_had_row = false;
         if let ScanState::Ready(rows) = &mut self.scan
-            && let Some(i) = rows.iter().position(|t| t.row.msgid == msgid)
+            && let Some(i) = rows.iter().position(|t| source.matches(&t.row))
         {
             rows.remove(i);
             scan_had_row = true;
@@ -1991,7 +2071,7 @@ impl InboxScreen {
         // Drop from search (if active). Reclamps `selected` against the
         // new results length.
         if let Some(s) = self.search.as_mut() {
-            s.drop_msgid(msgid);
+            s.drop_msg(source);
             if s.results.is_empty() {
                 self.selected = 0;
             } else if self.selected >= s.results.len() {
@@ -2008,7 +2088,10 @@ impl InboxScreen {
             adjust_unread(&mut self.folder_stats, &account, target_folder, 1);
         }
 
-        if let Err(e) = mirror_to_index(cache_path, &snapshot) {
+        // Under the composite key the destination is a *new* row, so the
+        // source row must be deleted explicitly — an upsert alone would
+        // leave the message indexed in both folders.
+        if let Err(e) = move_in_index(cache_path, source, &snapshot) {
             *status_error = Some(format!("index mirror failed: {e:#}"));
         }
     }
@@ -2021,13 +2104,13 @@ impl InboxScreen {
     /// `current.folder`; in-memory rows are patched when present.
     fn apply_flag_undo(
         &mut self,
-        msgid: &str,
         current: &MessageRow,
         new_path: &Path,
         new_flags: &str,
         cache_path: &Path,
         status_error: &mut Option<String>,
     ) {
+        let target = MsgRef::of(current);
         let was_unread = !current.flags.contains('S');
         let now_unread = !new_flags.contains('S');
         let unread_delta: i64 = match (was_unread, now_unread) {
@@ -2044,13 +2127,13 @@ impl InboxScreen {
             );
         }
         if let ScanState::Ready(rows) = &mut self.scan
-            && let Some(t) = rows.iter_mut().find(|t| t.row.msgid == msgid)
+            && let Some(t) = rows.iter_mut().find(|t| target.matches(&t.row))
         {
             t.row.path = new_path.to_path_buf();
             t.row.flags = new_flags.to_string();
         }
         if let Some(s) = self.search.as_mut() {
-            s.patch_row(msgid, new_path, new_flags);
+            s.patch_msg(&target, new_path, new_flags);
         }
         let mut snap = current.clone();
         snap.path = new_path.to_path_buf();
@@ -2070,13 +2153,15 @@ impl InboxScreen {
     /// is the undo destination.
     fn apply_move_undo(
         &mut self,
-        msgid: &str,
         current: &MessageRow,
         src_folder: &str,
         new_path: &Path,
         cache_path: &Path,
         status_error: &mut Option<String>,
     ) {
+        // `current` is where the message sits *now* (the forward move's
+        // destination); we're moving it back to `src_folder`.
+        let from = MsgRef::of(current);
         let was_unread = !current.flags.contains('S');
         let mut snap = current.clone();
         snap.folder = src_folder.to_string();
@@ -2086,7 +2171,7 @@ impl InboxScreen {
         // the forward move already dropped it — but defend against the
         // case where a rescan re-surfaced it under the dst label).
         if let ScanState::Ready(rows) = &mut self.scan
-            && let Some(i) = rows.iter().position(|t| t.row.msgid == msgid)
+            && let Some(i) = rows.iter().position(|t| from.matches(&t.row))
         {
             rows.remove(i);
             if self.search.is_none() {
@@ -2098,7 +2183,7 @@ impl InboxScreen {
             }
         }
         if let Some(s) = self.search.as_mut() {
-            s.drop_msgid(msgid);
+            s.drop_msg(&from);
             if s.results.is_empty() {
                 self.selected = 0;
             } else if self.selected >= s.results.len() {
@@ -2121,7 +2206,9 @@ impl InboxScreen {
             );
             adjust_unread(&mut self.folder_stats, &current.account, src_folder, 1);
         }
-        if let Err(e) = mirror_to_index(cache_path, &snap) {
+        // Delete the now-stale destination row and insert the row back
+        // under `src_folder` (composite key: distinct rows).
+        if let Err(e) = move_in_index(cache_path, &from, &snap) {
             *status_error = Some(format!("index mirror failed: {e:#}"));
         }
         // Queue a rescan of the destination folder so the row reappears
@@ -2138,7 +2225,7 @@ impl InboxScreen {
     /// the in-memory row patched and let the next rescan reconcile.
     fn apply_flag_change(
         &mut self,
-        msgid: &str,
+        target: &MsgRef,
         new_path: &Path,
         new_flags: &str,
         cache_path: &Path,
@@ -2149,7 +2236,7 @@ impl InboxScreen {
         // search), haystack only (global-search result outside the
         // current folder), or both (local search). Whichever has it
         // first is fine — the values that drive stats are identical.
-        let Some(pre) = self.find_row(msgid).cloned() else {
+        let Some(pre) = self.find_row(target).cloned() else {
             return;
         };
         let was_unread = !pre.flags.contains('S');
@@ -2162,7 +2249,7 @@ impl InboxScreen {
         // Patch scan (if there).
         let mut snapshot_for_index: Option<MessageRow> = None;
         if let ScanState::Ready(rows) = &mut self.scan
-            && let Some(t) = rows.iter_mut().find(|t| t.row.msgid == msgid)
+            && let Some(t) = rows.iter_mut().find(|t| target.matches(&t.row))
         {
             t.row.path = new_path.to_path_buf();
             t.row.flags = new_flags.to_string();
@@ -2170,9 +2257,9 @@ impl InboxScreen {
         }
         // Patch search haystack (if there).
         if let Some(s) = self.search.as_mut() {
-            s.patch_row(msgid, new_path, new_flags);
+            s.patch_msg(target, new_path, new_flags);
             if snapshot_for_index.is_none()
-                && let Some(r) = s.haystack.iter().find(|r| r.msgid == msgid)
+                && let Some(r) = s.haystack.iter().find(|r| target.matches(r))
             {
                 snapshot_for_index = Some(r.clone());
             }
@@ -2597,12 +2684,13 @@ impl InboxScreen {
         if !view_touched {
             return;
         }
-        let old_msgid = self.selected_msgid();
+        let old_ref = self.selected_message_row().map(MsgRef::of);
         self.scan = ScanState::Ready(data.threads);
-        self.selected = match (old_msgid, &self.scan) {
-            (Some(mid), ScanState::Ready(rows)) => {
-                rows.iter().position(|r| r.row.msgid == mid).unwrap_or(0)
-            }
+        self.selected = match (old_ref, &self.scan) {
+            (Some(target), ScanState::Ready(rows)) => rows
+                .iter()
+                .position(|r| target.matches(&r.row))
+                .unwrap_or(0),
             _ => 0,
         };
     }
@@ -2842,15 +2930,15 @@ impl InboxScreen {
     /// haystack (when search is active). Used by flag-toggle / move
     /// callsites that must keep the in-memory rows consistent regardless
     /// of which view is current.
-    pub fn find_row(&self, msgid: &str) -> Option<&MessageRow> {
+    pub fn find_row(&self, target: &MsgRef) -> Option<&MessageRow> {
         if let ScanState::Ready(rows) = &self.scan
-            && let Some(t) = rows.iter().find(|t| t.row.msgid == msgid)
+            && let Some(t) = rows.iter().find(|t| target.matches(&t.row))
         {
             return Some(&t.row);
         }
         self.search
             .as_ref()
-            .and_then(|s| s.haystack.iter().find(|r| r.msgid == msgid))
+            .and_then(|s| s.haystack.iter().find(|r| target.matches(r)))
     }
 
     /// Row at list position `i` in whichever view is active (search
@@ -2888,6 +2976,19 @@ fn account_specs(cfg: &Config) -> Vec<AccountSpec> {
 
 fn mirror_to_index(cache_path: &Path, row: &MessageRow) -> anyhow::Result<()> {
     let mut idx = Index::open(cache_path)?;
+    idx.upsert(row)?;
+    Ok(())
+}
+
+/// Reflect a cross-folder move in the index: delete the `source` row and
+/// upsert the relocated `row`. Under the composite `(msgid, account,
+/// folder)` key the destination is a distinct row, so a bare upsert
+/// would leave the message indexed in both the source and destination
+/// folders. No-op-safe when `source` already matches `row`'s identity
+/// (the delete drops it, the upsert reinstates it).
+fn move_in_index(cache_path: &Path, source: &MsgRef, row: &MessageRow) -> anyhow::Result<()> {
+    let mut idx = Index::open(cache_path)?;
+    idx.delete(&source.msgid, &source.account, &source.folder)?;
     idx.upsert(row)?;
     Ok(())
 }
@@ -3502,6 +3603,134 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
     }
 
     #[test]
+    fn cross_account_same_msgid_move_targets_only_selected_account() {
+        // Regression for the real-mail corruption: one Message-ID
+        // delivered to two accounts is two distinct rows now. Moving the
+        // row selected in account A must relocate A's file and leave B's
+        // copy untouched. The pre-fix code resolved the target by msgid
+        // alone (first match) and could move — and on sync, upload — the
+        // wrong account's message into the wrong mailbox.
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        for name in ["alpha", "beta"] {
+            cfg.accounts.insert(
+                name.into(),
+                Account {
+                    maildir: tmp.path().join("Mail").join(name),
+                    from: format!("Tester <{name}@example.invalid>"),
+                    layout: crate::mail::layout::Layout::Maildirpp,
+                    inbox: None,
+                    sent: None,
+                    archive: Some("Archive".into()),
+                    spam: None,
+                    trash: None,
+                    drafts: None,
+                    extra_folders: Vec::new(),
+                    smtp: None,
+                    primary: false,
+                },
+            );
+            let inbox = tmp.path().join("Mail").join(name);
+            fs::create_dir_all(inbox.join("cur")).unwrap();
+            fs::create_dir_all(inbox.join("new")).unwrap();
+            // Identical Message-ID in both accounts; distinct dates only so
+            // list order is deterministic.
+            let date = if name == "beta" {
+                "13:00:00"
+            } else {
+                "12:00:00"
+            };
+            let body = format!(
+                "Message-ID: <shared@x>\r\n\
+                 Date: Thu, 28 May 2026 {date} +0000\r\n\
+                 From: a@b\r\nSubject: hi\r\n\r\nbody\r\n"
+            );
+            fs::write(inbox.join("cur").join(format!("{name}:2,")), body).unwrap();
+        }
+        let cache = tmp.path().join("index.sqlite");
+        let mut app = App::new(&cfg, cache.clone(), None, None);
+        drain_scan(&mut app, &cfg);
+
+        // Unified [all] INBOX shows both copies (same msgid, two accounts).
+        assert_eq!(
+            app.inbox().threaded().len(),
+            2,
+            "both same-msgid copies present in [all]"
+        );
+
+        // Select alpha's copy specifically and archive it.
+        let alpha_idx = app
+            .inbox()
+            .threaded()
+            .iter()
+            .position(|t| t.row.account == "alpha")
+            .expect("alpha row present");
+        app.inbox_mut().selected = alpha_idx;
+        cmdline::dispatch("archive", &mut app, &cfg);
+
+        let dir_count = |p: std::path::PathBuf| fs::read_dir(p).map(|d| d.count()).unwrap_or(0);
+        let mail = tmp.path().join("Mail");
+        assert_eq!(
+            dir_count(mail.join("alpha").join(".Archive").join("cur")),
+            1,
+            "alpha's file must land in alpha's Archive"
+        );
+        assert_eq!(
+            dir_count(mail.join("alpha").join("cur")),
+            0,
+            "alpha's INBOX file must be gone"
+        );
+        assert_eq!(
+            dir_count(mail.join("beta").join("cur")),
+            1,
+            "beta's INBOX copy must be untouched"
+        );
+        assert!(
+            !mail.join("beta").join(".Archive").exists()
+                || dir_count(mail.join("beta").join(".Archive").join("cur")) == 0,
+            "beta must not have been archived"
+        );
+
+        // msgid is stored without the angle brackets (the parser strips them).
+        let idx = crate::store::index::Index::open(&cache).unwrap();
+        assert!(idx.get("shared@x", "alpha", "Archive").unwrap().is_some());
+        assert!(idx.get("shared@x", "alpha", "INBOX").unwrap().is_none());
+        assert!(idx.get("shared@x", "beta", "INBOX").unwrap().is_some());
+    }
+
+    #[test]
+    fn move_refused_when_file_outside_account_maildir() {
+        // Hard guard: epost never moves mail across accounts. If a row's
+        // path somehow points outside its account's maildir, the move is
+        // refused rather than relocating real mail into a foreign tree.
+        let tmp = TempDir::new().unwrap();
+        let src = drop_message(&tmp, "cur", "1779.M0P1.host:2,S");
+        let cfg = account_with_folders(&tmp, Some("Archive"), None);
+        let cache = tmp.path().join("index.sqlite");
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        // Corrupt the in-memory row's path to point outside the account.
+        let foreign = tmp.path().join("elsewhere").join("cur").join("x:2,S");
+        if let ScanState::Ready(rows) = &mut app.inbox_mut().scan {
+            rows[0].row.path = foreign;
+        }
+        let target = app.inbox().selected_message_row().map(MsgRef::of).unwrap();
+
+        let action = app.move_msgid_to(&target, "Archive", &cfg);
+        assert!(action.is_none(), "cross-account move must be refused");
+        assert!(
+            app.status_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("refused"),
+            "status should explain the refusal, got {:?}",
+            app.status_error
+        );
+        assert!(src.exists(), "original file must be left untouched");
+    }
+
+    #[test]
     fn auto_mark_seen_on_first_body_parse() {
         let tmp = TempDir::new().unwrap();
         let src = drop_message(&tmp, "new", "1779.M0P1.host");
@@ -3737,7 +3966,10 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         );
 
         let idx = crate::store::index::Index::open(&cache).unwrap();
-        let got = idx.get(&msgid).unwrap().expect("row in index");
+        let got = idx
+            .get(&msgid, "personal", "Archive")
+            .unwrap()
+            .expect("row in index");
         assert_eq!(got.folder, "Archive");
         assert_eq!(got.path, expected);
     }
@@ -4270,9 +4502,12 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         drain_inbox_only(&mut app, &cfg);
 
         let idx = crate::store::index::Index::open(&cache).unwrap();
-        assert!(idx.get("inbox-1@x").unwrap().is_some(), "INBOX must land");
         assert!(
-            idx.get("sent-1@x").unwrap().is_none(),
+            idx.get("inbox-1@x", "personal", "INBOX").unwrap().is_some(),
+            "INBOX must land"
+        );
+        assert!(
+            idx.get("sent-1@x", "personal", "Sent").unwrap().is_none(),
             "Sent must NOT be in the index after the eager pass alone"
         );
         // Track-set reflects the same: INBOX scanned, Sent not yet.
@@ -4300,7 +4535,10 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         drain_scan(&mut app, &cfg);
 
         let idx = crate::store::index::Index::open(&cache).unwrap();
-        assert!(idx.get("sent-1@x").unwrap().is_some(), "Sent indexed");
+        assert!(
+            idx.get("sent-1@x", "personal", "Sent").unwrap().is_some(),
+            "Sent indexed"
+        );
         assert!(
             app.inbox()
                 .scanned_folders
@@ -4372,6 +4610,8 @@ mod undo_stack_tests {
     fn flag(msgid: &str, was_set: bool) -> UndoAction {
         UndoAction::Flag {
             msgid: msgid.to_string(),
+            account: "dev".into(),
+            folder: "INBOX".into(),
             flag: 'S',
             was_set,
         }
@@ -4637,7 +4877,10 @@ mod undo_integration_tests {
         app.undo(&cfg);
         assert!(!archived.exists(), "undo must remove file from Archive");
         let idx = Index::open(&app.cache_path).unwrap();
-        let row = idx.get(&msgid).unwrap().expect("row still indexed");
+        let row = idx
+            .get(&msgid, "personal", "INBOX")
+            .unwrap()
+            .expect("row still indexed");
         assert_eq!(row.folder, "INBOX");
         assert!(row.path.exists(), "undo-restored file must exist on disk");
         assert!(

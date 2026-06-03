@@ -13,8 +13,12 @@ pub fn build_threads(rows: Vec<MessageRow>) -> Vec<ThreadedRow> {
         return vec![];
     }
 
-    // Index rows by msgid for parent lookup. If we see duplicates, keep the
-    // first — the upstream caller already deduped by primary key.
+    // Index rows by msgid for parent lookup. The same msgid can appear
+    // more than once in a unified `[all]` view (the same list mail
+    // delivered to two accounts is two distinct rows now); keep the first
+    // as the parent anchor — threading only needs *a* present ancestor,
+    // and the duplicates render as their own thread roots, which is
+    // correct: they are separate deliveries the user can act on per-row.
     let mut by_msgid: HashMap<String, usize> = HashMap::new();
     for (i, r) in rows.iter().enumerate() {
         by_msgid.entry(r.msgid.clone()).or_insert(i);

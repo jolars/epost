@@ -49,14 +49,14 @@ impl Index {
         // realistic per-transaction write time.
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .context("setting busy_timeout")?;
-        conn.execute_batch(SCHEMA).context("creating schema")?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite")?;
-        conn.execute_batch(SCHEMA).context("creating schema")?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -67,9 +67,7 @@ impl Index {
             .execute(
                 "INSERT INTO msg(msgid, account, folder, path, date, from_addr, subject, in_reply, refs, flags) \
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
-                 ON CONFLICT(msgid) DO UPDATE SET \
-                   account=excluded.account, \
-                   folder=excluded.folder, \
+                 ON CONFLICT(msgid, account, folder) DO UPDATE SET \
                    path=excluded.path, \
                    date=excluded.date, \
                    from_addr=excluded.from_addr, \
@@ -121,11 +119,14 @@ impl Index {
         }
         let dropped = to_drop.len();
         if !to_drop.is_empty() {
+            // Scoped to (account, folder): the same msgid can now live in
+            // other folders/accounts (Gmail's Inbox + All Mail, or a list
+            // mail in two accounts), and pruning INBOX must not touch those.
             let mut del = tx
-                .prepare("DELETE FROM msg WHERE msgid = ?1")
+                .prepare("DELETE FROM msg WHERE msgid = ?1 AND account = ?2 AND folder = ?3")
                 .context("preparing prune_folder delete")?;
             for msgid in &to_drop {
-                del.execute(params![msgid])
+                del.execute(params![msgid, account, folder])
                     .context("executing prune_folder delete")?;
             }
         }
@@ -271,24 +272,71 @@ impl Index {
         }
     }
 
-    /// Look up a single row by message-id. `msgid` is the stable primary
-    /// key — paths and folder labels drift on every sync, but msgid is
-    /// the email header value, so this is the canonical "find this
-    /// message wherever it lives now" entry point. Used by undo/redo to
-    /// re-locate a previously-moved message before applying the inverse
-    /// rename.
-    pub fn get(&self, msgid: &str) -> Result<Option<MessageRow>> {
+    /// Look up a single row by its full identity `(msgid, account,
+    /// folder)`. msgid alone no longer identifies a row — the same
+    /// Message-ID can live in several folders/accounts at once — so undo
+    /// /redo must re-locate the exact copy it acted on. Paths and flag
+    /// suffixes still drift on every sync, but the identity triple is
+    /// stable, so this remains the canonical "find this message where it
+    /// lives now" entry point.
+    pub fn get(&self, msgid: &str, account: &str, folder: &str) -> Result<Option<MessageRow>> {
         use rusqlite::OptionalExtension;
         self.conn
             .query_row(
                 "SELECT msgid, account, folder, path, date, from_addr, subject, in_reply, refs, flags \
-                 FROM msg WHERE msgid = ?1",
-                params![msgid],
+                 FROM msg WHERE msgid = ?1 AND account = ?2 AND folder = ?3",
+                params![msgid, account, folder],
                 row_from_sqlite,
             )
             .optional()
-            .context("get by msgid")
+            .context("get by identity")
     }
+
+    /// Delete the single row identified by `(msgid, account, folder)`.
+    /// A cross-folder move is delete-then-upsert: under the composite key
+    /// the destination row is a *new* row, so the source row must be
+    /// removed explicitly or the message would linger in both folders.
+    pub fn delete(&mut self, msgid: &str, account: &str, folder: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM msg WHERE msgid = ?1 AND account = ?2 AND folder = ?3",
+                params![msgid, account, folder],
+            )
+            .context("delete by identity")?;
+        Ok(())
+    }
+}
+
+/// Cache schema version. Bump whenever the `msg` table shape changes so
+/// a stale on-disk cache is dropped and rebuilt rather than silently
+/// running against the old layout. The cache is a disposable derivative
+/// of the maildir (DESIGN invariant), so dropping it loses nothing.
+///
+/// v2: primary key widened from `msgid` alone to `(msgid, account,
+/// folder)`. Under a single `msgid` key, scanning a folder that shares a
+/// Message-ID with another folder (Gmail copies one message into both
+/// Inbox and All Mail) or another account (the same list mail delivered
+/// to two accounts) would re-key or clobber the existing row — emptying
+/// the inbox view and mis-attributing messages across accounts.
+const SCHEMA_VERSION: i64 = 2;
+
+/// Create the schema, dropping a stale-version table first. `CREATE TABLE
+/// IF NOT EXISTS` alone can't change the primary key of a table that
+/// already exists, so a cache written by an older epost would keep the
+/// narrow `msgid` key. We gate on `PRAGMA user_version` and rebuild on
+/// mismatch.
+fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .context("reading user_version")?;
+    if version != SCHEMA_VERSION {
+        conn.execute_batch("DROP TABLE IF EXISTS msg")
+            .context("dropping stale msg table")?;
+    }
+    conn.execute_batch(SCHEMA).context("creating schema")?;
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("stamping user_version")?;
+    Ok(())
 }
 
 fn row_from_sqlite(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
@@ -310,7 +358,7 @@ fn row_from_sqlite(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS msg (
-  msgid     TEXT PRIMARY KEY,
+  msgid     TEXT NOT NULL,
   account   TEXT NOT NULL,
   folder    TEXT NOT NULL,
   path      TEXT NOT NULL,
@@ -319,7 +367,8 @@ CREATE TABLE IF NOT EXISTS msg (
   subject   TEXT,
   in_reply  TEXT,
   refs      TEXT,
-  flags     TEXT
+  flags     TEXT,
+  PRIMARY KEY (msgid, account, folder)
 );
 CREATE INDEX IF NOT EXISTS idx_folder_date ON msg(folder, date);
 CREATE INDEX IF NOT EXISTS idx_account    ON msg(account);
@@ -367,9 +416,52 @@ mod tests {
         r.path = PathBuf::from("/new");
         r.flags = "S".into();
         idx.upsert(&r).unwrap();
-        let got = idx.get("<a>").unwrap().unwrap();
+        let got = idx.get("<a>", "dev", "INBOX").unwrap().unwrap();
         assert_eq!(got.path, PathBuf::from("/new"));
         assert_eq!(got.flags, "S");
+    }
+
+    #[test]
+    fn same_msgid_coexists_across_folders_and_accounts() {
+        // Gmail copies one message into Inbox and All Mail; the same list
+        // mail lands in two accounts. All four are distinct rows under the
+        // composite key — scanning one must not clobber the others.
+        let mut idx = Index::open_in_memory().unwrap();
+        let mut mk = |account: &str, folder: &str, path: &str| {
+            let mut r = sample("<dup@x>", 100);
+            r.account = account.into();
+            r.folder = folder.into();
+            r.path = PathBuf::from(path);
+            idx.upsert(&r).unwrap();
+        };
+        mk("gmail", "INBOX", "/g/inbox");
+        mk("gmail", "[Gmail]/All Mail", "/g/all");
+        mk("posteo", "INBOX", "/p/inbox");
+
+        // The INBOX view still shows the message for each account.
+        assert_eq!(idx.list_folder(Some("gmail"), "INBOX").unwrap().len(), 1);
+        assert_eq!(idx.list_folder(Some("posteo"), "INBOX").unwrap().len(), 1);
+        // Each copy keeps its own path.
+        assert_eq!(
+            idx.get("<dup@x>", "gmail", "INBOX").unwrap().unwrap().path,
+            PathBuf::from("/g/inbox")
+        );
+        assert_eq!(
+            idx.get("<dup@x>", "gmail", "[Gmail]/All Mail")
+                .unwrap()
+                .unwrap()
+                .path,
+            PathBuf::from("/g/all")
+        );
+        // Deleting one copy leaves the others.
+        idx.delete("<dup@x>", "gmail", "[Gmail]/All Mail").unwrap();
+        assert!(idx.get("<dup@x>", "gmail", "INBOX").unwrap().is_some());
+        assert!(idx.get("<dup@x>", "posteo", "INBOX").unwrap().is_some());
+        assert!(
+            idx.get("<dup@x>", "gmail", "[Gmail]/All Mail")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -515,18 +607,23 @@ mod tests {
         let mut idx = Index::open_in_memory().unwrap();
         idx.upsert(&sample("<a>", 100)).unwrap();
         idx.upsert(&sample("<b>", 200)).unwrap();
+        // <c> exists in INBOX *and* Sent — two distinct rows now. Pruning
+        // INBOX drops the INBOX copy but must leave the Sent copy alone.
         idx.upsert(&sample("<c>", 300)).unwrap();
-        // <c> lives in a different folder — pruning INBOX must leave it alone.
         let mut other = sample("<c>", 300);
         other.folder = "Sent".into();
         idx.upsert(&other).unwrap();
 
         let keep: HashSet<String> = ["<a>".to_string()].into_iter().collect();
         let dropped = idx.prune_folder("dev", "INBOX", &keep).unwrap();
-        assert_eq!(dropped, 1, "only <b> should be pruned");
-        assert!(idx.get("<a>").unwrap().is_some());
-        assert!(idx.get("<b>").unwrap().is_none());
-        assert!(idx.get("<c>").unwrap().is_some(), "Sent row untouched");
+        assert_eq!(dropped, 2, "<b> and the INBOX copy of <c> are pruned");
+        assert!(idx.get("<a>", "dev", "INBOX").unwrap().is_some());
+        assert!(idx.get("<b>", "dev", "INBOX").unwrap().is_none());
+        assert!(idx.get("<c>", "dev", "INBOX").unwrap().is_none());
+        assert!(
+            idx.get("<c>", "dev", "Sent").unwrap().is_some(),
+            "Sent row untouched"
+        );
     }
 
     #[test]
@@ -535,7 +632,7 @@ mod tests {
         let mut r = sample("<c>", 100);
         r.refs = vec!["<a>".into(), "<b>".into()];
         idx.upsert(&r).unwrap();
-        let got = idx.get("<c>").unwrap().unwrap();
+        let got = idx.get("<c>", "dev", "INBOX").unwrap().unwrap();
         assert_eq!(got.refs, vec!["<a>", "<b>"]);
     }
 }

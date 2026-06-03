@@ -10,6 +10,7 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NConfig, Matcher, Utf32String};
 
 use crate::store::index::MessageRow;
+use crate::ui::app::MsgRef;
 use crate::ui::text_input::TextInput;
 
 /// Cap visible results to keep the list pane snappy even on huge
@@ -160,9 +161,11 @@ impl SearchState {
 
     /// Drop a row from the haystack and re-run the matcher. Used after
     /// a cross-folder move on a search result so the moved row stops
-    /// showing in `results`.
-    pub fn drop_msgid(&mut self, msgid: &str) {
-        let Some(idx) = self.haystack.iter().position(|r| r.msgid == msgid) else {
+    /// showing in `results`. Keyed on the full `(msgid, account,
+    /// folder)` identity so a same-msgid copy in another account/folder
+    /// (a global search can surface several) isn't dropped by mistake.
+    pub fn drop_msg(&mut self, target: &MsgRef) {
+        let Some(idx) = self.haystack.iter().position(|r| target.matches(r)) else {
             return;
         };
         self.haystack.remove(idx);
@@ -173,9 +176,9 @@ impl SearchState {
 
     /// Patch `path` / `flags` on a row in the haystack so the bold-unread
     /// list rendering stays accurate after a flag toggle on a search
-    /// result. No-op when the msgid isn't in the haystack.
-    pub fn patch_row(&mut self, msgid: &str, new_path: &std::path::Path, new_flags: &str) {
-        if let Some(r) = self.haystack.iter_mut().find(|r| r.msgid == msgid) {
+    /// result. No-op when the identity isn't in the haystack.
+    pub fn patch_msg(&mut self, target: &MsgRef, new_path: &std::path::Path, new_flags: &str) {
+        if let Some(r) = self.haystack.iter_mut().find(|r| target.matches(r)) {
             r.path = new_path.to_path_buf();
             r.flags = new_flags.to_string();
         }
@@ -283,7 +286,11 @@ mod tests {
             hs,
             None,
         );
-        s.drop_msgid("<a>");
+        s.drop_msg(&MsgRef {
+            msgid: "<a>".into(),
+            account: "dev".into(),
+            folder: "INBOX".into(),
+        });
         assert_eq!(s.results.len(), 1);
         assert_eq!(s.row(0).unwrap().msgid, "<b>");
     }
@@ -299,7 +306,15 @@ mod tests {
             hs,
             None,
         );
-        s.patch_row("<a>", std::path::Path::new("/new"), "ST");
+        s.patch_msg(
+            &MsgRef {
+                msgid: "<a>".into(),
+                account: "dev".into(),
+                folder: "INBOX".into(),
+            },
+            std::path::Path::new("/new"),
+            "ST",
+        );
         let r = s.row(0).unwrap();
         assert_eq!(r.flags, "ST");
         assert_eq!(r.path, std::path::PathBuf::from("/new"));

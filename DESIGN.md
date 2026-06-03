@@ -58,8 +58,14 @@ messages where a cell-grid rendering would lose important information.
    input is read by `crossterm` and routed by our modal keymap.
 2. **Everything keys on `Message-ID`, never on file path.** `mbsync` rewrites
    maildir paths and the `:2,<flags>` info suffix on every sync, so paths go
-   stale constantly. The index upserts by `msgid` and updates `path`/`flags` on
-   rescan.
+   stale constantly. Row identity is `(Message-ID, account, folder)` --- *not*
+   `Message-ID` alone, because one Message-ID legitimately exists in several
+   places at once (Gmail copies a message into both `Inbox` and `[Gmail]/All
+   Mail`; the same list mail is delivered to two accounts). Keying on
+   `Message-ID` alone made a scan of one folder re-key or clobber the row in
+   another, and made a move resolve to the wrong copy. The index upserts by that
+   triple and updates `path`/`flags` on rescan; a cross-folder move is
+   delete-then-insert (the destination is a distinct row).
 3. **The SQLite index is a cache.** Maildir is truth. A corrupt or deleted index
    is never a data-loss event --- full rescan on startup is the backstop.
 4. **Remote content is never fetched.** The HTML walker only resolves `cid:`
@@ -297,7 +303,7 @@ impls per struct. `~` expansion on path fields is applied at parse time.
 
 ```sql
 CREATE TABLE IF NOT EXISTS msg (
-  msgid     TEXT PRIMARY KEY,
+  msgid     TEXT NOT NULL,
   account   TEXT NOT NULL,
   folder    TEXT NOT NULL,
   path      TEXT NOT NULL,      -- current maildir path; mutable, never a key
@@ -306,7 +312,11 @@ CREATE TABLE IF NOT EXISTS msg (
   subject   TEXT,
   in_reply  TEXT,               -- In-Reply-To msgid
   refs      TEXT,               -- space-joined References msgids
-  flags     TEXT                -- maildir info flags, mirrored from suffix
+  flags     TEXT,               -- maildir info flags, mirrored from suffix
+  -- One Message-ID can live in several folders/accounts at once (Gmail
+  -- Inbox + All Mail; the same list mail in two accounts), so identity
+  -- is the triple, not msgid alone.
+  PRIMARY KEY (msgid, account, folder)
 );
 CREATE INDEX IF NOT EXISTS idx_folder_date ON msg(folder, date);
 CREATE INDEX IF NOT EXISTS idx_account ON msg(account);

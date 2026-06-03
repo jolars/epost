@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::mail::compose::{self as mail_compose, Draft};
 use crate::mail::parse;
 use crate::store::sync as store_sync;
-use crate::ui::app::{App, Mode, PendingSend, Screen, UndoAction};
+use crate::ui::app::{App, Mode, MsgRef, PendingSend, Screen, UndoAction};
 use crate::ui::browser;
 use crate::ui::compose::{self, ComposeScreen};
 
@@ -319,18 +319,18 @@ pub fn trash_thread_selected(app: &mut App, cfg: &Config) {
             .position(|t| t.depth == 0)
             .map(|p| start + 1 + p)
             .unwrap_or(threaded.len());
-        let members: Vec<(String, String)> = threaded[start..end]
+        let members: Vec<MsgRef> = threaded[start..end]
             .iter()
-            .map(|t| (t.row.msgid.clone(), t.row.account.clone()))
+            .map(|t| MsgRef::of(&t.row))
             .collect();
         (start, members)
     };
     // Filter out messages on accounts without a configured Trash; report
     // them as skipped so the user knows what didn't move.
-    let mut targets: Vec<String> = Vec::with_capacity(members.len());
+    let mut targets: Vec<MsgRef> = Vec::with_capacity(members.len());
     let mut skipped = 0usize;
-    for (msgid, account_name) in &members {
-        let Some(account) = cfg.accounts.get(account_name) else {
+    for member in &members {
+        let Some(account) = cfg.accounts.get(&member.account) else {
             skipped += 1;
             continue;
         };
@@ -341,7 +341,7 @@ pub fn trash_thread_selected(app: &mut App, cfg: &Config) {
             skipped += 1;
             continue;
         }
-        targets.push(msgid.clone());
+        targets.push(member.clone());
     }
     if targets.is_empty() {
         app.status_error = Some(format!(
@@ -357,8 +357,8 @@ pub fn trash_thread_selected(app: &mut App, cfg: &Config) {
     app.inbox_mut().selected = start;
     let target = MoveKind::Trash.role().label().to_string();
     let mut actions: Vec<UndoAction> = Vec::with_capacity(targets.len());
-    for msgid in &targets {
-        if let Some(action) = app.move_msgid_to(msgid, &target, cfg) {
+    for member in &targets {
+        if let Some(action) = app.move_msgid_to(member, &target, cfg) {
             actions.push(action);
         }
     }
@@ -378,7 +378,7 @@ pub fn trash_thread_selected(app: &mut App, cfg: &Config) {
 /// list order. `None` when no multi-select is active (so callers fall
 /// back to single-row behaviour); `Some(empty)` only when the list
 /// itself is empty.
-fn list_visual_members(app: &App) -> Option<Vec<(String, String)>> {
+fn list_visual_members(app: &App) -> Option<Vec<MsgRef>> {
     let inbox = app.inbox();
     let anchor = inbox.list_visual?;
     let len = inbox.list_len();
@@ -391,7 +391,7 @@ fn list_visual_members(app: &App) -> Option<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(hi - lo + 1);
     for i in lo..=hi {
         if let Some(r) = inbox.row_at(i) {
-            out.push((r.msgid.clone(), r.account.clone()));
+            out.push(MsgRef::of(r));
         }
     }
     Some(out)
@@ -414,12 +414,12 @@ fn move_range_named(app: &mut App, cfg: &Config, kind: MoveKind) {
         app.status_error = Some(format!("{label}: empty selection"));
         return;
     }
-    let mut targets: Vec<String> = Vec::with_capacity(members.len());
+    let mut targets: Vec<MsgRef> = Vec::with_capacity(members.len());
     let mut skipped = 0usize;
-    for (msgid, account_name) in &members {
-        match cfg.accounts.get(account_name) {
+    for member in &members {
+        match cfg.accounts.get(&member.account) {
             Some(account) if account.role_disk_name(kind.role()).is_some() => {
-                targets.push(msgid.clone());
+                targets.push(member.clone());
             }
             _ => skipped += 1,
         }
@@ -433,8 +433,8 @@ fn move_range_named(app: &mut App, cfg: &Config, kind: MoveKind) {
     }
     let target = kind.role().label().to_string();
     let mut actions: Vec<UndoAction> = Vec::with_capacity(targets.len());
-    for msgid in &targets {
-        if let Some(action) = app.move_msgid_to(msgid, &target, cfg) {
+    for member in &targets {
+        if let Some(action) = app.move_msgid_to(member, &target, cfg) {
             actions.push(action);
         }
     }
@@ -466,8 +466,8 @@ fn move_to_folder(app: &mut App, cfg: &Config, folder: &str) {
         return;
     }
     let mut actions: Vec<UndoAction> = Vec::with_capacity(members.len());
-    for (msgid, _) in &members {
-        if let Some(action) = app.move_msgid_to(msgid, folder, cfg) {
+    for member in &members {
+        if let Some(action) = app.move_msgid_to(member, folder, cfg) {
             actions.push(action);
         }
     }
@@ -494,8 +494,8 @@ pub fn flag_selection(app: &mut App, flag: char) {
         return;
     }
     let mut actions: Vec<UndoAction> = Vec::with_capacity(members.len());
-    for (msgid, _) in &members {
-        if let Some(action) = app.toggle_flag_msgid(flag, msgid) {
+    for member in &members {
+        if let Some(action) = app.toggle_flag_msgid(flag, member) {
             actions.push(action);
         }
     }
