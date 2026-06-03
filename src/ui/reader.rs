@@ -519,6 +519,21 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                     cursor_col: inbox.reader_cursor_col,
                 },
             );
+        } else if focused && mode == Mode::Normal {
+            // Show the reader cursor in Normal mode so the user can see
+            // where `v` / `V` will start and where `yp` / `yl` will act.
+            // In Normal mode the cursor is a passive shadow of viewport
+            // top (see the clamp above), so this renders as a REVERSED
+            // cell at the topmost visible body line, col 0.
+            paint_cursor_cell(
+                f.buffer_mut(),
+                inner,
+                &laid,
+                inbox.reader_cursor_line,
+                inbox.reader_cursor_col,
+                inbox.last_reader_header_offset,
+                inbox.reader_scroll,
+            );
         }
         if let Some(hl) = inbox.yank_highlight.as_ref()
             && hl.expires_at > Instant::now()
@@ -670,32 +685,62 @@ fn paint_selection(
     }
     // Cursor cell: always REVERSED so the user can see where the
     // active extend point sits even when (e.g. an empty line) the
-    // selection range above didn't cover it. The cursor col is
-    // capped against the line's real text length so an unclamped
-    // sentinel (`move_reader_cursor_to_line_end` sets `u16::MAX`)
-    // can't park the cursor cell at the right edge of an otherwise-
-    // short line — that was the "selection extends to end of screen"
-    // report.
-    let abs_line = view.header_offset as i32 + view.cursor_line as i32;
-    let row_signed = abs_line - scroll;
-    if row_signed >= 0 && row_signed < inner.height as i32 {
-        let row = inner.y + row_signed as u16;
-        let line_chars = laid
-            .line_text
-            .get(view.cursor_line as usize)
-            .map(|s| s.chars().count() as u16)
-            .unwrap_or(0);
-        let max_col = line_chars.saturating_sub(1);
-        let capped_col = view.cursor_col.min(max_col);
-        let x = inner
-            .x
-            .saturating_add(capped_col)
-            .min(inner.x + inner.width.saturating_sub(1));
-        if let Some(cell) = buf.cell_mut((x, row)) {
-            let mut style = cell.style();
-            style = style.add_modifier(Modifier::REVERSED);
-            cell.set_style(style);
-        }
+    // selection range above didn't cover it. Same paint as Normal
+    // mode's cursor — extracted into `paint_cursor_cell` so both
+    // modes stay visually consistent.
+    paint_cursor_cell(
+        buf,
+        inner,
+        laid,
+        view.cursor_line,
+        view.cursor_col,
+        view.header_offset,
+        view.scroll,
+    );
+}
+
+/// Paint a single REVERSED cell at the body-relative cursor position.
+/// Shared between Normal mode (where the cursor advertises the start
+/// point for `v` / `V` / `yp` / `yl`) and Visual mode (where it marks
+/// the active extend end of the selection).
+///
+/// The cursor col is capped against the line's real text length so an
+/// unclamped sentinel (`move_reader_cursor_to_line_end` sets `u16::MAX`)
+/// can't park the cursor cell at the right edge of an otherwise-short
+/// line — that was the "selection extends to end of screen" report.
+fn paint_cursor_cell(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    laid: &LaidOutBody,
+    cursor_line: u16,
+    cursor_col: u16,
+    header_offset: u16,
+    scroll: u16,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let abs_line = header_offset as i32 + cursor_line as i32;
+    let row_signed = abs_line - scroll as i32;
+    if row_signed < 0 || row_signed >= inner.height as i32 {
+        return;
+    }
+    let row = inner.y + row_signed as u16;
+    let line_chars = laid
+        .line_text
+        .get(cursor_line as usize)
+        .map(|s| s.chars().count() as u16)
+        .unwrap_or(0);
+    let max_col = line_chars.saturating_sub(1);
+    let capped_col = cursor_col.min(max_col);
+    let x = inner
+        .x
+        .saturating_add(capped_col)
+        .min(inner.x + inner.width.saturating_sub(1));
+    if let Some(cell) = buf.cell_mut((x, row)) {
+        let mut style = cell.style();
+        style = style.add_modifier(Modifier::REVERSED);
+        cell.set_style(style);
     }
 }
 
@@ -2557,6 +2602,82 @@ mod tests {
                 !reversed[col as usize],
                 "col {col} REVERSED but should be clean past line end (line_chars={line_chars})"
             );
+        }
+    }
+
+    #[test]
+    fn paint_cursor_cell_reverses_single_cell_in_normal_mode() {
+        // Normal-mode cursor: one REVERSED cell at (cursor_line, cursor_col)
+        // and nothing else on the row. Mirrors the call site in `draw`
+        // when the Reader pane is focused and mode is Normal.
+        use ratatui::buffer::Buffer;
+        let blocks = html::parse("<p>hello world</p>");
+        let laid = layout(&blocks, 80, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hello"))
+            .expect("hello line present") as u16;
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(inner);
+        super::paint_cursor_cell(&mut buf, inner, &laid, li, 0, 0, 0);
+        let row = inner.y + li;
+        let line_chars = laid.line_text[li as usize].chars().count() as u16;
+        for col in 0..inner.width {
+            let cell = buf.cell((inner.x + col, row)).expect("cell");
+            let rev = cell.style().add_modifier.contains(Modifier::REVERSED);
+            if col == 0 {
+                assert!(rev, "cursor cell at col 0 should be REVERSED");
+            } else {
+                assert!(
+                    !rev,
+                    "col {col} REVERSED but only the cursor cell should be (line_chars={line_chars})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paint_cursor_cell_clamps_unset_col_to_line_end() {
+        // u16::MAX is the `move_reader_cursor_to_line_end` sentinel.
+        // The helper must cap against the line's actual char count
+        // rather than the pane's inner width — same guard the visual-
+        // mode cursor cell already enforces.
+        use ratatui::buffer::Buffer;
+        let blocks = html::parse("<p>hi</p>");
+        let laid = layout(&blocks, 80, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("hi"))
+            .expect("hi line present") as u16;
+        let line_chars = laid.line_text[li as usize].chars().count() as u16;
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(inner);
+        super::paint_cursor_cell(&mut buf, inner, &laid, li, u16::MAX, 0, 0);
+        let row = inner.y + li;
+        let last_text_col = line_chars.saturating_sub(1);
+        for col in 0..inner.width {
+            let cell = buf.cell((inner.x + col, row)).expect("cell");
+            let rev = cell.style().add_modifier.contains(Modifier::REVERSED);
+            if col == last_text_col {
+                assert!(
+                    rev,
+                    "cursor cell should land on last text col, not the pane edge"
+                );
+            } else {
+                assert!(!rev, "col {col} REVERSED but should be clean");
+            }
         }
     }
 
