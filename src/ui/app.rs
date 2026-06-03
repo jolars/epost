@@ -47,6 +47,10 @@ pub enum Mode {
     Normal,
     Command,
     LinkPick,
+    /// Reader-pane attachment picker (`gf`). Digit input accumulates in
+    /// `App.attachment_pick_buf`; `<Enter>` opens the chosen attachment in
+    /// the external viewer. Mirrors `LinkPick`'s digit-capture grammar.
+    AttachmentPick,
     Search,
     /// Reader-pane vim-style visual mode. The kind (char-wise vs
     /// line-wise) and the anchor live on `InboxScreen.visual`; the mode
@@ -244,6 +248,9 @@ pub struct App {
     pub mode: Mode,
     pub cmdline: TextInput,
     pub link_pick_buf: String,
+    /// Digit buffer for the reader attachment picker (`gf`), mirroring
+    /// `link_pick_buf`. Active only in `Mode::AttachmentPick`.
+    pub attachment_pick_buf: String,
     /// Pending `g` prefix in Normal mode. The user has typed `g`; the
     /// next key decides what it composes — today only `/` for global
     /// search, future room for `gg`/`G` etc.
@@ -404,6 +411,12 @@ pub struct InboxScreen {
     /// vs line-wise lives on `kind`; the cursor end of the selection is
     /// `(reader_cursor_line, reader_cursor_col)`.
     pub visual: Option<VisualState>,
+    /// Body-relative line index of each attachment row from the last
+    /// reader draw, indexed by attachment (so `[i]` is the body line that
+    /// renders attachment `i`). Stashed so `gx`/`gs` can resolve "the
+    /// attachment under the cursor" without re-running layout. Empty when
+    /// the open message has no attachments.
+    pub last_attachment_lines: Vec<u16>,
     /// Header-row count (From/Subject/Folder/Flags + the blank
     /// separator) from the last reader draw. Stashed so the yank
     /// helpers can translate the absolute viewport scroll into body
@@ -577,6 +590,7 @@ impl App {
             mode: Mode::Normal,
             cmdline: TextInput::new(),
             link_pick_buf: String::new(),
+            attachment_pick_buf: String::new(),
             pending_g: false,
             pending_y: false,
             status_error: watcher_warning,
@@ -1536,9 +1550,30 @@ impl App {
     pub fn page_move(&mut self, down: bool, full: bool) {
         let inbox = self.inbox_mut();
         match inbox.focus {
-            Pane::Reader => inbox.scroll_page(down, full),
+            // Reader page keys move the cursor (scroll follows) so the
+            // cursor stays addressable for `gx`/`gs` and visual entry.
+            Pane::Reader => inbox.page_cursor(down, full),
             Pane::List => inbox.select_page(down, full),
             Pane::Folders => {}
+        }
+    }
+
+    /// Ctrl-e / Ctrl-y: nudge the reader viewport one line without moving
+    /// the cursor. The draw-time clamp re-seats the cursor onto the
+    /// viewport edge if this scroll would push it off-screen (vim's
+    /// scroll-line semantics). No-op unless the Reader pane is focused.
+    pub fn scroll_reader_line(&mut self, down: bool) {
+        let inbox = self.inbox_mut();
+        if inbox.focus != Pane::Reader {
+            return;
+        }
+        if down {
+            let max = inbox
+                .last_reader_body_lines
+                .saturating_sub(inbox.last_reader_inner_height);
+            inbox.reader_scroll = inbox.reader_scroll.saturating_add(1).min(max);
+        } else {
+            inbox.reader_scroll = inbox.reader_scroll.saturating_sub(1);
         }
     }
 
@@ -1643,6 +1678,7 @@ impl InboxScreen {
             reader_cursor_line: 0,
             reader_cursor_col: 0,
             visual: None,
+            last_attachment_lines: Vec::new(),
             last_reader_header_offset: 0,
             last_reader_body_only_lines: 0,
             last_reader_inner_width: 0,
@@ -1739,6 +1775,26 @@ impl InboxScreen {
         // Sentinel: clamped to real line end at draw time.
         self.reader_cursor_col = u16::MAX;
     }
+
+    /// Attachment count for the open message (0 when no body parsed).
+    pub fn attachment_count(&self) -> usize {
+        self.parsed.as_deref().map_or(0, |p| p.attachments.len())
+    }
+
+    /// Resolve the 0-based attachment index whose inline row the reader
+    /// cursor currently sits on, from the last draw's stashed line map.
+    /// Falls back to the sole attachment when the cursor is elsewhere but
+    /// exactly one attachment exists; returns `None` otherwise.
+    pub fn attachment_under_cursor(&self) -> Option<usize> {
+        if let Some(i) = self
+            .last_attachment_lines
+            .iter()
+            .position(|&line| line == self.reader_cursor_line)
+        {
+            return Some(i);
+        }
+        (self.attachment_count() == 1).then_some(0)
+    }
 }
 
 /// Reader motion impl. Cursor columns intentionally overshoot — the
@@ -1784,6 +1840,19 @@ impl MotionTarget for InboxScreen {
 }
 
 impl InboxScreen {
+    /// Move the reader cursor by a page (scroll follows). `full` is a
+    /// whole viewport with two lines of overlap (`Ctrl-f`/`Ctrl-b`), else
+    /// a half viewport (`Ctrl-d`/`Ctrl-u`) — both vim-style.
+    pub fn page_cursor(&mut self, down: bool, full: bool) {
+        let h = self.last_reader_inner_height;
+        let step = if full {
+            h.saturating_sub(2).max(1)
+        } else {
+            (h / 2).max(1)
+        } as i32;
+        self.move_reader_cursor(if down { step } else { -step }, 0);
+    }
+
     /// Adjust `reader_scroll` so the cursor sits inside the body
     /// viewport. Pure scroll-follow — does not move the cursor.
     pub fn follow_cursor(&mut self) {
@@ -2907,25 +2976,6 @@ impl InboxScreen {
         };
     }
 
-    /// Scroll the reader body by a page. `full` is a whole viewport
-    /// (Ctrl-f/b, two lines of overlap, vim-style); else a half viewport
-    /// (Ctrl-d/u). Clamped to the bottom-most scroll the body allows
-    /// (same calc `G` uses).
-    pub fn scroll_page(&mut self, down: bool, full: bool) {
-        let h = self.last_reader_inner_height;
-        let step = if full {
-            h.saturating_sub(2).max(1)
-        } else {
-            (h / 2).max(1)
-        };
-        if down {
-            let max = self.last_reader_body_lines.saturating_sub(h);
-            self.reader_scroll = self.reader_scroll.saturating_add(step).min(max);
-        } else {
-            self.reader_scroll = self.reader_scroll.saturating_sub(step);
-        }
-    }
-
     /// Look up a row by msgid across both the scan view and the search
     /// haystack (when search is active). Used by flag-toggle / move
     /// callsites that must keep the in-memory rows consistent regardless
@@ -3123,6 +3173,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         active,
         mode,
         link_pick_buf,
+        attachment_pick_buf,
         ..
     } = app;
     match screens.get_mut(*active) {
@@ -3142,7 +3193,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 list::draw(f, rect, inbox);
             }
             if let Some(rect) = reader_area {
-                reader::draw(f, rect, inbox, *mode, link_pick_buf);
+                reader::draw(f, rect, inbox, *mode, link_pick_buf, attachment_pick_buf);
             }
         }
         Some(Screen::Compose(c)) => compose::draw(f, body, c),
@@ -3286,6 +3337,43 @@ mod focus_nav_tests {
         assert_eq!(inbox.reader_cursor_line, 4);
     }
 
+    fn parsed_with_attachments(n: usize) -> Box<ParsedBody> {
+        Box::new(ParsedBody {
+            msgid: "x@y".into(),
+            blocks: Vec::new(),
+            raw_html: None,
+            plain_fallback: None,
+            cid_parts: std::collections::HashMap::new(),
+            attachments: (0..n)
+                .map(|i| parse::Attachment {
+                    filename: format!("f{i}"),
+                    bytes: vec![0u8; 4],
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn attachment_under_cursor_maps_line_then_falls_back() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.parsed = Some(parsed_with_attachments(3));
+        // Chip rows at body lines 0,1,2 (as the layout emits them).
+        inbox.last_attachment_lines = vec![0, 1, 2];
+        inbox.reader_cursor_line = 1;
+        assert_eq!(inbox.attachment_under_cursor(), Some(1));
+        inbox.reader_cursor_line = 2;
+        assert_eq!(inbox.attachment_under_cursor(), Some(2));
+        // Cursor off any chip row with >1 attachment → no resolution.
+        inbox.reader_cursor_line = 9;
+        assert_eq!(inbox.attachment_under_cursor(), None);
+
+        // With exactly one attachment, a cursor anywhere falls back to it.
+        inbox.parsed = Some(parsed_with_attachments(1));
+        inbox.last_attachment_lines = vec![0];
+        inbox.reader_cursor_line = 42;
+        assert_eq!(inbox.attachment_under_cursor(), Some(0));
+    }
+
     #[test]
     fn move_reader_cursor_follows_scroll_down() {
         let mut inbox = inbox_with_panes(true, true, true);
@@ -3340,27 +3428,28 @@ mod focus_nav_tests {
     }
 
     #[test]
-    fn scroll_page_half_and_full_step_and_clamp() {
+    fn page_cursor_half_and_full_step_and_clamp() {
         let mut inbox = inbox_with_panes(true, true, true);
         inbox.last_reader_inner_height = 10;
-        inbox.last_reader_body_lines = 100;
-        // Half page down = inner_height / 2.
-        inbox.scroll_page(true, false);
-        assert_eq!(inbox.reader_scroll, 5);
+        inbox.last_reader_body_only_lines = 100;
+        inbox.last_reader_header_offset = 0;
+        // Half page down = inner_height / 2; cursor moves, scroll follows.
+        inbox.page_cursor(true, false);
+        assert_eq!(inbox.reader_cursor_line, 5);
         // Full page down = inner_height - 2 (vim-style overlap).
-        inbox.scroll_page(true, true);
-        assert_eq!(inbox.reader_scroll, 5 + 8);
+        inbox.page_cursor(true, true);
+        assert_eq!(inbox.reader_cursor_line, 5 + 8);
         // Half page back up.
-        inbox.scroll_page(false, false);
-        assert_eq!(inbox.reader_scroll, 8);
-        // Down clamps to the bottom-most scroll (body - height = 90).
-        inbox.reader_scroll = 88;
-        inbox.scroll_page(true, true);
-        assert_eq!(inbox.reader_scroll, 90);
+        inbox.page_cursor(false, false);
+        assert_eq!(inbox.reader_cursor_line, 8);
+        // Down clamps the cursor to the last body line (99).
+        inbox.reader_cursor_line = 95;
+        inbox.page_cursor(true, true);
+        assert_eq!(inbox.reader_cursor_line, 99);
         // Up saturates at 0.
-        inbox.reader_scroll = 3;
-        inbox.scroll_page(false, true);
-        assert_eq!(inbox.reader_scroll, 0);
+        inbox.reader_cursor_line = 3;
+        inbox.page_cursor(false, true);
+        assert_eq!(inbox.reader_cursor_line, 0);
     }
 
     #[test]
@@ -3418,6 +3507,8 @@ mod focus_nav_tests {
             let inbox = app.inbox_mut();
             inbox.last_reader_inner_height = 10;
             inbox.last_reader_body_lines = 100;
+            inbox.last_reader_body_only_lines = 100;
+            inbox.last_reader_header_offset = 0;
             inbox.last_list_inner_height = 10;
             let rows: Vec<MessageRow> = (0..30)
                 .map(|i| MessageRow {
@@ -3435,16 +3526,17 @@ mod focus_nav_tests {
                 .collect();
             inbox.scan = ScanState::Ready(build_threads(rows));
         }
-        // Reader focus scrolls the body, leaves selection alone.
+        // Reader focus moves the body cursor (scroll follows), leaves
+        // selection alone.
         app.inbox_mut().focus = Pane::Reader;
         app.page_move(true, false);
-        assert_eq!(app.inbox().reader_scroll, 5);
+        assert_eq!(app.inbox().reader_cursor_line, 5);
         assert_eq!(app.inbox().selected, 0);
-        // List focus moves selection, leaves scroll alone.
+        // List focus moves selection, leaves the reader cursor alone.
         app.inbox_mut().focus = Pane::List;
         app.page_move(true, false);
         assert_eq!(app.inbox().selected, 5);
-        assert_eq!(app.inbox().reader_scroll, 5);
+        assert_eq!(app.inbox().reader_cursor_line, 5);
     }
 
     #[test]

@@ -84,6 +84,7 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::Normal => "-- NORMAL --",
         Mode::Command => "-- COMMAND --",
         Mode::LinkPick => "-- LINK PICK --",
+        Mode::AttachmentPick => "-- ATTACH PICK --",
         Mode::Search => "-- SEARCH --",
         // Char-wise vs line-wise lives on `InboxScreen.visual.kind`; the
         // label is the same shape for both — the user reads the
@@ -585,7 +586,23 @@ fn save_attachment(app: &mut App, full_cmd: &str) {
         return;
     };
     let dest_arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    save_attachment_index(app, n, dest_arg);
+}
 
+/// `gs` — save the attachment whose inline row the reader cursor is on
+/// (or the sole attachment), to the cwd under its own filename.
+pub fn save_attachment_under_cursor(app: &mut App) {
+    let Some(i) = app.inbox().attachment_under_cursor() else {
+        app.status_error = Some("save: move the cursor onto an attachment (or use gf)".into());
+        return;
+    };
+    save_attachment_index(app, i + 1, None);
+}
+
+/// Shared core for `:save` and `gs`. `n` is 1-based. With no `dest`,
+/// writes to the cwd under the attachment's filename. Refuses to
+/// overwrite an existing file.
+fn save_attachment_index(app: &mut App, n: usize, dest: Option<&str>) {
     let Some(parsed) = app.inbox_parsed() else {
         app.status_error = Some("save: no parsed body".into());
         return;
@@ -598,7 +615,7 @@ fn save_attachment(app: &mut App, full_cmd: &str) {
         return;
     }
     let att = parsed.attachments[n - 1].clone();
-    let target = match resolve_save_path(dest_arg, &att.filename) {
+    let target = match resolve_save_path(dest, &att.filename) {
         Ok(p) => p,
         Err(e) => {
             app.status_error = Some(format!("save: {e}"));
@@ -630,6 +647,22 @@ fn drag_attachment_cmd(app: &mut App, parts: &mut std::str::SplitWhitespace, cfg
         app.status_error = Some(format!("drag: not a number: {arg}"));
         return;
     };
+    drag_attachment_index(app, n, cfg);
+}
+
+/// `gd` — drag the attachment whose inline row the reader cursor is on
+/// (or the sole attachment) into another app via `[reader].drag`.
+pub fn drag_attachment_under_cursor(app: &mut App, cfg: &Config) {
+    let Some(i) = app.inbox().attachment_under_cursor() else {
+        app.status_error = Some("drag: move the cursor onto an attachment (or use gf)".into());
+        return;
+    };
+    drag_attachment_index(app, i + 1, cfg);
+}
+
+/// Shared core for `:drag` and `gd`. `n` is 1-based. Writes the
+/// attachment to a tempfile and hands it to `[reader].drag`.
+fn drag_attachment_index(app: &mut App, n: usize, cfg: &Config) {
     let Some(parsed) = app.inbox_parsed() else {
         app.status_error = Some("drag: no parsed body".into());
         return;
@@ -662,6 +695,24 @@ fn open_attachment(app: &mut App, parts: &mut std::str::SplitWhitespace, cfg: &C
         app.status_error = Some(format!("open-attachment: not a number: {arg}"));
         return;
     };
+    open_attachment_index(app, n, cfg);
+}
+
+/// `gx` — open the attachment whose inline row the reader cursor is on
+/// (or the sole attachment) in the external viewer.
+pub fn open_attachment_under_cursor(app: &mut App, cfg: &Config) {
+    let Some(i) = app.inbox().attachment_under_cursor() else {
+        app.status_error =
+            Some("open-attachment: move the cursor onto an attachment (or use gf)".into());
+        return;
+    };
+    open_attachment_index(app, i + 1, cfg);
+}
+
+/// Shared core for `:open-attachment`, `gx`, and the `gf` picker. `n` is
+/// 1-based. Writes the attachment to a tempfile preserving its extension
+/// and hands the path to `[reader].browser`.
+pub fn open_attachment_index(app: &mut App, n: usize, cfg: &Config) {
     let Some(parsed) = app.inbox_parsed() else {
         app.status_error = Some("open-attachment: no parsed body".into());
         return;

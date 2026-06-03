@@ -42,6 +42,7 @@ pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
         Mode::Normal => normal(app, cfg, k),
         Mode::Command => command(app, cfg, k),
         Mode::LinkPick => link_pick(app, cfg, k),
+        Mode::AttachmentPick => attachment_pick(app, cfg, k),
         Mode::Search => search(app, cfg, k),
         Mode::Visual => visual(app, cfg, k),
     }
@@ -102,14 +103,42 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                 return;
             }
             if k.code == KeyCode::Char('g') {
-                // `gg` → scroll to top in whichever pane supports it.
-                // Reader: jump body to row 0. (Lists use a different
-                // convention today and aren't wired here.)
+                // `gg` → top in whichever pane supports it. Reader: cursor
+                // to row 0. (Lists use a different convention today and
+                // aren't wired here.)
                 let inbox = app.inbox_mut();
                 if inbox.focus == Pane::Reader {
-                    inbox.reader_scroll = 0;
+                    inbox.move_reader_cursor_to_top();
                 }
                 return;
+            }
+            // `g`-prefixed attachment verbs, Reader focus only: `gx` opens
+            // the attachment under the cursor in the external viewer, `gs`
+            // saves it, `gd` drags it, `gf` opens the numeric attachment
+            // picker. Anything else falls through.
+            if app.inbox().focus == Pane::Reader {
+                match k.code {
+                    KeyCode::Char('x') => {
+                        cmdline::open_attachment_under_cursor(app, cfg);
+                        return;
+                    }
+                    KeyCode::Char('s') => {
+                        cmdline::save_attachment_under_cursor(app);
+                        return;
+                    }
+                    KeyCode::Char('d') => {
+                        cmdline::drag_attachment_under_cursor(app, cfg);
+                        return;
+                    }
+                    KeyCode::Char('f') => {
+                        if app.inbox().attachment_count() > 0 {
+                            app.attachment_pick_buf.clear();
+                            app.mode = Mode::AttachmentPick;
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
             }
             // Any other key falls through to the rest of Normal mode
             // (so e.g. `g` then `j` still moves selection).
@@ -221,6 +250,11 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             KeyCode::Char('u') => app.page_move(false, false),
             KeyCode::Char('f') => app.page_move(true, true),
             KeyCode::Char('b') => app.page_move(false, true),
+            // Ctrl-e/y scroll the reader viewport one line without moving
+            // the cursor's intent; the draw-time clamp slides the cursor
+            // to the viewport edge if the scroll would push it off-screen.
+            KeyCode::Char('e') => app.scroll_reader_line(true),
+            KeyCode::Char('y') => app.scroll_reader_line(false),
             _ => {}
         }
         return;
@@ -336,20 +370,20 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                 }
             }
             match k.code {
-                KeyCode::Char('j') => {
-                    let inbox = app.inbox_mut();
-                    inbox.reader_scroll = inbox.reader_scroll.saturating_add(1);
+                // Cursor motion: `j`/`k` walk the body-relative cursor and
+                // let `follow_cursor` drag the viewport along, same as
+                // visual mode. `gg` (top) lives in the `pending_g` block.
+                KeyCode::Char('j') | KeyCode::Down => app.inbox_mut().move_reader_cursor(1, 0),
+                KeyCode::Char('k') | KeyCode::Up => app.inbox_mut().move_reader_cursor(-1, 0),
+                KeyCode::Char('h') | KeyCode::Left => app.inbox_mut().move_reader_cursor(0, -1),
+                KeyCode::Char('l') | KeyCode::Right => app.inbox_mut().move_reader_cursor(0, 1),
+                KeyCode::Char('0') | KeyCode::Home => {
+                    app.inbox_mut().move_reader_cursor_to_line_start();
                 }
-                KeyCode::Char('k') => {
-                    let inbox = app.inbox_mut();
-                    inbox.reader_scroll = inbox.reader_scroll.saturating_sub(1);
+                KeyCode::Char('$') | KeyCode::End => {
+                    app.inbox_mut().move_reader_cursor_to_line_end();
                 }
-                KeyCode::Char('G') => {
-                    let inbox = app.inbox_mut();
-                    inbox.reader_scroll = inbox
-                        .last_reader_body_lines
-                        .saturating_sub(inbox.last_reader_inner_height);
-                }
+                KeyCode::Char('G') => app.inbox_mut().move_reader_cursor_to_bottom(),
                 KeyCode::Char('f') => {
                     app.link_pick_buf.clear();
                     app.mode = Mode::LinkPick;
@@ -477,7 +511,7 @@ pub(crate) fn yank_visual(app: &mut App, cfg: &Config) {
     let width = inbox.last_reader_inner_width.max(8);
     let (text, ranges) = match app.inbox_parsed() {
         Some(p) => {
-            let laid = crate::ui::reader::layout(&p.blocks, width, None);
+            let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
             let text = laid.extract_selection(
                 sel.anchor_line,
                 sel.anchor_col,
@@ -574,6 +608,34 @@ fn link_pick(app: &mut App, cfg: &Config, k: KeyEvent) {
     }
 }
 
+/// `Mode::AttachmentPick` keymap (`gf`). Mirrors `link_pick`: digits
+/// accumulate, `<Enter>` opens the chosen attachment in the external
+/// viewer, `Esc` cancels.
+fn attachment_pick(app: &mut App, cfg: &Config, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc => {
+            app.attachment_pick_buf.clear();
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Backspace => {
+            app.attachment_pick_buf.pop();
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            app.attachment_pick_buf.push(c);
+        }
+        KeyCode::Enter => {
+            let buf = std::mem::take(&mut app.attachment_pick_buf);
+            app.mode = Mode::Normal;
+            if let Ok(n) = buf.trim().parse::<usize>() {
+                cmdline::open_attachment_index(app, n, cfg);
+            } else if !buf.is_empty() {
+                app.status_error = Some(format!("attachment: not a number: {buf}"));
+            }
+        }
+        _ => {}
+    }
+}
+
 fn enter_command(app: &mut App) {
     app.cmdline.clear();
     app.status_error = None;
@@ -615,7 +677,7 @@ fn yank_paragraph(app: &mut App, cfg: &Config) {
     let cursor = inbox.reader_cursor_line;
     let (text, ranges) = match app.inbox_parsed() {
         Some(p) if !p.blocks.is_empty() => {
-            let laid = crate::ui::reader::layout(&p.blocks, width, None);
+            let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
             match laid.block_at(cursor) {
                 Some(idx) => (text::extract_block(&p.blocks[idx]), laid.block_ranges(idx)),
                 None => (String::new(), Vec::new()),
@@ -648,7 +710,7 @@ fn yank_link(app: &mut App, cfg: &Config) {
     let viewport_h = inbox.last_reader_inner_height;
     let (href, visible, ranges) = match app.inbox_parsed() {
         Some(p) => {
-            let laid = crate::ui::reader::layout(&p.blocks, width, None);
+            let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
             let visible = laid.visible_link_count(scroll_body, viewport_h);
             match laid.first_link_at_or_after(cursor) {
                 Some(slot) => (
@@ -724,7 +786,7 @@ fn follow_link(app: &mut App, cfg: &Config, buf: &str) {
     // the keymap doesn't know that width, rebuild the link table at a sensible
     // default to find the href. Width influences wrapping but not link
     // identity / count, so any reasonable width works.
-    let laid = crate::ui::reader::layout(&parsed.blocks, 80, None);
+    let laid = crate::ui::reader::layout(&parsed.blocks, 80, &[], None, None);
     let Some(slot) = laid.links.iter().find(|s| s.id == id) else {
         app.status_error = Some(format!("link: no such id: {id}"));
         return;

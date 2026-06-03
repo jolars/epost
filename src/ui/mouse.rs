@@ -29,7 +29,10 @@ pub fn handle(app: &mut App, cfg: &Config, ev: MouseEvent) {
     }
     // Suppress mouse during text-capturing modes so a stray click
     // doesn't yank focus mid-search / mid-command.
-    if matches!(app.mode, Mode::Command | Mode::LinkPick | Mode::Search) {
+    if matches!(
+        app.mode,
+        Mode::Command | Mode::LinkPick | Mode::AttachmentPick | Mode::Search
+    ) {
         return;
     }
     match ev.kind {

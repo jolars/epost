@@ -52,6 +52,11 @@ pub struct LaidOutBody {
     /// from the cell buffer). Drives visual-mode selection extraction
     /// without scraping cells. One entry per `lines` row.
     pub line_text: Vec<String>,
+    /// One slot per attachment, in attachment order. Each slot's `line`
+    /// is the body-relative row that renders it (attachments are emitted
+    /// as the first body lines). Drives `gx`/`gs` cursor resolution and
+    /// the `gf` picker. Empty when the message has no attachments.
+    pub attachments: Vec<AttachmentSlot>,
 }
 
 impl LaidOutBody {
@@ -306,7 +311,22 @@ pub struct ImageSlot {
     pub height: u16,
 }
 
-pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link_pick_buf: &str) {
+#[derive(Debug, Clone)]
+pub struct AttachmentSlot {
+    /// Body-relative line that renders this attachment's chip row. The
+    /// slot's position in `LaidOutBody.attachments` is the attachment's
+    /// 0-based index.
+    pub line: u16,
+}
+
+pub fn draw(
+    f: &mut Frame,
+    area: Rect,
+    inbox: &mut InboxScreen,
+    mode: Mode,
+    link_pick_buf: &str,
+    attach_pick_buf: &str,
+) {
     let focused = inbox.focus == Pane::Reader;
     let subject = inbox
         .parsed
@@ -319,17 +339,6 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
         format!("Reader [{}] — {subject}", inbox.reader_scroll)
     };
     let block = pane_block(&title, focused);
-
-    // Reserve a one-row interior strip at the bottom of the bordered pane
-    // when the current message carries attachments. The body's inner area
-    // shrinks by `strip_height` so the Paragraph doesn't draw into the
-    // strip row, and the scrollbar is shortened to match.
-    let attachment_count = inbox
-        .parsed
-        .as_ref()
-        .map(|p| p.attachments.len())
-        .unwrap_or(0);
-    let strip_height: u16 = if attachment_count > 0 { 1 } else { 0 };
 
     let inner_width = area.width.saturating_sub(2);
 
@@ -347,6 +356,7 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     let header_lines: Vec<Line<'static>>;
     let mut header_offset_this_frame: u16 = 0;
     let mut body_only_lines_this_frame: u16 = 0;
+    let mut attachment_lines_this_frame: Vec<u16> = Vec::new();
 
     // Gate on the search-aware selected row, not raw `inbox.scan`: a
     // global-search result may live in a folder whose scan isn't the
@@ -362,10 +372,30 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                 } else {
                     None
                 };
-                let mut body = layout_with_images(&parsed.blocks, inner_width, pick, |k| {
-                    inbox.resolved_image(k)
-                });
-                if body.lines.is_empty()
+                let attach_pick = if mode == Mode::AttachmentPick {
+                    Some(attach_pick_buf)
+                } else {
+                    None
+                };
+                let mut body = layout_with_images(
+                    &parsed.blocks,
+                    inner_width,
+                    &parsed.attachments,
+                    pick,
+                    attach_pick,
+                    |k| inbox.resolved_image(k),
+                );
+                // Attachment chip rows (+ blank separator) occupy the
+                // first `prefix_len` body lines; the plain-text fallback
+                // fires only when the HTML walk produced nothing beyond
+                // them.
+                let prefix_len = if body.attachments.is_empty() {
+                    0
+                } else {
+                    body.attachments.len() + 1
+                };
+                attachment_lines_this_frame = body.attachments.iter().map(|s| s.line).collect();
+                if body.lines.len() == prefix_len
                     && let Some(plain) = parsed.plain_fallback.as_deref()
                 {
                     body.lines
@@ -415,22 +445,23 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
     // but `j` from there is fine.
     inbox.last_reader_body_lines = lines.len().min(u16::MAX as usize) as u16;
     let pane_inner_height = area.height.saturating_sub(2);
-    inbox.last_reader_inner_height = pane_inner_height.saturating_sub(strip_height);
+    inbox.last_reader_inner_height = pane_inner_height;
     inbox.last_reader_inner_width = inner_width;
     inbox.last_reader_header_offset = header_offset_this_frame;
     inbox.last_reader_body_only_lines = body_only_lines_this_frame;
+    inbox.last_attachment_lines = attachment_lines_this_frame;
     inbox.last_reader_inner = Some(Rect {
         x: area.x + 1,
         y: area.y + 1,
         width: area.width.saturating_sub(2),
-        height: pane_inner_height.saturating_sub(strip_height),
+        height: pane_inner_height,
     });
-    // Clamp the body-relative cursor into the visible viewport so it
-    // tracks "topmost visible body line" until visual mode introduces
-    // independent movement. Scroll above the body (cursor below
-    // viewport top) → snap cursor up; scroll past the cursor (cursor
-    // above viewport bottom) → snap cursor down. Also clamp into the
-    // body's actual length so `yp` never indexes off the end.
+    // Keep the body-relative cursor inside the visible viewport. Cursor
+    // *moves* (`j`/`k`, page keys, visual) already maintain this via
+    // `follow_cursor`, so this is a no-op for them; it earns its keep
+    // after pure-scroll input (`Ctrl-e`/`Ctrl-y`, mouse wheel) by
+    // sliding the cursor to the viewport edge, matching vim. Also clamps
+    // into the body's actual length so `yp` never indexes off the end.
     let inner_h = inbox.last_reader_inner_height;
     let header = inbox.last_reader_header_offset;
     let body_top = inbox.reader_scroll.saturating_sub(header);
@@ -438,10 +469,9 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
         let body_bot_excl = body_top.saturating_add(inner_h);
         // In Visual mode the cursor is the *driver* — scroll follows it.
         // Don't clamp the cursor into the viewport; that would silently
-        // walk the selection back when the user scrolled. Visual entry
-        // and `move_reader_cursor` already maintain the scroll-follow
-        // invariant. In Normal mode the cursor is a passive shadow of
-        // viewport-top, so the original clamp still applies.
+        // walk the selection back when the user scrolled past an edge to
+        // extend it. Visual entry and `move_reader_cursor` already keep
+        // the scroll-follow invariant.
         if mode != Mode::Visual {
             if inbox.reader_cursor_line < body_top {
                 inbox.reader_cursor_line = body_top;
@@ -469,34 +499,20 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
 
     let total_lines = lines.len();
     // Render the pane border first, then the body Paragraph (no block)
-    // into the carved inner so the bottom attachment strip claims its
-    // own row without the body drawing over it.
-    let pane_inner = Rect {
+    // into the inner area. Attachments now render inline at the top of
+    // the body, so there's no reserved bottom strip to carve around.
+    let inner = Rect {
         x: area.x + 1,
         y: area.y + 1,
         width: area.width.saturating_sub(2),
         height: pane_inner_height,
-    };
-    let inner = Rect {
-        height: pane_inner.height.saturating_sub(strip_height),
-        ..pane_inner
     };
     f.render_widget(block, area);
     let widget = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((inbox.reader_scroll, 0));
     f.render_widget(widget, inner);
-    let scrollbar_area = Rect {
-        height: area.height.saturating_sub(strip_height),
-        ..area
-    };
-    pane_scrollbar(
-        f,
-        scrollbar_area,
-        inbox.reader_scroll as usize,
-        total_lines,
-        focused,
-    );
+    pane_scrollbar(f, area, inbox.reader_scroll as usize, total_lines, focused);
     if let Some(laid) = laid {
         let scroll = inbox.reader_scroll as i32;
         emit_osc8_hyperlinks(f.buffer_mut(), inner, &laid.links, scroll);
@@ -520,11 +536,10 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
                 },
             );
         } else if focused && mode == Mode::Normal {
-            // Show the reader cursor in Normal mode so the user can see
-            // where `v` / `V` will start and where `yp` / `yl` will act.
-            // In Normal mode the cursor is a passive shadow of viewport
-            // top (see the clamp above), so this renders as a REVERSED
-            // cell at the topmost visible body line, col 0.
+            // Show the reader cursor in Normal mode: it's a real,
+            // independently-movable cursor (`j`/`k` etc.), and marks where
+            // `v` / `V` will start, where `yp` / `yl` act, and which
+            // attachment `gx` / `gs` target. Renders as a REVERSED cell.
             paint_cursor_cell(
                 f.buffer_mut(),
                 inner,
@@ -582,59 +597,6 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen, mode: Mode, link
         }
         inbox.last_image_rects = drawn;
     }
-
-    if strip_height > 0 {
-        let strip_rect = Rect {
-            x: pane_inner.x,
-            y: pane_inner.y + pane_inner.height.saturating_sub(1),
-            width: pane_inner.width,
-            height: 1,
-        };
-        render_attachment_strip(f, strip_rect, inbox, focused);
-    }
-}
-
-/// One-row strip rendered along the bottom interior row of the reader pane
-/// when the open message has attachments. Lists `[n] filename` chips
-/// comma-separated, with overflow truncated by a trailing `…`. The chips
-/// drive the `:save <n>` / `:open-attachment <n>` cmdline verbs.
-fn render_attachment_strip(f: &mut Frame, area: Rect, inbox: &InboxScreen, focused: bool) {
-    let Some(parsed) = inbox.parsed.as_deref() else {
-        return;
-    };
-    if parsed.attachments.is_empty() || area.width == 0 || area.height == 0 {
-        return;
-    }
-    let label_style = if focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(parsed.attachments.len() * 2 + 1);
-    spans.push(Span::styled(
-        "Attach: ",
-        label_style.add_modifier(Modifier::BOLD),
-    ));
-    for (i, a) in parsed.attachments.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
-        }
-        spans.push(Span::styled(
-            format!("[{}] ", i + 1),
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::raw(a.filename.clone()));
-    }
-    let line = Line::from(spans);
-    // Paragraph with no wrap so a long attachment list truncates at the
-    // pane edge rather than spilling into a phantom second row.
-    let widget = Paragraph::new(line)
-        .wrap(Wrap { trim: false })
-        .scroll((0, 0));
-    // Clear first so the body's bottom-row residue (if any drew here in a
-    // prior frame before the strip's height was reserved) is gone.
-    f.render_widget(Clear, area);
-    f.render_widget(widget, area);
 }
 
 /// Paint the visual-mode selection by flipping `Modifier::REVERSED` on
@@ -866,8 +828,14 @@ fn render_headers(inbox: &InboxScreen) -> Vec<Line<'static>> {
 ///
 /// Image blocks always render as `[image: alt]` placeholder text; the
 /// pixel-overlay flow goes through `layout_with_images`.
-pub fn layout(blocks: &[Block], width: u16, link_pick: Option<&str>) -> LaidOutBody {
-    layout_with_images(blocks, width, link_pick, |_| None)
+pub fn layout(
+    blocks: &[Block],
+    width: u16,
+    attachments: &[crate::mail::parse::Attachment],
+    link_pick: Option<&str>,
+    attach_pick: Option<&str>,
+) -> LaidOutBody {
+    layout_with_images(blocks, width, attachments, link_pick, attach_pick, |_| None)
 }
 
 /// Like `layout`, but consults `resolve` for every `Block::Image` and,
@@ -878,13 +846,33 @@ pub fn layout(blocks: &[Block], width: u16, link_pick: Option<&str>) -> LaidOutB
 pub fn layout_with_images<'r, R>(
     blocks: &[Block],
     width: u16,
+    attachments: &[crate::mail::parse::Attachment],
     link_pick: Option<&str>,
+    attach_pick: Option<&str>,
     mut resolve: R,
 ) -> LaidOutBody
 where
     R: FnMut(&ImageKey) -> Option<&'r crate::ui::images::ResolvedImage>,
 {
     let mut ctx = LayoutCtx::new(width, link_pick);
+    // Attachments render as the first body lines (one chip row each)
+    // followed by a blank separator, so the reader cursor can land on
+    // them (`gx`/`gs`) and the `gf` picker can tag them. Emitted before
+    // the block walk so their `line_block_idx` is `None` and the image
+    // two-pass leaves their indices untouched (no sentinels up front).
+    let mut attach_slots: Vec<AttachmentSlot> = Vec::with_capacity(attachments.len());
+    if !attachments.is_empty() {
+        for (i, a) in attachments.iter().enumerate() {
+            attach_slots.push(AttachmentSlot {
+                line: ctx.lines.len().min(u16::MAX as usize) as u16,
+            });
+            ctx.lines
+                .push(attachment_chip_line(i, a, ctx.width, attach_pick));
+            ctx.line_block_idx.push(None);
+        }
+        ctx.lines.push(Line::raw(""));
+        ctx.line_block_idx.push(None);
+    }
     // Tag each newly-pushed line with its top-level block index. The
     // catch-up pattern (extend after the block emits) means we don't
     // have to thread block-index through every `self.lines.push` and
@@ -955,6 +943,69 @@ where
         images: out_images,
         line_block_idx: out_block_idx,
         line_text,
+        attachments: attach_slots,
+    }
+}
+
+/// Build one attachment chip row for the reader body: `Attach: [n]
+/// filename (size)` on the first row, indented under `Attach:` for the
+/// rest. When `pick` is `Some`, the `[n]` tag is highlighted (yellow on
+/// black) for candidates matching the typed prefix and dimmed otherwise,
+/// mirroring the link picker's tag grammar. `n` is 1-based.
+fn attachment_chip_line(
+    i: usize,
+    att: &crate::mail::parse::Attachment,
+    width: u16,
+    pick: Option<&str>,
+) -> Line<'static> {
+    const LABEL: &str = "Attach: ";
+    let n = i + 1;
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+    // Align continuation rows under the first row's chips.
+    let lead = if i == 0 {
+        LABEL.to_string()
+    } else {
+        " ".repeat(LABEL.len())
+    };
+    spans.push(Span::styled(
+        lead,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let tag_style = match pick {
+        Some(prefix) if prefix.is_empty() || n.to_string().starts_with(prefix) => Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+        Some(_) => Style::default().fg(Color::DarkGray),
+        None => Style::default().fg(Color::DarkGray),
+    };
+    spans.push(Span::styled(format!("[{n}]"), tag_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::raw(att.filename.clone()));
+    spans.push(Span::styled(
+        format!(" ({})", human_size(att.bytes.len())),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let _ = width; // chips truncate at the pane edge via the no-wrap Paragraph.
+    Line::from(spans)
+}
+
+/// Compact human-readable byte size (e.g. `12 KB`, `3.4 MB`). Uses
+/// 1024-based units; one decimal for MB+ to keep big files legible.
+fn human_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = KB * 1024;
+    const GB: usize = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes.div_ceil(KB))
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -1565,7 +1616,7 @@ mod tests {
 
     fn layout_first_para(html_src: &str, w: u16) -> Vec<String> {
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, w, None);
+        let laid = layout(&blocks, w, &[], None, None);
         laid.lines
             .iter()
             .map(|l| {
@@ -1623,7 +1674,7 @@ mod tests {
         // Two paragraphs → two top-level blocks. block_ranges(1) should
         // return ranges only for lines whose line_block_idx is Some(1).
         let blocks = html::parse("<p>one</p><p>two three</p>");
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let r0 = laid.block_ranges(0);
         let r1 = laid.block_ranges(1);
         assert!(!r0.is_empty(), "block 0 should have ranges");
@@ -1644,7 +1695,7 @@ mod tests {
     #[test]
     fn block_ranges_widths_match_line_text_char_counts() {
         let blocks = html::parse("<p>hello</p>");
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let ranges = laid.block_ranges(0);
         for (line, _, width) in &ranges {
             let actual = laid.line_text[*line as usize].chars().count() as u16;
@@ -1656,7 +1707,7 @@ mod tests {
     fn link_segment_ranges_maps_to_segments() {
         // Link spans one row; ranges should mirror the LinkSegment.
         let blocks = html::parse(r#"<p>see <a href="https://x">this</a></p>"#);
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let slot = laid.links.first().expect("link slot");
         let ranges = LaidOutBody::link_segment_ranges(slot);
         assert_eq!(ranges.len(), 1);
@@ -1693,7 +1744,7 @@ mod tests {
     #[test]
     fn link_text_is_collected() {
         let blocks = html::parse(r#"<p>see <a href="https://x">this</a> please</p>"#);
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         assert!(!laid.links.is_empty(), "expected at least one link");
         assert_eq!(laid.links[0].href, "https://x");
     }
@@ -1702,7 +1753,7 @@ mod tests {
     fn link_segment_tracks_columns_on_single_line() {
         // "see this please" — link "this" occupies cells 4..8.
         let blocks = html::parse(r#"<p>see <a href="https://x">this</a> please</p>"#);
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let slot = laid.links.first().expect("link slot");
         assert_eq!(slot.segments.len(), 1, "{:?}", slot.segments);
         let seg = &slot.segments[0];
@@ -1716,7 +1767,7 @@ mod tests {
         // Link spans two words on the same line; segments should merge
         // across the connecting space cell.
         let blocks = html::parse(r#"<p><a href="https://x">foo bar</a></p>"#);
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let slot = laid.links.first().expect("link slot");
         assert_eq!(slot.segments.len(), 1, "{:?}", slot.segments);
         let seg = &slot.segments[0];
@@ -1729,7 +1780,7 @@ mod tests {
     fn link_segment_splits_across_wrapped_lines() {
         // Force the link to wrap by giving it a narrow inner width.
         let blocks = html::parse(r#"<p><a href="https://x">foo bar baz</a></p>"#);
-        let laid = layout(&blocks, 4, None);
+        let laid = layout(&blocks, 4, &[], None, None);
         let slot = laid.links.first().expect("link slot");
         assert!(
             slot.segments.len() >= 2,
@@ -1751,7 +1802,7 @@ mod tests {
         // the first / last link cells carry the expected escape bytes.
         let html_src = r#"<p>see <a href="https://x.example/p">click</a> done</p>"#;
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         let inner = Rect {
             x: 0,
             y: 0,
@@ -1836,7 +1887,7 @@ mod tests {
         // be bumped so they line up with the rendered cells.
         let blocks =
             html::parse(r#"<blockquote><p><a href="https://x">click</a></p></blockquote>"#);
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let slot = laid.links.first().expect("link slot");
         let seg = slot.segments.first().expect("segment");
         // Without quote shift this would be 0; with the `> ` prefix the
@@ -1890,7 +1941,7 @@ mod tests {
         let blocks = html::parse(r#"<img src="cid:logo" alt="epost">"#);
         let resolved = fake_resolved(8, 5);
         let key = ImageKey::Cid("logo".to_string());
-        let laid = layout_with_images(&blocks, 40, None, |k| {
+        let laid = layout_with_images(&blocks, 40, &[], None, None, |k| {
             if *k == key { Some(&resolved) } else { None }
         });
         assert_eq!(laid.images.len(), 1, "expected one image slot");
@@ -1918,7 +1969,7 @@ mod tests {
         let blocks = html::parse(r#"<blockquote><img src="cid:x" alt="L"></blockquote>"#);
         let resolved = fake_resolved(6, 3);
         let key = ImageKey::Cid("x".to_string());
-        let laid = layout_with_images(&blocks, 40, None, |k| {
+        let laid = layout_with_images(&blocks, 40, &[], None, None, |k| {
             if *k == key { Some(&resolved) } else { None }
         });
         let slot = laid.images.first().expect("image slot recorded");
@@ -1937,7 +1988,7 @@ mod tests {
         let blocks = html::parse(r#"<ul><li><img src="cid:x" alt="L"></li></ul>"#);
         let resolved = fake_resolved(6, 3);
         let key = ImageKey::Cid("x".to_string());
-        let laid = layout_with_images(&blocks, 40, None, |k| {
+        let laid = layout_with_images(&blocks, 40, &[], None, None, |k| {
             if *k == key { Some(&resolved) } else { None }
         });
         let slot = laid.images.first().expect("image slot recorded");
@@ -1953,7 +2004,7 @@ mod tests {
     #[test]
     fn missing_cache_entry_falls_back_to_placeholder() {
         let blocks = html::parse(r#"<img src="cid:x" alt="L">"#);
-        let laid = layout_with_images(&blocks, 40, None, |_| None);
+        let laid = layout_with_images(&blocks, 40, &[], None, None, |_| None);
         assert!(laid.images.is_empty());
         let joined = laid
             .lines
@@ -1973,7 +2024,7 @@ mod tests {
     fn remote_image_records_no_slot_even_with_stale_resolver() {
         let blocks = html::parse(r#"<img src="https://x.example/p" alt="pixel">"#);
         let resolved = fake_resolved(4, 2);
-        let laid = layout_with_images(&blocks, 40, None, |_| Some(&resolved));
+        let laid = layout_with_images(&blocks, 40, &[], None, None, |_| Some(&resolved));
         assert!(
             laid.images.is_empty(),
             "remote images must never get a slot"
@@ -1990,7 +2041,7 @@ mod tests {
     #[test]
     fn line_block_idx_aligns_with_lines() {
         let blocks = html::parse("<p>one</p><p>two</p><h2>three</h2>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         assert_eq!(
             laid.line_block_idx.len(),
             laid.lines.len(),
@@ -2026,7 +2077,7 @@ mod tests {
     #[test]
     fn block_at_resolves_cursor_to_top_level_block() {
         let blocks = html::parse("<p>one</p><blockquote><p>quoted</p></blockquote><p>tail</p>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         let quoted_line = laid
             .lines
             .iter()
@@ -2045,7 +2096,7 @@ mod tests {
             <p><a href="https://b">B</a></p>
             <p><a href="https://c">C</a></p>"#;
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         // Cursor above the first link: first match is link A.
         let first = laid.first_link_at_or_after(0).expect("any link");
         assert_eq!(first.href, "https://a");
@@ -2058,7 +2109,7 @@ mod tests {
     #[test]
     fn first_link_at_or_after_falls_back_when_cursor_past_last() {
         let blocks = html::parse(r#"<p><a href="https://only">only</a></p>"#);
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         // Cursor below the only link: still yanks it (the fallback that
         // makes `yl` "just work" when the user is scrolled past the
         // single link in the body).
@@ -2071,7 +2122,7 @@ mod tests {
         let html_src = r#"<p><a href="https://a">A</a></p>
             <p><a href="https://b">B</a></p>"#;
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         let a_line = laid.links[0].segments[0].line as u16;
         let b_line = laid.links[1].segments[0].line as u16;
         // Viewport tight enough to include only A.
@@ -2087,7 +2138,7 @@ mod tests {
         let blocks = html::parse(r#"<p>before</p><img src="cid:x" alt="L"><p>after</p>"#);
         let resolved = fake_resolved(4, 3);
         let key = ImageKey::Cid("x".to_string());
-        let laid = layout_with_images(&blocks, 40, None, |k| {
+        let laid = layout_with_images(&blocks, 40, &[], None, None, |k| {
             if *k == key { Some(&resolved) } else { None }
         });
         assert_eq!(laid.line_block_idx.len(), laid.lines.len());
@@ -2108,7 +2159,7 @@ mod tests {
     fn link_pick_renders_overlay_tags() {
         let html_src = r#"<p>see <a href="https://x/a">A</a> and <a href="https://x/b">B</a></p>"#;
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 80, Some(""));
+        let laid = layout(&blocks, 80, &[], Some(""), None);
         let joined: String = laid
             .lines
             .iter()
@@ -2118,7 +2169,7 @@ mod tests {
         assert!(joined.contains("[1]"), "{joined:?}");
         assert!(joined.contains("[2]"), "{joined:?}");
         // Without pick mode, tags should NOT appear.
-        let laid2 = layout(&blocks, 80, None);
+        let laid2 = layout(&blocks, 80, &[], None, None);
         let joined2: String = laid2
             .lines
             .iter()
@@ -2129,9 +2180,75 @@ mod tests {
     }
 
     #[test]
+    fn attachments_render_as_leading_body_rows() {
+        let att = vec![
+            crate::mail::parse::Attachment {
+                filename: "report.pdf".into(),
+                bytes: vec![0u8; 2048],
+            },
+            crate::mail::parse::Attachment {
+                filename: "logo.png".into(),
+                bytes: vec![0u8; 10],
+            },
+        ];
+        let blocks = html::parse("<p>hello</p>");
+        let laid = layout(&blocks, 80, &att, None, None);
+        // Two slots, in order, on the first two body lines.
+        assert_eq!(laid.attachments.len(), 2);
+        assert_eq!(laid.attachments[0].line, 0);
+        assert_eq!(laid.attachments[1].line, 1);
+        // First chip row carries the label, tag, filename and size.
+        assert!(
+            laid.line_text[0].contains("Attach:"),
+            "{:?}",
+            laid.line_text[0]
+        );
+        assert!(laid.line_text[0].contains("[1]"), "{:?}", laid.line_text[0]);
+        assert!(
+            laid.line_text[0].contains("report.pdf"),
+            "{:?}",
+            laid.line_text[0]
+        );
+        assert!(
+            laid.line_text[0].contains("2 KB"),
+            "{:?}",
+            laid.line_text[0]
+        );
+        // Second row is a continuation (indented, no repeated label).
+        assert!(laid.line_text[1].contains("[2]"), "{:?}", laid.line_text[1]);
+        assert!(
+            !laid.line_text[1].contains("Attach:"),
+            "{:?}",
+            laid.line_text[1]
+        );
+        // Chip rows belong to no source block, so yp resolves past them.
+        assert_eq!(laid.line_block_idx[0], None);
+        assert_eq!(laid.line_block_idx[1], None);
+        // The HTML body still renders, after the chips + blank separator.
+        assert!(
+            laid.line_text.iter().any(|t| t.contains("hello")),
+            "body should follow the chips"
+        );
+    }
+
+    #[test]
+    fn attachment_pick_tags_only_in_pick_mode() {
+        let att = vec![crate::mail::parse::Attachment {
+            filename: "a.txt".into(),
+            bytes: vec![1, 2, 3],
+        }];
+        let blocks = html::parse("<p>x</p>");
+        // Tag always shows the index; pick mode just restyles it. Confirm
+        // the chip row exists with the `[1]` tag and a byte size.
+        let laid = layout(&blocks, 80, &att, None, Some(""));
+        assert!(laid.line_text[0].contains("[1]"));
+        assert!(laid.line_text[0].contains("3 B"), "{:?}", laid.line_text[0]);
+    }
+
+    #[test]
     fn line_text_aligns_with_lines() {
         let blocks = html::parse("<p>one</p><p>two</p>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         assert_eq!(
             laid.line_text.len(),
             laid.lines.len(),
@@ -2149,7 +2266,7 @@ mod tests {
         // Blockquote `> ` is inserted post-emit; line_text must include
         // it so visual selection yields the rendered form.
         let blocks = html::parse("<blockquote><p>hi</p></blockquote>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         assert!(
             laid.line_text.iter().any(|s| s.contains("> hi")),
             "line_text didn't capture quote prefix: {:?}",
@@ -2160,7 +2277,7 @@ mod tests {
     #[test]
     fn extract_selection_line_wise_joins_with_newline() {
         let blocks = html::parse("<p>alpha</p><p>beta</p><p>gamma</p>");
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         // Pick the lines containing each word, line-wise from alpha → gamma.
         let a = laid
             .line_text
@@ -2184,7 +2301,7 @@ mod tests {
     #[test]
     fn extract_selection_char_wise_single_line() {
         let blocks = html::parse("<p>hello world</p>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         // Find the line, grab "world" by char index.
         let li = laid
             .line_text
@@ -2202,7 +2319,7 @@ mod tests {
     fn extract_selection_char_wise_multi_line() {
         // Span two paragraphs: from middle of "hello" to middle of "world".
         let blocks = html::parse("<p>hello</p><p>world</p>");
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let l1 = laid
             .line_text
             .iter()
@@ -2223,7 +2340,7 @@ mod tests {
     #[test]
     fn extract_selection_normalizes_reversed_endpoints() {
         let blocks = html::parse("<p>hello</p>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2240,7 +2357,7 @@ mod tests {
     fn extract_selection_clamps_col_overshoot() {
         // `$` sets cursor_col = u16::MAX; extraction must clamp.
         let blocks = html::parse("<p>hi</p>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2253,7 +2370,7 @@ mod tests {
     #[test]
     fn selection_cell_ranges_line_wise_covers_full_line() {
         let blocks = html::parse("<p>hello</p>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2276,7 +2393,7 @@ mod tests {
     #[test]
     fn selection_cell_ranges_char_wise_clamps_to_cursor() {
         let blocks = html::parse("<p>abcdef</p>");
-        let laid = layout(&blocks, 40, None);
+        let laid = layout(&blocks, 40, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2305,7 +2422,7 @@ mod tests {
         // the painter should never light up cells beyond the IR's view of
         // the line.
         let blocks = html::parse("<p>hi</p>");
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2339,7 +2456,7 @@ mod tests {
         use ratatui::buffer::Buffer;
         let blocks = html::parse("<p>hello</p>");
         let inner_width: u16 = 40;
-        let laid = layout(&blocks, inner_width, None);
+        let laid = layout(&blocks, inner_width, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2406,7 +2523,7 @@ mod tests {
         use ratatui::buffer::Buffer;
         let blocks = html::parse("<p>hello</p>");
         let inner_width: u16 = 40;
-        let laid = layout(&blocks, inner_width, None);
+        let laid = layout(&blocks, inner_width, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2472,7 +2589,7 @@ mod tests {
             "<blockquote><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p></blockquote>",
         );
         let inner_width: u16 = 80;
-        let laid = layout(&blocks, inner_width, None);
+        let laid = layout(&blocks, inner_width, &[], None, None);
         for (i, t) in laid.line_text.iter().enumerate() {
             let n = t.chars().count();
             assert!(
@@ -2513,7 +2630,7 @@ mod tests {
         let mut bad: Vec<(String, usize, usize, String)> = Vec::new();
         for (name, html) in cases {
             let blocks = html::parse(html);
-            let laid = layout(&blocks, inner_width, None);
+            let laid = layout(&blocks, inner_width, &[], None, None);
             for (i, t) in laid.line_text.iter().enumerate() {
                 let n = t.chars().count();
                 if n > inner_width as usize {
@@ -2544,7 +2661,7 @@ mod tests {
             "<p>If you can read this in the reader pane, the Block-IR walker is rendering into ratatui cells correctly.</p>",
         );
         let inner_width: u16 = 80;
-        let laid = layout(&blocks, inner_width, None);
+        let laid = layout(&blocks, inner_width, &[], None, None);
         // Pick the first wrapped line and find its actual char count.
         let li_idx = laid
             .line_text
@@ -2612,7 +2729,7 @@ mod tests {
         // when the Reader pane is focused and mode is Normal.
         use ratatui::buffer::Buffer;
         let blocks = html::parse("<p>hello world</p>");
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2650,7 +2767,7 @@ mod tests {
         // mode cursor cell already enforces.
         use ratatui::buffer::Buffer;
         let blocks = html::parse("<p>hi</p>");
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let li = laid
             .line_text
             .iter()
@@ -2687,7 +2804,7 @@ mod tests {
         // `move_reader_cursor_to_line_end`); the painter must clamp the
         // highlight to the line's char count, not the pane's inner width.
         let blocks = html::parse("<p>hello world</p>");
-        let laid = layout(&blocks, 80, None);
+        let laid = layout(&blocks, 80, &[], None, None);
         let li = laid
             .line_text
             .iter()

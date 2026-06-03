@@ -148,6 +148,7 @@ fn mode_tag(mode: Mode) -> &'static str {
         Mode::Normal => "NORMAL  ",
         Mode::Command => "COMMAND ",
         Mode::LinkPick => "LINKPICK",
+        Mode::AttachmentPick => "ATTPICK ",
         Mode::Search => "SEARCH  ",
         Mode::Visual => "VISUAL  ",
     }
