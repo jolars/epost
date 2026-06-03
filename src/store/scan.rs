@@ -144,21 +144,52 @@ pub fn enumerate_folders(accounts: &[AccountSpec]) -> HashSet<(String, String)> 
 /// One `folder_stats(None)` for the "[all]" group, then one
 /// `folder_stats(Some(account))` per configured account, sorted by name.
 /// Order matches what the sidebar renders top-to-bottom.
+///
+/// Every group is back-filled with its configured folders (from each
+/// account's binding list) so a folder the user configured but that
+/// holds no mail still shows in the sidebar at `0/0`. The `[all]` group
+/// gets the union of every account's labels; per-account groups get
+/// just that account's labels.
 fn build_groups(idx: &Index, accounts: &[AccountSpec]) -> Result<Vec<AccountFolderStats>> {
     let mut groups = Vec::with_capacity(accounts.len() + 1);
+    let all_labels = accounts
+        .iter()
+        .flat_map(|s| s.folders.iter())
+        .map(|b| b.label.as_str());
     groups.push(AccountFolderStats {
         scope: None,
-        folders: idx.folder_stats(None)?,
+        folders: fill_configured_folders(idx.folder_stats(None)?, all_labels),
     });
-    let mut names: Vec<&str> = accounts.iter().map(|s| s.name.as_str()).collect();
-    names.sort();
-    for name in names {
+    let mut specs: Vec<&AccountSpec> = accounts.iter().collect();
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    for spec in specs {
+        let labels = spec.folders.iter().map(|b| b.label.as_str());
         groups.push(AccountFolderStats {
-            scope: Some(name.to_string()),
-            folders: idx.folder_stats(Some(name))?,
+            scope: Some(spec.name.clone()),
+            folders: fill_configured_folders(idx.folder_stats(Some(&spec.name))?, labels),
         });
     }
     Ok(groups)
+}
+
+/// Append a `0/0` `FolderStat` for every configured label not already
+/// present in `stats` (membership keyed on the folder name). Preserves
+/// the index rows verbatim — the UI layer (`folder_sort_key`) owns
+/// ordering — so a configured-but-empty folder reads as a plain `0`.
+fn fill_configured_folders<'a>(
+    mut stats: Vec<FolderStat>,
+    labels: impl Iterator<Item = &'a str>,
+) -> Vec<FolderStat> {
+    for label in labels {
+        if !stats.iter().any(|s| s.folder == label) {
+            stats.push(FolderStat {
+                folder: label.to_string(),
+                total: 0,
+                unread: 0,
+            });
+        }
+    }
+    stats
 }
 
 /// Re-walk only the dirty (account, folder) pairs, prune the index for
@@ -495,6 +526,61 @@ mod tests {
             scopes,
             vec![None, Some("personal".to_string()), Some("work".to_string())]
         );
+    }
+
+    #[test]
+    fn configured_but_empty_folders_show_at_zero() {
+        use std::fs;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("idx.sqlite");
+        let root = tmp.path().join("personal");
+        // Only INBOX has mail; Archive/Sent/Spam/Trash are configured but
+        // never created on disk and hold no messages.
+        for sub in ["cur", "new", "tmp"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let mut f = fs::File::create(root.join("cur").join("p1:2,S")).unwrap();
+        writeln!(f, "Message-ID: <p1>").unwrap();
+        writeln!(f, "Date: Thu, 1 Jan 1970 00:00:00 +0000").unwrap();
+        writeln!(f, "From: a@b").unwrap();
+        writeln!(f, "Subject: t").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "body").unwrap();
+
+        let accounts = vec![AccountSpec::from_account(
+            "personal",
+            &test_account(
+                root.clone(),
+                Layout::Maildirpp,
+                &[
+                    ("archive", "Archive"),
+                    ("sent", "Sent"),
+                    ("spam", "Spam"),
+                    ("trash", "Trash"),
+                ],
+            ),
+        )];
+        let rx = start_inbox_worker(accounts, cache, (None, "INBOX".to_string()));
+        let data = rx.recv().unwrap().unwrap();
+
+        // INBOX has its one message; every other configured role shows
+        // up at 0 in both the [all] union and the account group.
+        assert_eq!(group_total(&data.groups, None, "INBOX"), 1);
+        for folder in ["Archive", "Sent", "Spam", "Trash"] {
+            assert_eq!(
+                group_total(&data.groups, None, folder),
+                0,
+                "[all] should list configured {folder} at 0"
+            );
+            assert_eq!(
+                group_total(&data.groups, Some("personal"), folder),
+                0,
+                "personal should list configured {folder} at 0"
+            );
+        }
     }
 
     #[test]

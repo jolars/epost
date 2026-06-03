@@ -181,9 +181,9 @@ fn render_folder_row(name: &str, total: u64, unread: u64, width: usize) -> Line<
     };
 
     // Right-anchored counts: " 12 (3)" when unread, " 12" otherwise.
-    // Hidden when total is zero so empty folders read as plain labels.
+    // Empty (configured-but-no-mail) folders read as a plain " 0".
     let counts = if total == 0 {
-        String::new()
+        " 0".to_string()
     } else if has_unread {
         format!(" {total} ({unread})")
     } else {
@@ -302,14 +302,14 @@ mod tests {
     }
 
     #[test]
-    fn render_folder_row_hides_counts_when_empty() {
+    fn render_folder_row_shows_zero_when_empty() {
         let line = render_folder_row("Spam", 0, 0, 20);
         let text = line
             .spans
             .iter()
             .map(|sp| sp.content.as_ref())
             .collect::<String>();
-        assert_eq!(text, "  Spam");
+        assert_eq!(text, "  Spam 0");
     }
 
     #[test]
