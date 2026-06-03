@@ -404,6 +404,15 @@ pub struct InboxScreen {
     pub yank_highlight: Option<crate::ui::reader::YankHighlight>,
     pub scan: ScanState,
     pub selected: usize,
+    /// Anchor row for a list-pane multi-select ("visual line" over the
+    /// message list). `Some` while the user is building a selection with
+    /// `v` / `V`; the other end is `selected`, so the range covers
+    /// `min(anchor, selected)..=max(anchor, selected)`. Distinct from
+    /// `visual` (reader text selection). Survives into `Mode::Command` so
+    /// `:mv` / `:archive` / `:trash` can act on the range, vim-style.
+    /// Cleared on scope switch, search entry/exit, and after any range
+    /// action consumes it.
+    pub list_visual: Option<usize>,
     /// Persisted top-row offset for the messages list. Without this,
     /// every render starts from `offset = 0` and ratatui re-derives the
     /// offset from `selected` alone — which scrolls the viewport back
@@ -1019,10 +1028,25 @@ impl App {
     /// this method on purpose (so opening a message doesn't pollute the
     /// undo stack).
     pub fn toggle_flag_selected(&mut self, flag: char) {
-        let pre: Option<(String, bool)> = self
+        let Some(msgid) = self.inbox().selected_msgid() else {
+            return;
+        };
+        if let Some(action) = self.toggle_flag_msgid(flag, &msgid) {
+            self.undo_stack.record(action);
+        }
+    }
+
+    /// Msgid-targeted flag toggle that returns the would-be `UndoAction`
+    /// instead of recording it — multi-row callers (the list-visual
+    /// range) collect these into a single `UndoAction::Batch` so the
+    /// whole selection undoes in one `u`. Mirrors [`App::move_msgid_to`].
+    /// Single-row callers should prefer [`App::toggle_flag_selected`],
+    /// which records for them.
+    pub fn toggle_flag_msgid(&mut self, flag: char, msgid: &str) -> Option<UndoAction> {
+        let was_set = self
             .inbox()
-            .selected_message_row()
-            .map(|r| (r.msgid.clone(), r.flags.contains(flag)));
+            .find_row(msgid)
+            .map(|r| r.flags.contains(flag))?;
         let ok = {
             let Self {
                 screens,
@@ -1034,15 +1058,33 @@ impl App {
             let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
                 unreachable!("inbox is pinned at index 0")
             };
-            inbox.toggle_flag(flag, cache_path, self_writes, status_error)
+            inbox.toggle_flag_msgid(flag, msgid, cache_path, self_writes, status_error)
         };
-        if ok && let Some((msgid, was_set)) = pre {
-            self.undo_stack.record(UndoAction::Flag {
-                msgid,
+        if ok {
+            Some(UndoAction::Flag {
+                msgid: msgid.to_string(),
                 flag,
                 was_set,
-            });
+            })
+        } else {
+            None
         }
+    }
+
+    /// Start or cancel a list-pane multi-select. Anchored at the current
+    /// selection; the other end follows `selected` as the user moves with
+    /// `j` / `k`. No-op unless the List pane is focused — a "selection"
+    /// over the reader or sidebar is meaningless.
+    pub fn toggle_list_visual(&mut self) {
+        let inbox = self.inbox_mut();
+        if inbox.focus != Pane::List {
+            return;
+        }
+        inbox.list_visual = if inbox.list_visual.is_some() {
+            None
+        } else {
+            Some(inbox.selected)
+        };
     }
 
     /// Move the selected row's message file into `target_folder` of the
@@ -1539,6 +1581,7 @@ impl InboxScreen {
             yank_highlight: None,
             scan,
             selected: 0,
+            list_visual: None,
             list_offset: 0,
             parsed: None,
             last_parsed_msgid: None,
@@ -1787,23 +1830,26 @@ impl InboxScreen {
     /// Returns `true` iff the rename succeeded — the App-level wrapper
     /// uses that to decide whether to push an undo entry. Early returns
     /// for "no selection" / "no row" / rename failure all yield `false`.
-    pub fn toggle_flag(
+    /// Toggle `flag` on the message identified by `msgid` rather than the
+    /// current selection. Returns `true` on a successful rename so the
+    /// App wrapper can decide whether to record undo. Multi-row callers
+    /// (list-visual range) drive several of these from one operation; the
+    /// selection-targeted [`InboxScreen::toggle_flag`] delegates here.
+    pub fn toggle_flag_msgid(
         &mut self,
         flag: char,
+        msgid: &str,
         cache_path: &Path,
         self_writes: &SelfWrites,
         status_error: &mut Option<String>,
     ) -> bool {
-        let Some(msgid) = self.selected_msgid() else {
-            return false;
-        };
-        let Some(row) = self.find_row(&msgid) else {
+        let Some(row) = self.find_row(msgid) else {
             return false;
         };
         let path = row.path.clone();
         match flags::set_flag_recorded(&path, flag, FlagOp::Toggle, self_writes) {
             Ok((new_path, new_flags)) => {
-                self.apply_flag_change(&msgid, &new_path, &new_flags, cache_path, status_error);
+                self.apply_flag_change(msgid, &new_path, &new_flags, cache_path, status_error);
                 true
             }
             Err(e) => {
@@ -2296,6 +2342,7 @@ impl InboxScreen {
         // folder since the view aggregates across accounts.
         self.queue_lazy_scan(account.as_deref(), folder);
         self.selected = 0;
+        self.list_visual = None;
         self.reader_scroll = 0;
         self.reader_cursor_line = 0;
         self.reader_cursor_col = 0;
@@ -2645,6 +2692,7 @@ impl InboxScreen {
             prior,
         )));
         self.selected = 0;
+        self.list_visual = None;
         self.focus = Pane::List;
         true
     }
@@ -2687,6 +2735,7 @@ impl InboxScreen {
             prior,
         )));
         self.selected = 0;
+        self.list_visual = None;
         self.focus = Pane::List;
         true
     }
@@ -2698,6 +2747,7 @@ impl InboxScreen {
             return;
         };
         self.selected = 0;
+        self.list_visual = None;
         if let Some(prior) = s.prior_selected_msgid
             && let ScanState::Ready(rows) = &self.scan
             && let Some(i) = rows.iter().position(|t| t.row.msgid == prior)
@@ -2713,6 +2763,7 @@ impl InboxScreen {
         if self.search.take().is_some() {
             self.selected = 0;
         }
+        self.list_visual = None;
     }
 
     pub fn select_next(&mut self) {
@@ -2742,6 +2793,17 @@ impl InboxScreen {
         self.search
             .as_ref()
             .and_then(|s| s.haystack.iter().find(|r| r.msgid == msgid))
+    }
+
+    /// Row at list position `i` in whichever view is active (search
+    /// results when a search is running, otherwise the threaded scan).
+    /// Mirrors [`InboxScreen::selected_message_row`]'s view routing for
+    /// an arbitrary index — used to enumerate a list-visual range.
+    pub fn row_at(&self, i: usize) -> Option<&MessageRow> {
+        if let Some(s) = self.search.as_ref() {
+            return s.selected_row(i);
+        }
+        self.threaded().get(i).map(|t| &t.row)
     }
 }
 
@@ -4581,6 +4643,158 @@ mod undo_integration_tests {
             app.undo_stack.redo_len(),
             1,
             "undo of batch must push a single redo entry"
+        );
+    }
+
+    #[test]
+    fn toggle_list_visual_anchors_on_list_focus_only() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = one_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+        let mut app = App::new(&cfg, cache, None, None);
+
+        // Off the List pane it's a no-op — a row selection on the reader
+        // or sidebar is meaningless.
+        app.inbox_mut().focus = Pane::Reader;
+        app.toggle_list_visual();
+        assert_eq!(app.inbox().list_visual, None);
+
+        // On the List pane it anchors at the cursor and toggles back off.
+        app.inbox_mut().focus = Pane::List;
+        app.inbox_mut().selected = 2;
+        app.toggle_list_visual();
+        assert_eq!(app.inbox().list_visual, Some(2));
+        app.toggle_list_visual();
+        assert_eq!(app.inbox().list_visual, None);
+    }
+
+    #[test]
+    fn list_visual_range_trashes_all_with_single_undo() {
+        // Three standalone messages (distinct ids → three list rows).
+        // A `v`-anchored range over all of them should trash every row
+        // and record a single batched undo, mirroring `D`.
+        let tmp = TempDir::new().unwrap();
+        drop_thread_msg(
+            &tmp,
+            "1:2,S",
+            "a@x",
+            None,
+            "Thu, 28 May 2026 12:00:00 +0000",
+        );
+        drop_thread_msg(
+            &tmp,
+            "2:2,S",
+            "b@x",
+            None,
+            "Thu, 28 May 2026 12:01:00 +0000",
+        );
+        drop_thread_msg(
+            &tmp,
+            "3:2,S",
+            "c@x",
+            None,
+            "Thu, 28 May 2026 12:02:00 +0000",
+        );
+        let cfg = account_with_folders(&tmp, None, Some("Trash"));
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+        assert_eq!(app.inbox().threaded().len(), 3);
+
+        // Anchor at row 0, extend the cursor to row 2 → all three.
+        app.inbox_mut().focus = Pane::List;
+        app.inbox_mut().selected = 0;
+        app.toggle_list_visual();
+        app.inbox_mut().selected = 2;
+        assert_eq!(app.inbox().list_visual, Some(0));
+
+        cmdline::trash_selected(&mut app, &cfg);
+
+        let trash_cur = tmp
+            .path()
+            .join("Mail")
+            .join("personal")
+            .join(".Trash")
+            .join("cur");
+        assert_eq!(
+            fs::read_dir(&trash_cur).unwrap().count(),
+            3,
+            "every selected row should land in .Trash/cur"
+        );
+        assert_eq!(app.inbox().threaded().len(), 0, "INBOX view drained");
+        assert_eq!(
+            app.inbox().list_visual,
+            None,
+            "selection consumed by the move"
+        );
+        assert_eq!(
+            app.undo_stack.undo_len(),
+            1,
+            "range trash must record exactly one batched undo entry"
+        );
+
+        app.undo(&cfg);
+        let inbox_cur = tmp.path().join("Mail").join("personal").join("cur");
+        assert_eq!(
+            fs::read_dir(&inbox_cur).unwrap().count(),
+            3,
+            "a single undo must restore the whole range"
+        );
+    }
+
+    #[test]
+    fn list_visual_range_flags_all_and_batches_undo() {
+        let tmp = TempDir::new().unwrap();
+        drop_thread_msg(
+            &tmp,
+            "1:2,S",
+            "a@x",
+            None,
+            "Thu, 28 May 2026 12:00:00 +0000",
+        );
+        drop_thread_msg(
+            &tmp,
+            "2:2,S",
+            "b@x",
+            None,
+            "Thu, 28 May 2026 12:01:00 +0000",
+        );
+        let cfg = account_with_folders(&tmp, None, None);
+        let cache = tmp.path().join("index.sqlite");
+
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+        assert_eq!(app.inbox().threaded().len(), 2);
+
+        app.inbox_mut().focus = Pane::List;
+        app.inbox_mut().selected = 0;
+        app.toggle_list_visual();
+        app.inbox_mut().selected = 1;
+
+        cmdline::flag_selection(&mut app, 'F');
+
+        assert!(
+            app.inbox()
+                .threaded()
+                .iter()
+                .all(|t| t.row.flags.contains('F')),
+            "both rows should be flagged"
+        );
+        assert_eq!(app.inbox().list_visual, None, "selection consumed");
+        assert_eq!(
+            app.undo_stack.undo_len(),
+            1,
+            "range flag must record one batched undo entry"
+        );
+
+        app.undo(&cfg);
+        assert!(
+            app.inbox()
+                .threaded()
+                .iter()
+                .all(|t| !t.row.flags.contains('F')),
+            "a single undo must clear the flag on every row"
         );
     }
 }

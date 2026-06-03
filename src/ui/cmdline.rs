@@ -42,6 +42,13 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
                     format!(" {err} "),
                     Style::default().fg(Color::Red),
                 ))
+            } else if let Some(label) = list_visual_label(app) {
+                Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
             } else {
                 Line::from(Span::styled(
                     format!(" {} ", mode_label(app.mode)),
@@ -51,6 +58,25 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         }
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// Status-row banner while a list-pane multi-select is open, e.g.
+/// `-- VISUAL LINE -- 4 selected`. `None` when no selection is active,
+/// so the ambient mode label shows instead. Reads from the pinned inbox
+/// screen regardless of the active tab — the selection lives there.
+fn list_visual_label(app: &App) -> Option<String> {
+    let Some(Screen::Inbox(inbox)) = app.screens.first() else {
+        return None;
+    };
+    let anchor = inbox.list_visual?;
+    let len = inbox.list_len();
+    if len == 0 {
+        return None;
+    }
+    let sel = inbox.selected.min(len - 1);
+    let a = anchor.min(len - 1);
+    let n = a.max(sel) - a.min(sel) + 1;
+    Some(format!(" -- VISUAL LINE -- {n} selected "))
 }
 
 fn mode_label(mode: Mode) -> &'static str {
@@ -153,7 +179,7 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
                 app.status_error = Some("mv: missing folder".into());
                 return;
             };
-            app.move_selected_to(folder, cfg);
+            move_to_folder(app, cfg, folder);
         }
         "attach" => attach_path(app, cmd),
         "detach" => detach_index(app, &mut parts),
@@ -210,6 +236,12 @@ impl MoveKind {
 /// `app.status_error`; success leaves `move_selected_to` to set the
 /// "moved to X" message.
 fn move_named(app: &mut App, cfg: &Config, kind: MoveKind) {
+    // A live list-visual selection takes over: act on the whole range
+    // rather than the single cursor row.
+    if app.inbox().list_visual.is_some() {
+        move_range_named(app, cfg, kind);
+        return;
+    }
     let label = kind.label();
     let Some(row) = app.inbox().selected_row().map(|t| t.row.clone()) else {
         app.status_error = Some(format!("{label}: no message selected"));
@@ -265,6 +297,9 @@ pub fn trash_thread_selected(app: &mut App, cfg: &Config) {
         app.status_error = Some("trash-thread: not available in search".into());
         return;
     }
+    // `D` trashes the cursor's whole thread, not the multi-select range —
+    // drop any open selection so its highlight band doesn't linger.
+    app.inbox_mut().list_visual = None;
     let (start, members) = {
         let inbox = app.inbox();
         let threaded = inbox.threaded();
@@ -337,6 +372,138 @@ pub fn trash_thread_selected(app: &mut App, cfg: &Config) {
     } else {
         format!("trashed thread ({moved} of {total}, skipped {skipped})")
     });
+}
+
+/// `(msgid, account)` for every row in the active list-visual range, in
+/// list order. `None` when no multi-select is active (so callers fall
+/// back to single-row behaviour); `Some(empty)` only when the list
+/// itself is empty.
+fn list_visual_members(app: &App) -> Option<Vec<(String, String)>> {
+    let inbox = app.inbox();
+    let anchor = inbox.list_visual?;
+    let len = inbox.list_len();
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let sel = inbox.selected.min(len - 1);
+    let a = anchor.min(len - 1);
+    let (lo, hi) = (a.min(sel), a.max(sel));
+    let mut out = Vec::with_capacity(hi - lo + 1);
+    for i in lo..=hi {
+        if let Some(r) = inbox.row_at(i) {
+            out.push((r.msgid.clone(), r.account.clone()));
+        }
+    }
+    Some(out)
+}
+
+/// Apply a role-based move (`archive` / `spam` / `trash`) to every
+/// message in the active list-visual selection. Routing is per-row:
+/// each message lands in its own account's configured role folder, and
+/// rows on accounts without that role are skipped and counted (rather
+/// than failing the batch). Collected moves land as one
+/// `UndoAction::Batch` so `u` reverses the entire selection.
+fn move_range_named(app: &mut App, cfg: &Config, kind: MoveKind) {
+    let label = kind.label();
+    let members = list_visual_members(app).unwrap_or_default();
+    // Consume the selection up front — the action fires once regardless
+    // of outcome, and leaving the highlight band up after acting reads
+    // as "nothing happened".
+    app.inbox_mut().list_visual = None;
+    if members.is_empty() {
+        app.status_error = Some(format!("{label}: empty selection"));
+        return;
+    }
+    let mut targets: Vec<String> = Vec::with_capacity(members.len());
+    let mut skipped = 0usize;
+    for (msgid, account_name) in &members {
+        match cfg.accounts.get(account_name) {
+            Some(account) if account.role_disk_name(kind.role()).is_some() => {
+                targets.push(msgid.clone());
+            }
+            _ => skipped += 1,
+        }
+    }
+    if targets.is_empty() {
+        app.status_error = Some(format!(
+            "{label}: no {label} configured for any of the {} message(s)",
+            members.len()
+        ));
+        return;
+    }
+    let target = kind.role().label().to_string();
+    let mut actions: Vec<UndoAction> = Vec::with_capacity(targets.len());
+    for msgid in &targets {
+        if let Some(action) = app.move_msgid_to(msgid, &target, cfg) {
+            actions.push(action);
+        }
+    }
+    let moved = actions.len();
+    let total = members.len();
+    if !actions.is_empty() {
+        app.undo_stack.record(UndoAction::Batch(actions));
+    }
+    app.status_error = Some(if skipped == 0 {
+        format!("{label}: moved {moved} of {total}")
+    } else {
+        format!("{label}: moved {moved} of {total}, skipped {skipped}")
+    });
+}
+
+/// `:mv <folder>` — range-aware. Moves the whole list-visual selection
+/// to `folder` when one is active (one batched undo), otherwise the
+/// single selected row. Rows whose account has no such folder surface
+/// their own per-row error from `move_msgid_to` and are simply not
+/// counted in `moved`.
+fn move_to_folder(app: &mut App, cfg: &Config, folder: &str) {
+    let Some(members) = list_visual_members(app) else {
+        app.move_selected_to(folder, cfg);
+        return;
+    };
+    app.inbox_mut().list_visual = None;
+    if members.is_empty() {
+        app.status_error = Some("mv: empty selection".into());
+        return;
+    }
+    let mut actions: Vec<UndoAction> = Vec::with_capacity(members.len());
+    for (msgid, _) in &members {
+        if let Some(action) = app.move_msgid_to(msgid, folder, cfg) {
+            actions.push(action);
+        }
+    }
+    let moved = actions.len();
+    let total = members.len();
+    if !actions.is_empty() {
+        app.undo_stack.record(UndoAction::Batch(actions));
+    }
+    app.status_error = Some(format!("moved {moved} of {total} to {folder}"));
+}
+
+/// Toggle a maildir flag (`S` / `F` / `T`) across the list-visual
+/// selection, or the single selected row when no multi-select is
+/// active. Drives the `m` / `*` / `x` bindings. Each row toggles
+/// independently (so a mixed selection ends up mixed); the per-row undo
+/// entries batch into one `u`.
+pub fn flag_selection(app: &mut App, flag: char) {
+    let Some(members) = list_visual_members(app) else {
+        app.toggle_flag_selected(flag);
+        return;
+    };
+    app.inbox_mut().list_visual = None;
+    if members.is_empty() {
+        return;
+    }
+    let mut actions: Vec<UndoAction> = Vec::with_capacity(members.len());
+    for (msgid, _) in &members {
+        if let Some(action) = app.toggle_flag_msgid(flag, msgid) {
+            actions.push(action);
+        }
+    }
+    let toggled = actions.len();
+    if !actions.is_empty() {
+        app.undo_stack.record(UndoAction::Batch(actions));
+    }
+    app.status_error = Some(format!("toggled {flag} on {toggled} message(s)"));
 }
 
 /// Spawn the `[sync].command` worker if one isn't already running.

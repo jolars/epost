@@ -270,9 +270,14 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
         Pane::List => match k.code {
             KeyCode::Char('j') => app.select_next(),
             KeyCode::Char('k') => app.select_prev(),
-            KeyCode::Char('m') => app.toggle_flag_selected('S'),
-            KeyCode::Char('*') => app.toggle_flag_selected('F'),
-            KeyCode::Char('x') => app.toggle_flag_selected('T'),
+            // `v` / `V` arm (or cancel) a vim-style visual-line selection
+            // over the list. There's no char/line distinction in a row
+            // list, so both keys do the same thing; `j`/`k` then extend
+            // the range and the action keys below operate on all of it.
+            KeyCode::Char('v') | KeyCode::Char('V') => app.toggle_list_visual(),
+            KeyCode::Char('m') => cmdline::flag_selection(app, 'S'),
+            KeyCode::Char('*') => cmdline::flag_selection(app, 'F'),
+            KeyCode::Char('x') => cmdline::flag_selection(app, 'T'),
             KeyCode::Char('a') => cmdline::archive_selected(app, cfg),
             KeyCode::Char('d') => cmdline::trash_selected(app, cfg),
             KeyCode::Char('D') => cmdline::trash_thread_selected(app, cfg),
@@ -293,6 +298,9 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                 // the guard). For any other folder, fall back to
                 // focusing the reader pane.
                 app.inbox_mut().focus = Pane::Reader;
+            }
+            KeyCode::Esc if app.inbox().list_visual.is_some() => {
+                app.inbox_mut().list_visual = None;
             }
             KeyCode::Esc if app.inbox().search.is_some() => app.clear_search(),
             KeyCode::Esc if app.inbox().sidebar_visible => {
@@ -569,6 +577,10 @@ fn enter_command(app: &mut App) {
 fn exit_command(app: &mut App) {
     app.cmdline.clear();
     app.mode = Mode::Normal;
+    // A `:` opened from a list-visual selection keeps the range alive so
+    // the command can act on it (vim's `:'<,'>`). Cancelling the command
+    // drops the selection too, matching vim's Esc-from-cmdline.
+    app.inbox_mut().list_visual = None;
 }
 
 /// Yank the entire parsed body. `Y` in Reader pane.

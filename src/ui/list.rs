@@ -88,10 +88,57 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen) {
             f.render_stateful_widget(widget, area, &mut state);
             new_offset = state.offset();
             pane_scrollbar(f, area, selected, rows.len(), focused);
+            paint_list_visual(f, area, inbox, new_offset, selected, rows.len());
         }
     }
 
     inbox.list_offset = new_offset;
+}
+
+/// Reverse-video band over the rows in the active list-visual selection.
+/// The cursor row keeps the `List` widget's own highlight so the active
+/// end stays distinct; every other row in the range gets
+/// `Modifier::REVERSED`, mirroring the reader's visual-mode paint. No-op
+/// when no multi-select is active. `offset` is the list's resolved top
+/// row, `selected` the cursor row, `len` the row count.
+fn paint_list_visual(
+    f: &mut Frame,
+    area: Rect,
+    inbox: &InboxScreen,
+    offset: usize,
+    selected: usize,
+    len: usize,
+) {
+    let Some(anchor) = inbox.list_visual else {
+        return;
+    };
+    // Need room for the 1-cell border on every side.
+    if len == 0 || area.width < 3 || area.height < 3 {
+        return;
+    }
+    let sel = selected.min(len - 1);
+    let a = anchor.min(len - 1);
+    let (lo, hi) = (a.min(sel), a.max(sel));
+    let x0 = area.x + 1;
+    let x1 = area.x + area.width - 1; // exclusive: last col is the border
+    let top = area.y + 1;
+    let bottom = area.y + area.height - 1; // exclusive: bottom border row
+    let buf = f.buffer_mut();
+    for i in lo..=hi {
+        if i == sel || i < offset {
+            continue;
+        }
+        let y = top + (i - offset) as u16;
+        if y >= bottom {
+            break;
+        }
+        for x in x0..x1 {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                let style = cell.style().add_modifier(Modifier::REVERSED);
+                cell.set_style(style);
+            }
+        }
+    }
 }
 
 fn draw_search(
@@ -157,6 +204,7 @@ fn draw_search(
             f.render_stateful_widget(widget, area, &mut state);
             new_offset = state.offset();
             pane_scrollbar(f, area, selected, s.results.len(), focused);
+            paint_list_visual(f, area, inbox, new_offset, selected, s.results.len());
         }
     }
     inbox.list_offset = new_offset;
