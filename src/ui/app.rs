@@ -446,6 +446,9 @@ pub struct InboxScreen {
     /// Inner reader-pane height (after border) from the previous draw.
     /// Pairs with `last_reader_body_lines` for the `G` calc.
     pub last_reader_inner_height: u16,
+    /// Inner message-list height (after border) from the previous draw.
+    /// Drives the Ctrl-d/u/f/b page-step in the list pane.
+    pub last_list_inner_height: u16,
     /// Set by `ensure_body` when the body changed this tick; reader
     /// consumes it to drive the Clear pass.
     pub body_changed_this_tick: bool,
@@ -1472,6 +1475,18 @@ impl App {
         self.inbox_mut().select_prev();
     }
 
+    /// Half/full-page navigation (Ctrl-d/u/f/b), routed by focus: the
+    /// reader scrolls its body, the list moves its selection. No-op when
+    /// the sidebar is focused.
+    pub fn page_move(&mut self, down: bool, full: bool) {
+        let inbox = self.inbox_mut();
+        match inbox.focus {
+            Pane::Reader => inbox.scroll_page(down, full),
+            Pane::List => inbox.select_page(down, full),
+            Pane::Folders => {}
+        }
+    }
+
     /// Advance / retreat through the sidebar's flat list of selectable
     /// `(scope, folder)` entries, skipping non-selectable group headers
     /// (`[all]`, `[<account>]`). Order mirrors what `folders::draw`
@@ -1590,6 +1605,7 @@ impl InboxScreen {
             last_image_rects: Vec::new(),
             last_reader_body_lines: 0,
             last_reader_inner_height: 0,
+            last_list_inner_height: 0,
             body_changed_this_tick: false,
             folder_stats: Vec::new(),
             current_account: None,
@@ -2780,6 +2796,48 @@ impl InboxScreen {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// Move the list selection by a page. `full` picks a whole viewport
+    /// (Ctrl-f/b, with two rows of overlap for context, vim-style); else
+    /// a half viewport (Ctrl-d/u). The `List` widget recomputes its own
+    /// offset to keep `selected` visible, so this only moves the cursor.
+    /// A live visual-line range follows `selected` as usual.
+    pub fn select_page(&mut self, down: bool, full: bool) {
+        let len = self.list_len();
+        if len == 0 {
+            return;
+        }
+        let h = self.last_list_inner_height.max(1) as usize;
+        let step = if full {
+            h.saturating_sub(2).max(1)
+        } else {
+            (h / 2).max(1)
+        };
+        self.selected = if down {
+            (self.selected + step).min(len - 1)
+        } else {
+            self.selected.saturating_sub(step)
+        };
+    }
+
+    /// Scroll the reader body by a page. `full` is a whole viewport
+    /// (Ctrl-f/b, two lines of overlap, vim-style); else a half viewport
+    /// (Ctrl-d/u). Clamped to the bottom-most scroll the body allows
+    /// (same calc `G` uses).
+    pub fn scroll_page(&mut self, down: bool, full: bool) {
+        let h = self.last_reader_inner_height;
+        let step = if full {
+            h.saturating_sub(2).max(1)
+        } else {
+            (h / 2).max(1)
+        };
+        if down {
+            let max = self.last_reader_body_lines.saturating_sub(h);
+            self.reader_scroll = self.reader_scroll.saturating_add(step).min(max);
+        } else {
+            self.reader_scroll = self.reader_scroll.saturating_sub(step);
+        }
+    }
+
     /// Look up a row by msgid across both the scan view and the search
     /// haystack (when search is active). Used by flag-toggle / move
     /// callsites that must keep the in-memory rows consistent regardless
@@ -3178,6 +3236,114 @@ mod focus_nav_tests {
         inbox.move_reader_cursor_to_bottom();
         assert_eq!(inbox.reader_cursor_line, 6);
         assert_eq!(inbox.reader_cursor_col, u16::MAX);
+    }
+
+    #[test]
+    fn scroll_page_half_and_full_step_and_clamp() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_inner_height = 10;
+        inbox.last_reader_body_lines = 100;
+        // Half page down = inner_height / 2.
+        inbox.scroll_page(true, false);
+        assert_eq!(inbox.reader_scroll, 5);
+        // Full page down = inner_height - 2 (vim-style overlap).
+        inbox.scroll_page(true, true);
+        assert_eq!(inbox.reader_scroll, 5 + 8);
+        // Half page back up.
+        inbox.scroll_page(false, false);
+        assert_eq!(inbox.reader_scroll, 8);
+        // Down clamps to the bottom-most scroll (body - height = 90).
+        inbox.reader_scroll = 88;
+        inbox.scroll_page(true, true);
+        assert_eq!(inbox.reader_scroll, 90);
+        // Up saturates at 0.
+        inbox.reader_scroll = 3;
+        inbox.scroll_page(false, true);
+        assert_eq!(inbox.reader_scroll, 0);
+    }
+
+    #[test]
+    fn select_page_steps_selection_and_clamps_to_ends() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_list_inner_height = 10;
+        let rows: Vec<MessageRow> = (0..30)
+            .map(|i| MessageRow {
+                msgid: format!("m{i}"),
+                account: "dev".into(),
+                folder: "INBOX".into(),
+                path: std::path::PathBuf::from("/x"),
+                date: i as i64,
+                from_addr: None,
+                subject: Some(format!("s{i}")),
+                in_reply: None,
+                refs: Vec::new(),
+                flags: String::new(),
+            })
+            .collect();
+        inbox.scan = ScanState::Ready(build_threads(rows));
+        inbox.selected = 0;
+        // Half page = 5.
+        inbox.select_page(true, false);
+        assert_eq!(inbox.selected, 5);
+        // Full page = inner_height - 2 = 8.
+        inbox.select_page(true, true);
+        assert_eq!(inbox.selected, 13);
+        // Up a half page.
+        inbox.select_page(false, false);
+        assert_eq!(inbox.selected, 8);
+        // Down clamps at the last row (29).
+        inbox.selected = 27;
+        inbox.select_page(true, true);
+        assert_eq!(inbox.selected, 29);
+        // Up saturates at 0.
+        inbox.selected = 4;
+        inbox.select_page(false, true);
+        assert_eq!(inbox.selected, 0);
+    }
+
+    #[test]
+    fn page_move_routes_by_focus() {
+        let mut cfg = Config::default();
+        cfg.ui.sidebar = true;
+        cfg.ui.list = true;
+        cfg.ui.reader = true;
+        let mut app = App::new(
+            &cfg,
+            std::path::PathBuf::from("/tmp/epost-test.sqlite"),
+            None,
+            None,
+        );
+        {
+            let inbox = app.inbox_mut();
+            inbox.last_reader_inner_height = 10;
+            inbox.last_reader_body_lines = 100;
+            inbox.last_list_inner_height = 10;
+            let rows: Vec<MessageRow> = (0..30)
+                .map(|i| MessageRow {
+                    msgid: format!("m{i}"),
+                    account: "dev".into(),
+                    folder: "INBOX".into(),
+                    path: std::path::PathBuf::from("/x"),
+                    date: i as i64,
+                    from_addr: None,
+                    subject: None,
+                    in_reply: None,
+                    refs: Vec::new(),
+                    flags: String::new(),
+                })
+                .collect();
+            inbox.scan = ScanState::Ready(build_threads(rows));
+        }
+        // Reader focus scrolls the body, leaves selection alone.
+        app.inbox_mut().focus = Pane::Reader;
+        app.page_move(true, false);
+        assert_eq!(app.inbox().reader_scroll, 5);
+        assert_eq!(app.inbox().selected, 0);
+        // List focus moves selection, leaves scroll alone.
+        app.inbox_mut().focus = Pane::List;
+        app.page_move(true, false);
+        assert_eq!(app.inbox().selected, 5);
+        assert_eq!(app.inbox().reader_scroll, 5);
     }
 
     #[test]

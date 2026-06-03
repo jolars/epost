@@ -215,6 +215,12 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             // the universal section just below — both walk the same
             // stack so the user expects them to fire from any focus.
             KeyCode::Char('r') => app.redo(cfg),
+            // Vim page navigation, focus-routed (reader scrolls, list
+            // moves selection): Ctrl-d/u half page, Ctrl-f/b full page.
+            KeyCode::Char('d') => app.page_move(true, false),
+            KeyCode::Char('u') => app.page_move(false, false),
+            KeyCode::Char('f') => app.page_move(true, true),
+            KeyCode::Char('b') => app.page_move(false, true),
             _ => {}
         }
         return;

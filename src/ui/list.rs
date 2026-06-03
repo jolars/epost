@@ -20,6 +20,9 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen) {
     let focused = inbox.focus == Pane::List;
     let block = pane_block("Messages", focused);
 
+    // Record the inner height so Ctrl-d/u/f/b can size their page step.
+    inbox.last_list_inner_height = area.height.saturating_sub(2);
+
     // Search results take over the list pane when active. Flat, no
     // threading — fzf-style. Each row prefixed with the folder (and
     // account when the scope crosses accounts) so cross-folder mixes
