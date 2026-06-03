@@ -17,9 +17,12 @@ pub const DEFAULT_FOLDER: &str = "INBOX";
 /// One row of the sidebar tree. `Header` is a non-selectable group
 /// label (e.g. "[all]", "[personal]"); `Folder` is a selectable
 /// `(scope, name)` row whose `scope = None` means "unified across
-/// accounts" and `Some(name)` means that account's folder.
+/// accounts" and `Some(name)` means that account's folder. `Spacer` is
+/// a blank line inserted between groups so they read apart without any
+/// indentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarEntry {
+    Spacer,
     Header {
         label: String,
     },
@@ -52,7 +55,10 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
         }
         _ => {
             let entries = build_entries(&inbox.folder_stats);
-            let inner_width = area.width.saturating_sub(2) as usize;
+            // Inner width minus the 2 cells the `List` reserves on every
+            // row for the highlight symbol ("▌ "), so right-anchored
+            // counts line up against the true right edge.
+            let inner_width = (area.width.saturating_sub(2) as usize).saturating_sub(2);
 
             // Find the row that matches the active `(scope, folder)` so
             // ListState highlights it. The cursor never lands on a
@@ -64,7 +70,7 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &InboxScreen) {
                     scope.as_deref() == inbox.current_account.as_deref()
                         && name == &inbox.current_folder
                 }
-                SidebarEntry::Header { .. } => false,
+                SidebarEntry::Header { .. } | SidebarEntry::Spacer => false,
             });
 
             let items: Vec<ListItem> = entries
@@ -102,7 +108,7 @@ pub(crate) fn selectable_entries(groups: &[AccountFolderStats]) -> Vec<(Option<S
         .into_iter()
         .filter_map(|e| match e {
             SidebarEntry::Folder { scope, name, .. } => Some((scope, name)),
-            SidebarEntry::Header { .. } => None,
+            SidebarEntry::Header { .. } | SidebarEntry::Spacer => None,
         })
         .collect()
 }
@@ -123,6 +129,11 @@ fn build_entries(groups: &[AccountFolderStats]) -> Vec<SidebarEntry> {
 
     let mut out = Vec::new();
     for g in ordered {
+        // Blank line between groups (not before the first), so groups
+        // read apart without relying on folder indentation.
+        if !out.is_empty() {
+            out.push(SidebarEntry::Spacer);
+        }
         let label = match &g.scope {
             None => "[all]".to_string(),
             Some(name) => format!("[{name}]"),
@@ -154,6 +165,7 @@ pub(crate) fn folder_sort_key(name: &str) -> (u8, String) {
 
 fn render_entry(entry: &SidebarEntry, width: usize) -> Line<'static> {
     match entry {
+        SidebarEntry::Spacer => Line::from(""),
         SidebarEntry::Header { label } => {
             let truncated = truncate_to(label, width);
             Line::from(Span::styled(
@@ -180,26 +192,28 @@ fn render_folder_row(name: &str, total: u64, unread: u64, width: usize) -> Line<
         Modifier::empty()
     };
 
-    // Right-anchored counts: " 12 (3)" when unread, " 12" otherwise.
-    // Empty (configured-but-no-mail) folders read as a plain " 0".
+    // Right-anchored counts: "unread/total" when there's anything
+    // unread, bare "total" when all read, "0" for an empty folder.
     let counts = if total == 0 {
-        " 0".to_string()
+        "0".to_string()
     } else if has_unread {
-        format!(" {total} ({unread})")
+        format!("{unread}/{total}")
     } else {
-        format!(" {total}")
+        format!("{total}")
     };
 
-    // Two-space indent under the group header.
-    let indent = "  ";
-    let label_max = width
-        .saturating_sub(indent.chars().count())
-        .saturating_sub(counts.chars().count());
+    // Name flush left, counts flush right, at least one space between.
+    let counts_w = counts.chars().count();
+    let label_max = width.saturating_sub(counts_w).saturating_sub(1);
     let label = truncate_to(name, label_max);
+    let gap = width
+        .saturating_sub(label.chars().count())
+        .saturating_sub(counts_w)
+        .max(1);
 
     Line::from(vec![
-        Span::raw(indent),
         Span::styled(label, Style::default().add_modifier(name_mods)),
+        Span::raw(" ".repeat(gap)),
         Span::styled(counts, Style::default().fg(Color::DarkGray)),
     ])
 }
@@ -301,43 +315,44 @@ mod tests {
         );
     }
 
+    /// Folder rows are three spans: label, gap, counts. The label is
+    /// flush left; the counts flush right; the gap pads between.
+    fn row_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect::<String>()
+    }
+
     #[test]
     fn render_folder_row_shows_zero_when_empty() {
         let line = render_folder_row("Spam", 0, 0, 20);
-        let text = line
-            .spans
-            .iter()
-            .map(|sp| sp.content.as_ref())
-            .collect::<String>();
-        assert_eq!(text, "  Spam 0");
+        assert_eq!(line.spans.first().unwrap().content.as_ref(), "Spam");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "0");
+        // No leading indent; name is flush left.
+        assert!(!row_text(&line).starts_with(' '));
+        // Counts are flush right: total rendered width fills the column.
+        assert_eq!(row_text(&line).chars().count(), 20);
     }
 
     #[test]
     fn render_folder_row_shows_total_only_when_all_read() {
         let line = render_folder_row("Sent", 4, 0, 20);
-        let text = line
-            .spans
-            .iter()
-            .map(|sp| sp.content.as_ref())
-            .collect::<String>();
-        assert_eq!(text, "  Sent 4");
+        assert_eq!(line.spans.first().unwrap().content.as_ref(), "Sent");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "4");
     }
 
     #[test]
-    fn render_folder_row_shows_total_and_unread() {
+    fn render_folder_row_shows_unread_over_total() {
         let line = render_folder_row("INBOX", 12, 3, 20);
-        let text = line
-            .spans
-            .iter()
-            .map(|sp| sp.content.as_ref())
-            .collect::<String>();
-        assert_eq!(text, "  INBOX 12 (3)");
+        assert_eq!(line.spans.first().unwrap().content.as_ref(), "INBOX");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "3/12");
     }
 
     #[test]
     fn render_folder_row_bolds_when_unread() {
         let line = render_folder_row("INBOX", 5, 2, 20);
-        // span 0 is the indent, span 1 is the label.
-        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        // span 0 is the label.
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 }
