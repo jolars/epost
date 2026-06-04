@@ -104,11 +104,12 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             }
             if k.code == KeyCode::Char('g') {
                 // `gg` → top in whichever pane supports it. Reader: cursor
-                // to row 0. (Lists use a different convention today and
-                // aren't wired here.)
+                // to row 0. List: first message in the folder.
                 let inbox = app.inbox_mut();
-                if inbox.focus == Pane::Reader {
-                    inbox.move_reader_cursor_to_top();
+                match inbox.focus {
+                    Pane::Reader => inbox.move_reader_cursor_to_top(),
+                    Pane::List => inbox.select_first(),
+                    _ => {}
                 }
                 return;
             }
@@ -316,6 +317,7 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
         Pane::List => match k.code {
             KeyCode::Char('j') => app.select_next(),
             KeyCode::Char('k') => app.select_prev(),
+            KeyCode::Char('G') => app.select_last(),
             // `v` / `V` arm (or cancel) a vim-style visual-line selection
             // over the list. There's no char/line distinction in a row
             // list, so both keys do the same thing; `j`/`k` then extend

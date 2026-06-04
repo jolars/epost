@@ -1594,6 +1594,10 @@ impl App {
         self.inbox_mut().select_prev();
     }
 
+    pub fn select_last(&mut self) {
+        self.inbox_mut().select_last();
+    }
+
     /// Half/full-page navigation (Ctrl-d/u/f/b), routed by focus: the
     /// reader scrolls its body, the list moves its selection. No-op when
     /// the sidebar is focused.
@@ -3091,6 +3095,14 @@ impl InboxScreen {
 
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn select_last(&mut self) {
+        self.selected = self.list_len().saturating_sub(1);
     }
 
     /// Move the list selection by a page. `full` picks a whole viewport
