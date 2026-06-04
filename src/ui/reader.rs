@@ -1263,7 +1263,8 @@ impl<'a> LayoutCtx<'a> {
                 self.width = saved_width;
             }
             Block::Table { rows } => {
-                let mut col_widths = vec![0usize; rows.iter().map(|r| r.len()).max().unwrap_or(0)];
+                let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                let mut col_widths = vec![0usize; ncols];
                 for row in rows {
                     for (i, cell) in row.iter().enumerate() {
                         let w = inline_text_len(cell);
@@ -1273,27 +1274,44 @@ impl<'a> LayoutCtx<'a> {
                     }
                 }
                 let inner_w = self.width.saturating_sub(indent) as usize;
-                let total: usize = col_widths.iter().sum::<usize>() + 3 * col_widths.len();
-                let scale = if total > inner_w && total > 0 {
-                    inner_w as f32 / total as f32
+                let total: usize = col_widths.iter().sum::<usize>() + 3 * ncols;
+                // A genuine data table renders as an aligned `|`-separated
+                // grid only when it actually fits the pane untruncated. The
+                // moment it would need to be squeezed it is treated as a
+                // layout table instead — which is what nearly all HTML email
+                // tables are: nested for positioning, not tabular data.
+                // Collapsing a layout table's cells onto one truncated line
+                // each silently dropped the entire message body (newsletters
+                // wrap the article in deeply-nested layout tables, so the
+                // body landed in one giant cell that got cut at column
+                // width). So for those, stack each non-empty cell as wrapped
+                // block text in row-major order: no text lost, line breaks
+                // honored, links tracked, image placeholders flowed — the
+                // same path a paragraph takes.
+                let render_as_grid = ncols >= 2 && rows.len() >= 2 && total > 0 && total <= inner_w;
+                if render_as_grid {
+                    for row in rows {
+                        let mut spans: Vec<Span<'static>> = pad_indent_spans(indent);
+                        for (i, cell) in row.iter().enumerate() {
+                            let w = col_widths.get(i).copied().unwrap_or(8);
+                            let text = truncate_inline(cell, w);
+                            spans.push(Span::raw(format!("{text:<w$}")));
+                            spans.push(Span::raw(" | "));
+                        }
+                        if matches!(spans.last(), Some(s) if s.content == " | ") {
+                            spans.pop();
+                        }
+                        self.lines.push(Line::from(spans));
+                    }
                 } else {
-                    1.0
-                };
-                let col_widths: Vec<usize> = col_widths
-                    .iter()
-                    .map(|w| ((*w as f32 * scale) as usize).max(3))
-                    .collect();
-                for row in rows {
-                    let mut spans: Vec<Span<'static>> = pad_indent_spans(indent);
-                    for (i, cell) in row.iter().enumerate() {
-                        let text = truncate_inline(cell, col_widths.get(i).copied().unwrap_or(8));
-                        spans.push(Span::raw(text));
-                        spans.push(Span::raw(" | "));
+                    for row in rows {
+                        for cell in row {
+                            if inline_text_len(cell) == 0 {
+                                continue;
+                            }
+                            self.emit_inlines(cell, indent, "");
+                        }
                     }
-                    if !spans.is_empty() && matches!(spans.last(), Some(s) if s.content == " | ") {
-                        spans.pop();
-                    }
-                    self.lines.push(Line::from(spans));
                 }
                 self.lines.push(Line::raw(""));
             }
@@ -1813,6 +1831,60 @@ mod tests {
     fn remote_image_renders_placeholder() {
         let lines = layout_first_para(r#"<img src="https://x.example/p" alt="pixel">"#, 40);
         assert!(lines.iter().any(|l| l.contains("[remote image: pixel]")));
+    }
+
+    #[test]
+    fn layout_table_does_not_truncate_cell_body() {
+        // Newsletters wrap the article in deeply-nested layout tables, so
+        // the body lands in one wide cell. The old grid path cut each cell
+        // to one column-width line and dropped the rest — the message body
+        // vanished. The cell must now wrap across lines with all text kept.
+        let body = "The quick brown fox jumps over the lazy dog and keeps \
+                    on running well past the right edge of any single line.";
+        let html_src = format!("<table><tr><td>{body}</td></tr></table>");
+        let lines = layout_first_para(&html_src, 24);
+        let joined = lines.join("\n");
+        // Every word survives, even ones far past column 24.
+        for word in ["quick", "jumps", "running", "past", "edge", "line"] {
+            assert!(joined.contains(word), "dropped {word:?} in:\n{joined}");
+        }
+        // And it actually wrapped rather than living on one cut line.
+        assert!(
+            lines.iter().filter(|l| !l.trim().is_empty()).count() > 1,
+            "expected the cell to wrap onto multiple lines:\n{joined}"
+        );
+        // No `|` grid separator for a single-column layout table.
+        assert!(!joined.contains(" | "), "unexpected grid pipe:\n{joined}");
+    }
+
+    #[test]
+    fn layout_table_multicol_too_wide_stacks_cells() {
+        // A multi-column row that can't fit the pane (typical newsletter
+        // spacer-col + content-col layout) stacks its cells instead of
+        // truncating them into a grid.
+        let html_src = "<table><tr>\
+            <td>left column content here that is fairly long</td>\
+            <td>right column content here that is also long</td>\
+            </tr></table>";
+        let lines = layout_first_para(html_src, 20);
+        let joined = lines.join("\n");
+        // Both cells survive in full (wrapping may split phrases across
+        // lines, so check the tail words individually).
+        for word in ["left", "fairly", "right", "also", "long"] {
+            assert!(joined.contains(word), "dropped {word:?} in:\n{joined}");
+        }
+    }
+
+    #[test]
+    fn data_table_that_fits_keeps_grid() {
+        // A small genuine data table still renders as an aligned grid.
+        let html_src = "<table>\
+            <tr><td>a</td><td>b</td></tr>\
+            <tr><td>c</td><td>d</td></tr></table>";
+        let lines = layout_first_para(html_src, 80);
+        let joined = lines.join("\n");
+        assert!(joined.contains(" | "), "expected grid pipes:\n{joined}");
+        assert!(joined.contains("a") && joined.contains("d"), "{joined}");
     }
 
     #[test]
