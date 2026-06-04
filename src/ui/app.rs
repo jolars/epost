@@ -2055,6 +2055,11 @@ impl InboxScreen {
             self.evict_image_cache(old_msgid.as_deref(), &msgid);
             return;
         };
+        // Folder of the selected row, captured before the read so a
+        // failure can mark it dirty for a path-refreshing rescan.
+        let stale_folder = self
+            .selected_message_row()
+            .map(|r| (r.account.clone(), r.folder.clone()));
         match parse::read_body(&path) {
             Ok(body) => {
                 let blocks = body.html.as_deref().map(html::parse).unwrap_or_default();
@@ -2085,6 +2090,19 @@ impl InboxScreen {
                 self.parsed = None;
                 *status_error = Some(format!("parse failed: {e:#}"));
                 self.evict_image_cache(old_msgid.as_deref(), &msgid);
+                // The file was almost certainly renamed out from under us
+                // by an mbsync/`notmuch new` sync, leaving a stale path in
+                // the index. Mark the folder dirty so the next rescan
+                // refreshes the path, and clear `last_parsed_msgid` so the
+                // body re-loads once it does — otherwise it stays broken
+                // (msgid unchanged → no retry) until the user navigates
+                // away and back. If the message was truly removed, the
+                // rescan prunes the row and selection moves on, so this
+                // can't spin forever on one msgid.
+                if let Some(key) = stale_folder {
+                    self.pending_dirty.insert(key);
+                }
+                self.last_parsed_msgid = None;
             }
         }
     }

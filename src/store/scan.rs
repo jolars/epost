@@ -323,7 +323,26 @@ fn scan_folder(
             if !path.is_file() {
                 continue;
             }
-            match parse::read_headers(&path)? {
+            // A maildir scan races every mbsync/`notmuch new` run: files
+            // are renamed (new→cur, flag-suffix rewrites) between the
+            // `read_dir` above and the read below, so a path listed a
+            // moment ago can already be gone — or briefly mid-rename. A
+            // hard `?` here aborts the *entire* folder rescan on the first
+            // such file, so a sync that delivers new mail (and shuffles
+            // existing files) makes the very rescan meant to surface that
+            // mail fail, and nothing updates until restart. Treat any
+            // per-file read error as skip-and-continue: the rename that
+            // moved it fires its own watcher event → another rescan, and
+            // the file is picked up at its new path then.
+            let headers = match parse::read_headers(&path) {
+                Ok(h) => h,
+                Err(e) => {
+                    log::debug!("scan: skipping {}: {e:#}", path.display());
+                    report.skipped += 1;
+                    continue;
+                }
+            };
+            match headers {
                 Some(headers) => {
                     let flags = extract_flags(&path);
                     let msgid = headers.msgid.clone();
@@ -495,6 +514,61 @@ mod tests {
             1,
             "Archive must NOT be re-walked"
         );
+    }
+
+    #[test]
+    fn scan_skips_unreadable_file_instead_of_aborting() {
+        // Regression: a folder rescan races every mbsync/`notmuch new`
+        // run, so a listed file can be unreadable (vanished mid-rename).
+        // The scan must skip it and still index the rest — a hard error
+        // here used to abort the whole rescan, so a sync that delivered
+        // new mail made the rescan meant to surface it fail. Simulated
+        // here with a mode-000 file standing in for the transient read
+        // failure.
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("idx.sqlite");
+        let root = tmp.path().join("dev");
+        for sub in ["cur", "new", "tmp"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let write_eml = |p: &Path, mid: &str| {
+            let mut f = fs::File::create(p).unwrap();
+            writeln!(f, "Message-ID: <{mid}>").unwrap();
+            writeln!(f, "Date: Thu, 1 Jan 1970 00:00:00 +0000").unwrap();
+            writeln!(f, "From: a@b").unwrap();
+            writeln!(f, "Subject: t").unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "body").unwrap();
+        };
+        write_eml(&root.join("cur").join("1.M0.h:2,S"), "good-a");
+        write_eml(&root.join("cur").join("2.M0.h:2,S"), "good-b");
+        // Unreadable file (owner has no read bit) → read_headers errors.
+        let bad = root.join("cur").join("3.M0.h:2,S");
+        write_eml(&bad, "bad-c");
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let accounts = vec![AccountSpec::from_account(
+            "dev",
+            &test_account(root.clone(), Layout::Maildirpp, &[]),
+        )];
+        let rx = start_inbox_worker(accounts, cache, (None, "INBOX".to_string()));
+        let data = rx
+            .recv()
+            .unwrap()
+            .expect("scan must succeed despite the unreadable file");
+        assert_eq!(
+            group_total(&data.groups, None, "INBOX"),
+            2,
+            "the two readable messages must be indexed; the bad one skipped, not fatal"
+        );
+
+        // Restore perms so TempDir cleanup can remove it.
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
