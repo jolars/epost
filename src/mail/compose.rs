@@ -65,21 +65,42 @@ impl Draft {
     /// Build a reply to `h` (and `b` for the quoted body). `reply_all`
     /// promotes the original To+Cc list into Cc, minus our own address.
     /// `Reply-To:` (when present on the original) wins over `From:`.
+    ///
+    /// When the original was sent by us (the sender resolves to our own
+    /// address), we don't reply to ourselves — instead we address the
+    /// original recipients, so an unanswered thread we started can be
+    /// nudged forward.
     pub fn reply_to(h: &Headers, b: &Body, account: &str, from: &str, reply_all: bool) -> Draft {
         let our = extract_addr(from);
-        let target = h
+        let sender = h
             .reply_to
             .clone()
             .or_else(|| h.from.clone())
             .unwrap_or_default();
-        let to: Vec<String> = if target.is_empty() {
+        let self_sent = !sender.is_empty() && extract_addr(&sender) == our;
+        let to: Vec<String> = if self_sent {
+            h.to.iter()
+                .filter(|a| {
+                    let addr = extract_addr(a);
+                    !addr.is_empty() && addr != our
+                })
+                .cloned()
+                .collect()
+        } else if sender.is_empty() {
             Vec::new()
         } else {
-            vec![target]
+            vec![sender]
         };
         let mut cc: Vec<String> = Vec::new();
         if reply_all {
-            for a in h.to.iter().chain(h.cc.iter()) {
+            // The self-sent To list already holds the original recipients,
+            // so only the original Cc feeds Cc; otherwise To+Cc both do.
+            let src: Vec<&String> = if self_sent {
+                h.cc.iter().collect()
+            } else {
+                h.to.iter().chain(h.cc.iter()).collect()
+            };
+            for a in src {
                 let addr = extract_addr(a);
                 if !addr.is_empty() && addr == our {
                     continue;
@@ -719,6 +740,46 @@ mod tests {
         );
         assert!(d.cc.iter().any(|c| extract_addr(c) == "jane@example.com"));
         assert!(d.cc.iter().any(|c| extract_addr(c) == "carol@example.com"));
+    }
+
+    #[test]
+    fn reply_to_own_message_addresses_original_recipients() {
+        // We (Alice) sent the original; replying should target the
+        // original recipients, not loop back to ourselves.
+        let h = headers_fixture();
+        let d = Draft::reply_to(
+            &h,
+            &body_plain(),
+            "personal",
+            "Alice <alice@example.com>",
+            false,
+        );
+        assert_eq!(
+            d.to,
+            vec![
+                "bob@example.com".to_string(),
+                "Jane <jane@example.com>".to_string()
+            ]
+        );
+        assert!(!d.to.iter().any(|t| extract_addr(t) == "alice@example.com"));
+        assert!(d.cc.is_empty(), "cc empty without reply_all");
+        assert_eq!(d.in_reply_to.as_deref(), Some("orig@example.com"));
+    }
+
+    #[test]
+    fn reply_all_to_own_message_keeps_recipients_in_to_and_cc() {
+        let h = headers_fixture();
+        let d = Draft::reply_to(&h, &body_plain(), "personal", "alice@example.com", true);
+        // Original To stays in To; original Cc moves to Cc; we stay out.
+        assert_eq!(
+            d.to,
+            vec![
+                "bob@example.com".to_string(),
+                "Jane <jane@example.com>".to_string()
+            ]
+        );
+        assert_eq!(d.cc, vec!["carol@example.com".to_string()]);
+        assert!(!d.cc.iter().any(|c| extract_addr(c) == "alice@example.com"));
     }
 
     #[test]
