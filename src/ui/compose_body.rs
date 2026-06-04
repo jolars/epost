@@ -151,6 +151,25 @@ pub struct BodyEditor {
     /// Active yank-highlight flash, if any. Painted by `compose::draw`
     /// and expired by the host loop via [`Self::expire_yank_highlight`].
     pub yank_highlight: Option<BodyYankHighlight>,
+    /// Vim "curswant": the column vertical motion (`j`/`k`, page moves)
+    /// tries to keep across lines of differing length. tui-textarea's
+    /// own `Up`/`Down` clamps the column to each line and forgets it, so
+    /// we track the goal ourselves and drive vertical moves via `Jump`.
+    goal_col: GoalCol,
+    /// The cursor column right after the last move we tracked. If the
+    /// live column differs at the start of a vertical move, an untracked
+    /// path (edit, paste, insert entry) moved the cursor, so we reseed
+    /// `goal_col` from the live column before applying the move.
+    goal_anchor: usize,
+}
+
+/// Target column for vim-style vertical motion. `Col(n)` rides char
+/// column `n` (clamped per line); `Eol` rides the end of each line —
+/// vim's `curswant = MAXCOL`, set by `$`.
+#[derive(Clone, Copy)]
+enum GoalCol {
+    Col(usize),
+    Eol,
 }
 
 impl BodyEditor {
@@ -175,6 +194,8 @@ impl BodyEditor {
             pending: Pending::None,
             yank: None,
             yank_highlight: None,
+            goal_col: GoalCol::Col(0),
+            goal_anchor: 0,
         }
     }
 
@@ -191,6 +212,8 @@ impl BodyEditor {
         self.block_anchor = None;
         self.block_insert = None;
         self.yank_highlight = None;
+        self.goal_col = GoalCol::Col(0);
+        self.goal_anchor = 0;
     }
 
     /// Data-space cursor (row, col into the textarea's line vector).
@@ -311,6 +334,7 @@ impl BodyEditor {
                 if matches!(k.code, KeyCode::Char('g')) {
                     self.textarea.move_cursor(CursorMove::Top);
                     self.textarea.move_cursor(CursorMove::Head);
+                    self.sync_goal();
                     return KeyOutcome::Consumed;
                 }
             }
@@ -423,6 +447,48 @@ impl BodyEditor {
             _ => {}
         }
         KeyOutcome::Consumed
+    }
+
+    /// Re-establish the vim goal column from the live cursor column.
+    /// Called after any horizontal / explicit-column move so a following
+    /// `j`/`k` rides the column the user just landed on.
+    fn sync_goal(&mut self) {
+        let (_, col) = self.textarea.cursor();
+        self.goal_col = GoalCol::Col(col);
+        self.goal_anchor = col;
+    }
+
+    /// Vim-style vertical motion that preserves the goal column across
+    /// lines of differing length (tui-textarea's `Up`/`Down` clamps and
+    /// forgets it). Reseeds the goal when an untracked path moved the
+    /// cursor since the last tracked move, then `Jump`s to the goal
+    /// column clamped to the target line's last on-a-char position.
+    fn vertical(&mut self, up: bool, count: usize) {
+        let (row, col) = self.textarea.cursor();
+        // Untracked move (edit, paste, insert exit) since the last goal
+        // sync? Reseed so we don't carry a stale goal.
+        if col != self.goal_anchor {
+            self.goal_col = GoalCol::Col(col);
+        }
+        let last_row = self.textarea.lines().len().saturating_sub(1);
+        let target_row = if up {
+            row.saturating_sub(count)
+        } else {
+            (row + count).min(last_row)
+        };
+        // Normal/Visual: the block cursor sits ON a char, so the last
+        // valid column is line_len - 1 (0 for an empty line).
+        let max_col = self.textarea.lines()[target_row]
+            .chars()
+            .count()
+            .saturating_sub(1);
+        let new_col = match self.goal_col {
+            GoalCol::Eol => max_col,
+            GoalCol::Col(n) => n.min(max_col),
+        };
+        self.textarea
+            .move_cursor(CursorMove::Jump(target_row as u16, new_col as u16));
+        self.goal_anchor = new_col;
     }
 
     fn move_h(&mut self) {
@@ -1107,57 +1173,65 @@ impl BodyEditor {
 impl MotionTarget for BodyEditor {
     fn move_char_left(&mut self) {
         self.move_h();
+        self.sync_goal();
     }
     fn move_char_right(&mut self) {
         self.move_l();
+        self.sync_goal();
     }
     fn move_char_up(&mut self) {
-        self.textarea.move_cursor(CursorMove::Up);
+        self.vertical(true, 1);
     }
     fn move_char_down(&mut self) {
-        self.textarea.move_cursor(CursorMove::Down);
+        self.vertical(false, 1);
     }
     fn move_word_forward(&mut self) {
         self.word_move(WordMotion::Forward, false);
+        self.sync_goal();
     }
     fn move_word_back(&mut self) {
         self.word_move(WordMotion::Back, false);
+        self.sync_goal();
     }
     fn move_word_end(&mut self) {
         self.word_move(WordMotion::End, false);
+        self.sync_goal();
     }
     fn move_word_forward_big(&mut self) {
         self.word_move(WordMotion::Forward, true);
+        self.sync_goal();
     }
     fn move_word_back_big(&mut self) {
         self.word_move(WordMotion::Back, true);
+        self.sync_goal();
     }
     fn move_word_end_big(&mut self) {
         self.word_move(WordMotion::End, true);
+        self.sync_goal();
     }
     fn move_line_start(&mut self) {
         self.textarea.move_cursor(CursorMove::Head);
+        self.sync_goal();
     }
     fn move_line_end(&mut self) {
         self.textarea.move_cursor(CursorMove::End);
+        // `$` rides the end of each line on subsequent `j`/`k` until a
+        // horizontal move resets the goal (vim's `curswant = MAXCOL`).
+        self.goal_col = GoalCol::Eol;
+        self.goal_anchor = self.textarea.cursor().1;
     }
     fn move_first_line(&mut self) {
         self.textarea.move_cursor(CursorMove::Top);
         self.textarea.move_cursor(CursorMove::Head);
+        self.sync_goal();
     }
     fn move_last_line(&mut self) {
         self.textarea.move_cursor(CursorMove::Bottom);
         self.textarea.move_cursor(CursorMove::Head);
+        self.sync_goal();
     }
     fn move_half_page(&mut self, down: bool) {
-        let m = if down {
-            CursorMove::Down
-        } else {
-            CursorMove::Up
-        };
-        for _ in 0..half_page() {
-            self.textarea.move_cursor(m);
-        }
+        self.vertical(!down, half_page());
     }
 }
 
@@ -1233,6 +1307,33 @@ mod tests {
         let mut ed = BodyEditor::new("alpha\nbeta");
         feed(&mut ed, &[k('Y'), k('p')]);
         assert_eq!(ed.text(), "alpha\nalpha\nbeta");
+    }
+
+    #[test]
+    fn vertical_preserves_goal_column_across_blank_line() {
+        let mut ed = BodyEditor::new("foo bar\n\nfoo");
+        // Cursor to column 2 (second 'o'), then down across the blank
+        // line: vim curswant keeps column 2 instead of collapsing to 0.
+        feed(&mut ed, &[k('l'), k('l'), k('j'), k('j')]);
+        assert_eq!(ed.cursor(), (2, 2));
+    }
+
+    #[test]
+    fn dollar_rides_end_of_each_line_on_vertical_move() {
+        let mut ed = BodyEditor::new("foobar\nab\nhello");
+        feed(&mut ed, &[k('$'), k('j')]);
+        assert_eq!(ed.cursor(), (1, 1)); // EOL of "ab"
+        ed.handle_key(k('j'));
+        assert_eq!(ed.cursor(), (2, 4)); // EOL of "hello"
+    }
+
+    #[test]
+    fn horizontal_move_resets_goal_column() {
+        let mut ed = BodyEditor::new("foobar\nab\nhello");
+        // `$` then `h` drops EOL-sticky; the goal becomes the concrete
+        // column, so the next `j` lands there rather than at EOL.
+        feed(&mut ed, &[k('$'), k('j'), k('h'), k('j')]);
+        assert_eq!(ed.cursor(), (2, 0));
     }
 
     #[test]

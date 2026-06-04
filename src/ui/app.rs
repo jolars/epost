@@ -412,6 +412,13 @@ pub struct InboxScreen {
     /// clicked cell back with `reader::char_at_cell`), so zero-width and
     /// wide characters land overlays on the right cells.
     pub reader_cursor_col: u16,
+    /// Vim "curswant": the column vertical motion (`j`/`k`, page moves)
+    /// tries to keep across lines of differing length. `u16::MAX` is the
+    /// end-of-line sentinel (set by `$`), so vertical motion rides each
+    /// line's end. Horizontal / explicit-column moves reset it to the
+    /// resulting column. `reader_cursor_col` is the *live* (trued-up)
+    /// column; this is the *goal* a vertical move re-sources from.
+    pub reader_goal_col: u16,
     /// Vim-style visual-mode anchor. `Some` iff `Mode::Visual` is the
     /// active mode (strict pairing — see `Mode::Visual` doc). Char-wise
     /// vs line-wise lives on `kind`; the cursor end of the selection is
@@ -1733,6 +1740,7 @@ impl InboxScreen {
             reader_scroll: 0,
             reader_cursor_line: 0,
             reader_cursor_col: 0,
+            reader_goal_col: 0,
             visual: None,
             last_attachment_lines: Vec::new(),
             last_reader_body_line_text: Vec::new(),
@@ -1797,26 +1805,43 @@ impl InboxScreen {
         if self.last_reader_body_only_lines == 0 {
             return;
         }
-        let max_line = self.last_reader_body_only_lines.saturating_sub(1) as i32;
-        let new_line = (self.reader_cursor_line as i32 + dy).clamp(0, max_line) as u16;
-        // Columns clamp at the floor only; the ceiling depends on
-        // line_text, which the keymap doesn't have. Draw-time clamp
-        // brings overshoots back in. Saturate add so u16::MAX + N
-        // doesn't wrap to zero.
-        let new_col = if dx >= 0 {
-            self.reader_cursor_col.saturating_add(dx as u16)
-        } else {
-            self.reader_cursor_col
-                .saturating_sub((-dx).min(u16::MAX as i32) as u16)
-        };
-        self.reader_cursor_line = new_line;
-        self.reader_cursor_col = new_col;
+        // Horizontal: move the live column, clamp it to the current
+        // line's last on-a-char position (so `l` stops at EOL instead of
+        // silently overshooting), and reset the goal to it. Vertical and
+        // horizontal are never combined by callers, but handling each
+        // axis independently keeps the goal honest if they ever are.
+        if dx != 0 {
+            let raw = if dx >= 0 {
+                self.reader_cursor_col.saturating_add(dx as u16)
+            } else {
+                self.reader_cursor_col
+                    .saturating_sub((-dx).min(u16::MAX as i32) as u16)
+            };
+            self.reader_cursor_col = self
+                .last_reader_body_line_text
+                .get(self.reader_cursor_line as usize)
+                .map(|l| raw.min(l.chars().count().saturating_sub(1) as u16))
+                .unwrap_or(raw);
+            self.reader_goal_col = self.reader_cursor_col;
+        }
+        // Vertical: re-source the live column from the goal (vim
+        // curswant) so it survives short/empty lines. The goal itself is
+        // left alone; the draw-time clamp (reader::draw) trues the live
+        // column to the new line, but the next vertical move re-sources
+        // from the goal so that clamping is harmless.
+        if dy != 0 {
+            let max_line = self.last_reader_body_only_lines.saturating_sub(1) as i32;
+            self.reader_cursor_line =
+                (self.reader_cursor_line as i32 + dy).clamp(0, max_line) as u16;
+            self.reader_cursor_col = self.reader_goal_col;
+        }
         self.follow_cursor();
     }
 
     pub fn move_reader_cursor_to_top(&mut self) {
         self.reader_cursor_line = 0;
         self.reader_cursor_col = 0;
+        self.reader_goal_col = 0;
         self.follow_cursor();
     }
 
@@ -1826,16 +1851,21 @@ impl InboxScreen {
         // Vim `G` lands at the start of the last line, not its end —
         // matches `gg`, which parks at column 0.
         self.reader_cursor_col = 0;
+        self.reader_goal_col = 0;
         self.follow_cursor();
     }
 
     pub fn move_reader_cursor_to_line_start(&mut self) {
         self.reader_cursor_col = 0;
+        self.reader_goal_col = 0;
     }
 
     pub fn move_reader_cursor_to_line_end(&mut self) {
-        // Sentinel: clamped to real line end at draw time.
+        // Sentinel: clamped to real line end at draw time. As the goal
+        // it makes subsequent `j`/`k` ride each line's end (curswant =
+        // MAXCOL) until a horizontal move resets it.
         self.reader_cursor_col = u16::MAX;
+        self.reader_goal_col = u16::MAX;
     }
 
     /// Vim word motion over the laid-out body. Reads the per-frame
@@ -1856,6 +1886,7 @@ impl InboxScreen {
         );
         self.reader_cursor_line = nr as u16;
         self.reader_cursor_col = nc as u16;
+        self.reader_goal_col = nc as u16;
         self.follow_cursor();
     }
 
@@ -2006,6 +2037,7 @@ impl InboxScreen {
         // so drop it.
         self.reader_cursor_line = 0;
         self.reader_cursor_col = 0;
+        self.reader_goal_col = 0;
         self.visual = None;
         self.mouse_drag_anchor = None;
         self.yank_highlight = None;
@@ -2608,6 +2640,7 @@ impl InboxScreen {
         self.reader_scroll = 0;
         self.reader_cursor_line = 0;
         self.reader_cursor_col = 0;
+        self.reader_goal_col = 0;
         self.visual = None;
         self.mouse_drag_anchor = None;
         self.yank_highlight = None;
@@ -3392,6 +3425,55 @@ mod focus_nav_tests {
             SelfWrites::new(),
             None,
         )
+    }
+
+    #[test]
+    fn reader_vertical_preserves_goal_column_across_blank_line() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_line_text = vec!["foo bar".into(), String::new(), "foo".into()];
+        inbox.last_reader_body_only_lines = 3;
+        // Move to column 2 of the first line.
+        inbox.move_reader_cursor(0, 1);
+        inbox.move_reader_cursor(0, 1);
+        assert_eq!(inbox.reader_cursor_col, 2);
+        // Down onto the blank line: the live column overshoots and the
+        // draw-time clamp would true it to 0 (simulated here).
+        inbox.move_reader_cursor(1, 0);
+        inbox.reader_cursor_col = 0;
+        // Down onto "foo": the goal restores column 2.
+        inbox.move_reader_cursor(1, 0);
+        assert_eq!(inbox.reader_cursor_line, 2);
+        assert_eq!(inbox.reader_cursor_col, 2);
+    }
+
+    #[test]
+    fn reader_dollar_rides_end_of_each_line() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_line_text = vec!["foobar".into(), "ab".into(), "hello".into()];
+        inbox.last_reader_body_only_lines = 3;
+        inbox.move_reader_cursor_to_line_end();
+        assert_eq!(inbox.reader_goal_col, u16::MAX);
+        // Each vertical move re-sources the EOL sentinel; the draw clamp
+        // (not run here) trues the live column to each line's end.
+        inbox.move_reader_cursor(1, 0);
+        assert_eq!(inbox.reader_cursor_col, u16::MAX);
+        assert_eq!(inbox.reader_goal_col, u16::MAX);
+        inbox.move_reader_cursor(1, 0);
+        assert_eq!(inbox.reader_goal_col, u16::MAX);
+    }
+
+    #[test]
+    fn reader_horizontal_move_resets_goal_column() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_line_text = vec!["foobar".into(), "hello".into()];
+        inbox.last_reader_body_only_lines = 2;
+        inbox.move_reader_cursor_to_line_end();
+        // `h` after `$` drops EOL-sticky and pins the goal to a column.
+        inbox.reader_cursor_col = 5; // simulate the draw clamp to EOL of "foobar"
+        inbox.move_reader_cursor(0, -1);
+        assert_eq!(inbox.reader_goal_col, 4);
+        inbox.move_reader_cursor(1, 0);
+        assert_eq!(inbox.reader_cursor_col, 4);
     }
 
     #[test]

@@ -579,9 +579,13 @@ pub fn draw(
             inbox.reader_cursor_line = body_only_lines_this_frame - 1;
         }
     }
-    // Clamp `reader_cursor_col` against the real line length. Movement
-    // helpers (`$`, `move_reader_cursor`) intentionally overshoot since
-    // they don't have the laid-out body in hand; we true them up here.
+    // True up the *live* column (`reader_cursor_col`) against the real
+    // line length. Movement helpers (`$`, `move_reader_cursor`)
+    // intentionally overshoot — the `$`/curswant sentinel rides EOL —
+    // since they don't have the laid-out body in hand. This only touches
+    // the live column, never `reader_goal_col`: a vertical move
+    // re-sources the live column from the goal, so clamping it here is
+    // harmless and the goal column survives short/empty lines.
     if let Some(laid_ref) = laid.as_ref() {
         let li = inbox.reader_cursor_line as usize;
         if let Some(line) = laid_ref.line_text.get(li) {
