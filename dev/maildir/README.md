@@ -41,3 +41,6 @@ files placed under `cur/` or `.Sent/cur/`.
 - [x] `multipart/mixed` with two `Content-Disposition: attachment` parts
       (exercises the reader's bottom strip + `:save` / `:open-attachment`)
       — `cur/1779264000…attach-fixture…`
+- [x] Dated *today* — list-pane date column should render a clock time
+      (`14:15`) rather than a month/day — `cur/1780575300…today-time…`
+      (note: `Date:` header is 2026-06-04; only reads as "today" on that day)

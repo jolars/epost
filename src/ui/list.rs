@@ -1,8 +1,10 @@
+use jiff::{Timestamp, Zoned};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState};
+use unicode_width::UnicodeWidthStr;
 
 use crate::store::index::MessageRow;
 use crate::store::thread::ThreadedRow;
@@ -15,6 +17,12 @@ use crate::ui::style::{pane_block, pane_scrollbar};
 /// doesn't move the viewport, but once the cursor lands within this band
 /// of the edge the viewport scrolls to maintain the margin.
 const SCROLL_PADDING: usize = 2;
+
+/// Selected-row marker. The `List` widget reserves this glyph's display
+/// width as a left gutter on *every* row (blank-padded on the unselected
+/// ones), so row layout must budget against `inner_width - its width` or the
+/// right-flushed date gets clipped.
+const LIST_HIGHLIGHT_SYMBOL: &str = "▌ ";
 
 pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen) {
     let focused = inbox.focus == Pane::List;
@@ -62,10 +70,12 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen) {
             f.render_widget(widget, area);
         }
         ScanState::Ready(rows) => {
-            let inner_width = area.width.saturating_sub(2) as usize;
+            let row_width = (area.width.saturating_sub(2) as usize)
+                .saturating_sub(disp_w(LIST_HIGHLIGHT_SYMBOL));
+            let now = Zoned::now();
             let items: Vec<ListItem> = rows
                 .iter()
-                .map(|t| ListItem::new(render_row(t, inner_width)))
+                .map(|t| ListItem::new(render_row(t, row_width, &now)))
                 .collect();
             // Both fg and bg are set so the highlight uniformly overrides the
             // per-Span colors used in `render_row` (date=DarkGray, from=Cyan,
@@ -82,7 +92,7 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen) {
             let widget = List::new(items)
                 .block(block)
                 .highlight_style(highlight)
-                .highlight_symbol("▌ ")
+                .highlight_symbol(LIST_HIGHLIGHT_SYMBOL)
                 .scroll_padding(SCROLL_PADDING);
             let mut state = ListState::default();
             *state.offset_mut() = initial_offset;
@@ -180,12 +190,14 @@ fn draw_search(
                     account.is_none()
                 }
             };
-            let inner_width = area.width.saturating_sub(2) as usize;
+            let row_width = (area.width.saturating_sub(2) as usize)
+                .saturating_sub(disp_w(LIST_HIGHLIGHT_SYMBOL));
+            let now = Zoned::now();
             let items: Vec<ListItem> = s
                 .results
                 .iter()
                 .filter_map(|(i, _)| s.haystack.get(*i))
-                .map(|row| ListItem::new(render_search_row(row, show_account, inner_width)))
+                .map(|row| ListItem::new(render_search_row(row, show_account, row_width, &now)))
                 .collect();
             let highlight = if focused {
                 Style::default()
@@ -198,7 +210,7 @@ fn draw_search(
             let widget = List::new(items)
                 .block(block)
                 .highlight_style(highlight)
-                .highlight_symbol("▌ ")
+                .highlight_symbol(LIST_HIGHLIGHT_SYMBOL)
                 .scroll_padding(SCROLL_PADDING);
             let mut state = ListState::default();
             *state.offset_mut() = initial_offset;
@@ -213,9 +225,15 @@ fn draw_search(
     inbox.list_offset = new_offset;
 }
 
-/// Flat search-result row. Layout: `YYYY-MM-DD  acct/Folder  From            Subject`.
-/// Account is omitted when the haystack is already scoped to one account.
-fn render_search_row(row: &MessageRow, show_account: bool, width: usize) -> Line<'static> {
+/// Flat search-result row. Layout: `From          acct/Folder   ★ Subject … Date`,
+/// with the date flushed to the right edge. Account is omitted when the
+/// haystack is already scoped to one account.
+fn render_search_row(
+    row: &MessageRow,
+    show_account: bool,
+    width: usize,
+    now: &Zoned,
+) -> Line<'static> {
     let MessageRow {
         date,
         from_addr,
@@ -225,7 +243,8 @@ fn render_search_row(row: &MessageRow, show_account: bool, width: usize) -> Line
         folder,
         ..
     } = row;
-    let date_label = format_date(*date);
+    let date_label = format_date(*date, now);
+    let date_w = disp_w(&date_label);
     let from = from_addr.as_deref().unwrap_or("(unknown)");
     let subject_text = subject.as_deref().unwrap_or("(no subject)");
     let unread = !flags.contains('S');
@@ -249,7 +268,9 @@ fn render_search_row(row: &MessageRow, show_account: bool, width: usize) -> Line
     };
     let subj_style = Style::default().fg(subj_color).add_modifier(subj_mods);
 
-    let head = format!("{date_label}  ");
+    let from_col_width: usize = 14;
+    let from_truncated = truncate_pad(from, from_col_width);
+    let from_span = format!("{from_truncated}  ");
     let folder_col_width: usize = 14;
     let folder_label = if show_account {
         format!("{account}/{folder}")
@@ -258,27 +279,28 @@ fn render_search_row(row: &MessageRow, show_account: bool, width: usize) -> Line
     };
     let folder_truncated = truncate_pad(&folder_label, folder_col_width);
     let folder_span = format!("{folder_truncated}  ");
-    let from_col_width: usize = 14;
-    let from_truncated = truncate_pad(from, from_col_width);
-    let from_span = format!("{from_truncated}  ");
 
-    let remaining = width
-        .saturating_sub(head.len())
-        .saturating_sub(folder_span.len())
-        .saturating_sub(from_span.len())
-        .saturating_sub(flag_cells);
-    let subject_truncated = truncate_to(subject_text, remaining);
+    // Budget the subject from what's left after the date (plus a 2-cell gap)
+    // is reserved on the right, so the date is always visible.
+    let gap = 2;
+    let used = disp_w(&from_span) + disp_w(&folder_span) + flag_cells;
+    let avail_subject = width.saturating_sub(used + date_w + gap);
+    let subject_truncated = truncate_to(subject_text, avail_subject);
+
+    let left_w = used + disp_w(&subject_truncated);
+    let filler = " ".repeat(width.saturating_sub(left_w + date_w));
 
     Line::from(vec![
-        Span::styled(head, Style::default().fg(Color::DarkGray)),
-        Span::styled(folder_span, Style::default().fg(Color::Magenta)),
         Span::styled(from_span, Style::default().fg(Color::Cyan)),
+        Span::styled(folder_span, Style::default().fg(Color::Magenta)),
         Span::styled(flag_glyph.to_string(), Style::default().fg(Color::Yellow)),
         Span::styled(subject_truncated, subj_style),
+        Span::raw(filler),
+        Span::styled(date_label, Style::default().fg(Color::DarkGray)),
     ])
 }
 
-fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {
+fn render_row(t: &ThreadedRow, width: usize, now: &Zoned) -> Line<'static> {
     let MessageRow {
         date,
         from_addr,
@@ -287,7 +309,8 @@ fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {
         ..
     } = &t.row;
 
-    let date_label = format_date(*date);
+    let date_label = format_date(*date, now);
+    let date_w = disp_w(&date_label);
     let indent = "  ".repeat(t.depth as usize);
     let arrow = if t.depth > 0 { "↳ " } else { "" };
     let from = from_addr.as_deref().unwrap_or("(unknown)");
@@ -297,7 +320,7 @@ fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {
     let trashed = flags.contains('T');
 
     // Fixed 2-cell flag column: ★ + space when Flagged, two spaces
-    // otherwise. Subtracted as 2 cells below; ★ is multi-byte so a `.len()`
+    // otherwise. Budgeted as 2 cells below; ★ is multi-byte so a `.len()`
     // would mis-budget.
     let flag_glyph = if flagged { "★ " } else { "  " };
     let flag_cells: usize = 2;
@@ -316,59 +339,80 @@ fn render_row(t: &ThreadedRow, width: usize) -> Line<'static> {
     };
     let subj_style = Style::default().fg(subj_color).add_modifier(subj_mods);
 
-    let head = format!("{date_label}  ");
     let from_col_width: usize = 16;
     let from_truncated = truncate_pad(from, from_col_width);
     let from_span = format!("{from_truncated}  ");
 
-    let remaining = width
-        .saturating_sub(head.len())
-        .saturating_sub(from_span.len())
-        .saturating_sub(flag_cells)
-        .saturating_sub(indent.len())
-        .saturating_sub(arrow.len());
-    let subject_truncated = truncate_to(subject_text, remaining);
+    // Budget the subject from what's left after the date (plus a 2-cell gap)
+    // is reserved on the right, so the date is always visible.
+    let gap = 2;
+    let used = disp_w(&from_span) + flag_cells + disp_w(&indent) + disp_w(arrow);
+    let avail_subject = width.saturating_sub(used + date_w + gap);
+    let subject_truncated = truncate_to(subject_text, avail_subject);
+
+    let left_w = used + disp_w(&subject_truncated);
+    let filler = " ".repeat(width.saturating_sub(left_w + date_w));
 
     Line::from(vec![
-        Span::styled(head, Style::default().fg(Color::DarkGray)),
         Span::styled(from_span, Style::default().fg(Color::Cyan)),
         Span::styled(flag_glyph.to_string(), Style::default().fg(Color::Yellow)),
         Span::raw(indent),
         Span::styled(arrow.to_string(), Style::default().fg(Color::DarkGray)),
         Span::styled(subject_truncated, subj_style),
+        Span::raw(filler),
+        Span::styled(date_label, Style::default().fg(Color::DarkGray)),
     ])
 }
 
-fn format_date(unix: i64) -> String {
-    // Lightweight date label — full chrono dep is overkill for a yyyy-mm-dd
-    // header that the user reads at a glance. Sequencing matters more than
-    // wall-clock formatting; if `date == 0`, show a placeholder.
-    if unix <= 0 {
-        return "----------".to_string();
-    }
-    let days = unix / 86_400;
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
+fn disp_w(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
 }
 
-// Hinnant's date algorithm (proleptic Gregorian, days from 1970-01-01).
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 {
-        z / 146_097
-    } else {
-        (z - 146_096) / 146_097
+/// Relative date label. `now` is the local-zoned wall clock for this frame;
+/// the message timestamp is converted into the same zone before comparison.
+///
+/// - today → 24h clock (`14:15`)
+/// - earlier this year → abbreviated month + day (`May 2`)
+/// - a previous year → year + full month + day (`2025 April 9`)
+fn format_date(unix: i64, now: &Zoned) -> String {
+    if unix <= 0 {
+        return "·".to_string(); // placeholder; right-flushed, so width-agnostic
+    }
+    let Ok(ts) = Timestamp::from_second(unix) else {
+        return "·".to_string();
     };
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i32 + (era * 400) as i32;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp.wrapping_sub(9) };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    let z = ts.to_zoned(now.time_zone().clone());
+    if z.date() == now.date() {
+        format!("{:02}:{:02}", z.hour(), z.minute())
+    } else if z.year() == now.year() {
+        format!("{} {}", MONTH_ABBR[(z.month() - 1) as usize], z.day())
+    } else {
+        format!(
+            "{} {} {}",
+            z.year(),
+            MONTH_FULL[(z.month() - 1) as usize],
+            z.day()
+        )
+    }
 }
+
+const MONTH_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const MONTH_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
 
 fn truncate_to(s: &str, max_chars: usize) -> String {
     let mut out = String::new();
@@ -400,18 +444,36 @@ fn truncate_pad(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::tz::TimeZone;
+
+    fn utc_now(unix: i64) -> Zoned {
+        Timestamp::from_second(unix)
+            .unwrap()
+            .to_zoned(TimeZone::UTC)
+    }
 
     #[test]
-    fn date_label_formats_known_unix() {
-        assert_eq!(format_date(0), "----------");
-        // 1970-01-01
-        assert_eq!(format_date(1), "1970-01-01");
-        // 2026-01-01 00:00 UTC = 1767225600
-        assert_eq!(format_date(1_767_225_600), "2026-01-01");
-        // 2026-05-26 00:00 UTC = 2026-01-01 + 145 days = 1779753600
-        assert_eq!(format_date(1_779_753_600), "2026-05-26");
-        // 2024-02-29 (leap-day) 00:00 UTC = 1709164800
-        assert_eq!(format_date(1_709_164_800), "2024-02-29");
+    fn date_label_relative_to_now() {
+        // "now" = 2026-05-26 12:00 UTC.
+        let now = utc_now(1_779_796_800);
+
+        // Missing/zero date → placeholder.
+        assert_eq!(format_date(0, &now), "·");
+
+        // Same calendar day → 24h clock (zero-padded). 2026-05-26 01:15 UTC.
+        assert_eq!(format_date(1_779_758_100, &now), "01:15");
+        // 2026-05-26 14:15 UTC.
+        assert_eq!(format_date(1_779_804_900, &now), "14:15");
+
+        // Earlier this year → abbrev month + day, no leading zero.
+        // 2026-05-02 00:00 UTC = 1777680000.
+        assert_eq!(format_date(1_777_680_000, &now), "May 2");
+        // 2026-04-08 00:00 UTC = 1775606400.
+        assert_eq!(format_date(1_775_606_400, &now), "Apr 8");
+
+        // A previous year → year + full month + day.
+        // 2025-04-09 00:00 UTC = 1744156800.
+        assert_eq!(format_date(1_744_156_800, &now), "2025 April 9");
     }
 
     #[test]

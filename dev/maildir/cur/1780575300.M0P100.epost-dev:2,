@@ -1,0 +1,13 @@
+Return-Path: <today@example.com>
+Delivered-To: dev@example.invalid
+Message-ID: <today-time-001@example.com>
+From: Today Tester <today@example.com>
+To: Dev <dev@example.invalid>
+Subject: Sent today — should show a clock time
+Date: Thu, 04 Jun 2026 14:15:00 +0200
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+This message is dated today (2026-06-04 14:15 local). In the message
+list the date column should render as a clock time (e.g. 14:15) rather
+than a month/day, since it arrived today.
