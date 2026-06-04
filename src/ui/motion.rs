@@ -27,6 +27,9 @@ pub enum Motion {
     WordForward,
     WordBack,
     WordEnd,
+    WordForwardBig,
+    WordBackBig,
+    WordEndBig,
     LineStart,
     LineEnd,
     FirstLine,
@@ -52,6 +55,9 @@ pub trait MotionTarget {
     fn move_word_forward(&mut self) {}
     fn move_word_back(&mut self) {}
     fn move_word_end(&mut self) {}
+    fn move_word_forward_big(&mut self) {}
+    fn move_word_back_big(&mut self) {}
+    fn move_word_end_big(&mut self) {}
     fn move_half_page(&mut self, _down: bool) {}
 }
 
@@ -66,6 +72,9 @@ pub fn apply<T: MotionTarget>(t: &mut T, m: Motion) {
         Motion::WordForward => t.move_word_forward(),
         Motion::WordBack => t.move_word_back(),
         Motion::WordEnd => t.move_word_end(),
+        Motion::WordForwardBig => t.move_word_forward_big(),
+        Motion::WordBackBig => t.move_word_back_big(),
+        Motion::WordEndBig => t.move_word_end_big(),
         Motion::LineStart => t.move_line_start(),
         Motion::LineEnd => t.move_line_end(),
         Motion::FirstLine => t.move_first_line(),
@@ -110,6 +119,9 @@ pub fn key_to_motion(k: KeyEvent) -> Option<Motion> {
         KeyCode::Char('w') => Some(Motion::WordForward),
         KeyCode::Char('b') => Some(Motion::WordBack),
         KeyCode::Char('e') => Some(Motion::WordEnd),
+        KeyCode::Char('W') => Some(Motion::WordForwardBig),
+        KeyCode::Char('B') => Some(Motion::WordBackBig),
+        KeyCode::Char('E') => Some(Motion::WordEndBig),
         KeyCode::Char('0') | KeyCode::Home => Some(Motion::LineStart),
         KeyCode::Char('$') | KeyCode::End => Some(Motion::LineEnd),
         KeyCode::Char('^') => Some(Motion::LineStart),
@@ -141,6 +153,9 @@ mod tests {
         assert_eq!(key_to_motion(key('w')), Some(Motion::WordForward));
         assert_eq!(key_to_motion(key('b')), Some(Motion::WordBack));
         assert_eq!(key_to_motion(key('e')), Some(Motion::WordEnd));
+        assert_eq!(key_to_motion(key('W')), Some(Motion::WordForwardBig));
+        assert_eq!(key_to_motion(key('B')), Some(Motion::WordBackBig));
+        assert_eq!(key_to_motion(key('E')), Some(Motion::WordEndBig));
         assert_eq!(key_to_motion(key('0')), Some(Motion::LineStart));
         assert_eq!(key_to_motion(key('$')), Some(Motion::LineEnd));
         assert_eq!(key_to_motion(key('^')), Some(Motion::LineStart));
@@ -200,6 +215,15 @@ mod tests {
         fn move_word_end(&mut self) {
             self.calls.push("word_end");
         }
+        fn move_word_forward_big(&mut self) {
+            self.calls.push("word_forward_big");
+        }
+        fn move_word_back_big(&mut self) {
+            self.calls.push("word_back_big");
+        }
+        fn move_word_end_big(&mut self) {
+            self.calls.push("word_end_big");
+        }
         fn move_half_page(&mut self, down: bool) {
             self.calls.push(if down { "half_down" } else { "half_up" });
         }
@@ -215,6 +239,9 @@ mod tests {
             (Motion::WordForward, "word_forward"),
             (Motion::WordBack, "word_back"),
             (Motion::WordEnd, "word_end"),
+            (Motion::WordForwardBig, "word_forward_big"),
+            (Motion::WordBackBig, "word_back_big"),
+            (Motion::WordEndBig, "word_end_big"),
             (Motion::LineStart, "line_start"),
             (Motion::LineEnd, "line_end"),
             (Motion::FirstLine, "first_line"),

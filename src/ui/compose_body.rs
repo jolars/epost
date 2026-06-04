@@ -1,19 +1,23 @@
 //! Vim-style body editor for the compose tab. Wraps
 //! [`tui_textarea::TextArea`] with a light vim mode machine: Normal /
-//! Insert / Visual(Char|Line). [`handle_key`] returns whether the key
-//! was consumed by the editor or should fall through to the app
+//! Insert / Visual(Char|Line|Block). [`handle_key`] returns whether the
+//! key was consumed by the editor or should fall through to the app
 //! dispatch (only `: / ? Tab BackTab` pass through from Normal /
 //! Visual; nothing passes through from Insert).
 //!
 //! v1 scope:
-//! - Motions: `h j k l`, `w b e`, `0 $ ^`, `gg G`, `Ctrl-d` / `Ctrl-u`.
+//! - Motions: `h j k l`, `w b e` + `W B E` (WORD, via the shared
+//!   [`words`](crate::ui::words) scanner), `0 $ ^`, `gg G`, `Ctrl-d` /
+//!   `Ctrl-u`.
 //! - Insert entry: `i a A I o O`.
-//! - Edits: `x X`, `dd`, `yy`, `p P`, `u`, `Ctrl-R`.
-//! - Visual: `v V`; in Visual `y d x c` plus Esc / same-kind toggle /
-//!   opposite-kind swap.
+//! - Edits: `x X`, `dd`, `yy` / `Y`, `p P`, `u`, `Ctrl-R`.
+//! - Visual: `v V`, and block-wise `Ctrl-V`; in Visual `y d x c` plus
+//!   Esc / same-kind toggle / opposite-kind swap. Block-visual also
+//!   takes `I` / `A` / `c` block-insert (type on the top row, replayed
+//!   across the rest on Esc).
 //!
-//! Out of scope (deferred): text objects, counts, registers, macros,
-//! search, ex-commands beyond what the host cmdline already provides.
+//! Out of scope (deferred): block-paste (`p` of a rectangle), counts,
+//! registers, macros, search, ex-commands beyond the host cmdline.
 
 use std::time::{Duration, Instant};
 
@@ -23,6 +27,7 @@ use ratatui::style::Style;
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::ui::motion::{self, MotionTarget};
+use crate::ui::words::{self, WordMotion};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
@@ -35,6 +40,49 @@ pub enum BodyMode {
 pub enum VisualKind {
     Char,
     Line,
+    Block,
+}
+
+/// Which block-insert flavour is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockInsertKind {
+    /// `I` — insert at the block's left edge on every row.
+    Insert,
+    /// `A` — append after the block's right edge on every row.
+    Append,
+    /// `c` — delete the rectangle then insert at the left edge.
+    Change,
+}
+
+/// Per-row insert column for a block insert.
+#[derive(Debug, Clone, Copy)]
+enum BlockColSpec {
+    /// Insert at this absolute column (`I` / `c`).
+    Left(usize),
+    /// Append after this (inclusive) right edge column (`A`).
+    Append(usize),
+}
+
+/// In-flight block-insert (`Ctrl-V` then `I` / `A` / `c`). The user types
+/// on the top row in Insert mode; on `Esc` the inserted text is replayed
+/// on every other selected row. See [`BodyEditor::finish_block_insert`].
+#[derive(Debug, Clone)]
+struct BlockInsert {
+    /// Rows to replay onto (excludes the top row, where the live typing
+    /// already landed).
+    rows: Vec<usize>,
+    /// How to resolve each row's insert column.
+    spec: BlockColSpec,
+    /// The top (anchor) row, where the live insert happens.
+    top_row: usize,
+    /// Column on the top row where the live insert began.
+    top_col: usize,
+    /// `chars(lines[top_row])` captured at entry, so the Esc handler can
+    /// recover the typed span by diffing against the post-insert length.
+    pre_len: usize,
+    /// `lines.len()` captured at entry — if it changed (Enter pressed),
+    /// replay is aborted.
+    pre_rows: usize,
 }
 
 /// Operator-pending latch for two-key chords (`dd`, `yy`, `gg`). Only
@@ -90,6 +138,14 @@ pub struct BodyEditor {
     /// on the textarea's selection_start so kind swaps (`v` ↔ `V`) can
     /// recompute the selection without losing the origin.
     visual_anchor: (usize, usize),
+    /// Anchor `(row, col)` for block-wise visual (`Ctrl-V`). Separate from
+    /// `visual_anchor` because tui-textarea's single contiguous selection
+    /// can't represent a rectangle — block selection is painted and
+    /// extracted by us, not the textarea.
+    block_anchor: Option<(usize, usize)>,
+    /// In-flight block insert, set by `I`/`A`/`c` in block-visual and
+    /// consumed by the `Esc` that ends the insert.
+    block_insert: Option<BlockInsert>,
     pending: Pending,
     yank: Option<Yank>,
     /// Active yank-highlight flash, if any. Painted by `compose::draw`
@@ -114,6 +170,8 @@ impl BodyEditor {
             textarea,
             mode: BodyMode::Normal,
             visual_anchor: (0, 0),
+            block_anchor: None,
+            block_insert: None,
             pending: Pending::None,
             yank: None,
             yank_highlight: None,
@@ -130,6 +188,8 @@ impl BodyEditor {
         self.textarea.cancel_selection();
         self.mode = BodyMode::Normal;
         self.pending = Pending::None;
+        self.block_anchor = None;
+        self.block_insert = None;
         self.yank_highlight = None;
     }
 
@@ -168,6 +228,11 @@ impl BodyEditor {
         // Esc (matching vim) which drops back to Normal and nudges the
         // cursor back one cell, like `<Esc>` in real vim.
         if k.code == KeyCode::Esc {
+            // A block insert (`Ctrl-V` then `I`/`A`/`c`) replays the
+            // top-row text across the other selected rows on Esc.
+            if let Some(bi) = self.block_insert.take() {
+                self.finish_block_insert(bi);
+            }
             self.mode = BodyMode::Normal;
             self.textarea.move_cursor(CursorMove::Back);
             return KeyOutcome::Consumed;
@@ -323,6 +388,8 @@ impl BodyEditor {
             KeyCode::Char('y') => {
                 self.pending = Pending::Y;
             }
+            // `Y` is vim's line-yank, same as `yy`.
+            KeyCode::Char('Y') => self.yank_current_line(),
             KeyCode::Char('p') => self.paste_after(),
             KeyCode::Char('P') => self.paste_before(),
             KeyCode::Char('u') => {
@@ -346,6 +413,8 @@ impl BodyEditor {
             KeyCode::Char('r') => {
                 self.textarea.redo();
             }
+            // Ctrl-V enters block-wise visual.
+            KeyCode::Char('v') => self.enter_visual(VisualKind::Block),
             // Ctrl-C falls through to the app (which quits) only when
             // the user has already left Insert. That matches the
             // pty-editor path's behavior: ^C in insert mode is the
@@ -380,17 +449,74 @@ impl BodyEditor {
         }
     }
 
+    /// Vim word motion via the shared [`words`] scanner. Both the small
+    /// (`w b e`) and WORD (`W B E`) variants route here so the composer
+    /// and the reader stay byte-for-byte in agreement on word boundaries
+    /// — tui-textarea's own `WordForward` differs subtly and the reader
+    /// can't reach it at all.
+    fn word_move(&mut self, motion: WordMotion, big: bool) {
+        let (row, col) = self.textarea.cursor();
+        let (nr, nc) = words::word_motion(self.textarea.lines(), row, col, motion, big);
+        self.textarea
+            .move_cursor(CursorMove::Jump(nr as u16, nc as u16));
+    }
+
     // ---------- Visual mode ----------
 
     fn enter_visual(&mut self, kind: VisualKind) {
         self.visual_anchor = self.textarea.cursor();
+        self.block_anchor = if kind == VisualKind::Block {
+            Some(self.visual_anchor)
+        } else {
+            None
+        };
         self.mode = BodyMode::Visual(kind);
         self.refresh_visual_selection();
     }
 
     fn exit_visual_to_normal(&mut self) {
         self.textarea.cancel_selection();
+        self.block_anchor = None;
         self.mode = BodyMode::Normal;
+    }
+
+    /// Switch visual kind in place, keeping the anchor. Char/Line drive
+    /// the textarea selection; Block drives our own `block_anchor`.
+    fn swap_visual_kind(&mut self, new: VisualKind) {
+        if new == VisualKind::Block {
+            self.block_anchor = Some(self.visual_anchor);
+        } else {
+            self.block_anchor = None;
+        }
+        self.mode = BodyMode::Visual(new);
+        self.refresh_visual_selection();
+    }
+
+    /// Rectangle corners `(r0, r1, c0, c1)` (rows/cols normalized
+    /// independently) for the active block selection, or `None` when not
+    /// block-selecting. `c1` is inclusive.
+    fn block_corners(&self) -> Option<(usize, usize, usize, usize)> {
+        let (ar, ac) = self.block_anchor?;
+        let (cr, cc) = self.textarea.cursor();
+        Some((ar.min(cr), ar.max(cr), ac.min(cc), ac.max(cc)))
+    }
+
+    /// Cell ranges (`(row, col_start, col_end_excl)`, char coords) for the
+    /// live block selection — drives both the flash and the painter in
+    /// `compose.rs`. Empty when not block-selecting.
+    pub fn block_selection_ranges(&self) -> Vec<(u16, u16, u16)> {
+        let Some((r0, r1, c0, c1)) = self.block_corners() else {
+            return Vec::new();
+        };
+        let lines = self.textarea.lines();
+        (r0..=r1)
+            .filter_map(|r| {
+                let len = lines.get(r)?.chars().count();
+                let lo = c0.min(len);
+                let hi = (c1 + 1).min(len);
+                (hi > lo).then_some((r as u16, lo as u16, hi as u16))
+            })
+            .collect()
     }
 
     fn handle_visual(&mut self, k: KeyEvent, kind: VisualKind) -> KeyOutcome {
@@ -399,6 +525,15 @@ impl BodyEditor {
             return KeyOutcome::Consumed;
         }
         if k.modifiers.contains(KeyModifiers::CONTROL) {
+            // Ctrl-V toggles block-wise: same kind exits, else swaps in.
+            if matches!(k.code, KeyCode::Char('v')) {
+                if kind == VisualKind::Block {
+                    self.exit_visual_to_normal();
+                } else {
+                    self.swap_visual_kind(VisualKind::Block);
+                }
+                return KeyOutcome::Consumed;
+            }
             // Ctrl-C exits visual like Esc (and then the app handler
             // sees a clean Normal-mode keypress next).
             if matches!(k.code, KeyCode::Char('c')) {
@@ -445,8 +580,7 @@ impl BodyEditor {
                 if kind == VisualKind::Char {
                     self.exit_visual_to_normal();
                 } else {
-                    self.mode = BodyMode::Visual(VisualKind::Char);
-                    self.refresh_visual_selection();
+                    self.swap_visual_kind(VisualKind::Char);
                 }
                 return KeyOutcome::Consumed;
             }
@@ -454,27 +588,59 @@ impl BodyEditor {
                 if kind == VisualKind::Line {
                     self.exit_visual_to_normal();
                 } else {
-                    self.mode = BodyMode::Visual(VisualKind::Line);
-                    self.refresh_visual_selection();
+                    self.swap_visual_kind(VisualKind::Line);
                 }
                 return KeyOutcome::Consumed;
             }
 
             // Selection actions
             KeyCode::Char('y') => {
-                self.yank_selection(kind);
+                if kind == VisualKind::Block {
+                    self.yank_block();
+                } else {
+                    self.yank_selection(kind);
+                }
                 self.exit_visual_to_normal();
                 return KeyOutcome::Consumed;
             }
             KeyCode::Char('d') | KeyCode::Char('x') => {
-                self.cut_selection(kind);
+                if kind == VisualKind::Block {
+                    self.delete_block();
+                } else {
+                    self.cut_selection(kind);
+                }
                 self.exit_visual_to_normal();
                 return KeyOutcome::Consumed;
             }
             KeyCode::Char('c') => {
-                self.cut_selection(kind);
-                self.textarea.cancel_selection();
-                self.mode = BodyMode::Insert;
+                if kind == VisualKind::Block {
+                    // Capture corners before `delete_block` moves the
+                    // cursor (which would otherwise collapse the row range
+                    // when the anchor is the top row), then block-insert at
+                    // the left edge — vim's block-change.
+                    if let Some(corners) = self.block_corners() {
+                        self.delete_block();
+                        self.begin_block_insert(corners, BlockInsertKind::Change);
+                    }
+                } else {
+                    self.cut_selection(kind);
+                    self.textarea.cancel_selection();
+                    self.block_anchor = None;
+                    self.mode = BodyMode::Insert;
+                }
+                return KeyOutcome::Consumed;
+            }
+            // Block-insert entries (block-visual only).
+            KeyCode::Char('I') if kind == VisualKind::Block => {
+                if let Some(corners) = self.block_corners() {
+                    self.begin_block_insert(corners, BlockInsertKind::Insert);
+                }
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('A') if kind == VisualKind::Block => {
+                if let Some(corners) = self.block_corners() {
+                    self.begin_block_insert(corners, BlockInsertKind::Append);
+                }
                 return KeyOutcome::Consumed;
             }
 
@@ -530,7 +696,150 @@ impl BodyEditor {
                     self.textarea.move_cursor(CursorMove::Jump(cur.0 as u16, 0));
                 }
             }
+            // Block selection is painted by us (see `block_selection_ranges`),
+            // not the textarea's single-range selection — leave it cleared.
+            VisualKind::Block => {}
         }
+    }
+
+    // ---------- Block ops ----------
+
+    /// Rectangular text of the active block selection (rows joined by
+    /// `\n`, each row sliced to `[c0, c1]`). Empty when not block-selecting.
+    fn block_text(&self, r0: usize, r1: usize, c0: usize, c1: usize) -> String {
+        let lines = self.textarea.lines();
+        (r0..=r1)
+            .map(|r| {
+                let chars: Vec<char> = lines[r].chars().collect();
+                let lo = c0.min(chars.len());
+                let hi = (c1 + 1).min(chars.len());
+                chars[lo..hi].iter().collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn yank_block(&mut self) {
+        let Some((r0, r1, c0, c1)) = self.block_corners() else {
+            return;
+        };
+        let text = self.block_text(r0, r1, c0, c1);
+        self.yank = Some(Yank {
+            text,
+            line_wise: false,
+        });
+        let ranges = self.block_selection_ranges();
+        self.arm_yank_highlight(ranges);
+    }
+
+    fn delete_block(&mut self) {
+        let Some((r0, r1, c0, c1)) = self.block_corners() else {
+            return;
+        };
+        let text = self.block_text(r0, r1, c0, c1);
+        self.yank = Some(Yank {
+            text,
+            line_wise: false,
+        });
+        // Cut each row's `[c0, c1]` span. Within-line cuts never shift
+        // other rows, so order is free; rows shorter than `c0` are
+        // untouched. Each cut is its own history step (v1: N undos).
+        for r in r0..=r1 {
+            let len = self.textarea.lines()[r].chars().count();
+            if c0 >= len {
+                continue;
+            }
+            let hi = (c1 + 1).min(len);
+            self.textarea.cancel_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(r as u16, c0 as u16));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(r as u16, hi as u16));
+            self.textarea.cut();
+        }
+        self.textarea.cancel_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(r0 as u16, c0 as u16));
+    }
+
+    /// Start a block insert (`I` / `A` / `c`). Records the replay plan in
+    /// `block_insert`, moves the cursor to the top-row insert column, and
+    /// drops into Insert mode. The actual replay across the other rows
+    /// happens when the Esc that ends the insert lands in `handle_insert`.
+    fn begin_block_insert(&mut self, corners: (usize, usize, usize, usize), what: BlockInsertKind) {
+        let (r0, r1, c0, c1) = corners;
+        let lines = self.textarea.lines();
+        let top_len = lines[r0].chars().count();
+        let (spec, top_col) = match what {
+            BlockInsertKind::Insert | BlockInsertKind::Change => {
+                (BlockColSpec::Left(c0), c0.min(top_len))
+            }
+            BlockInsertKind::Append => (BlockColSpec::Append(c1), (c1 + 1).min(top_len)),
+        };
+        let rows: Vec<usize> = (r0 + 1..=r1).collect();
+        self.block_insert = Some(BlockInsert {
+            rows,
+            spec,
+            top_row: r0,
+            top_col,
+            pre_len: top_len,
+            pre_rows: self.textarea.lines().len(),
+        });
+        // The rectangle is captured in `block_insert`; drop the visual
+        // anchor so leaving via Esc doesn't think we're still selecting.
+        self.block_anchor = None;
+        self.textarea.cancel_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(r0 as u16, top_col as u16));
+        self.mode = BodyMode::Insert;
+    }
+
+    /// Replay the just-typed top-row text across the other block rows.
+    /// Called from the Esc that ends a block insert. Aborts (replays
+    /// nothing) if the row count changed (a newline was typed) or the
+    /// cursor left the top row, matching the snapshot-diff contract.
+    fn finish_block_insert(&mut self, bi: BlockInsert) {
+        let lines = self.textarea.lines();
+        if lines.len() != bi.pre_rows {
+            return;
+        }
+        let (cur_row, _) = self.textarea.cursor();
+        if cur_row != bi.top_row {
+            return;
+        }
+        let top_chars: Vec<char> = lines[bi.top_row].chars().collect();
+        let typed_len = top_chars.len().saturating_sub(bi.pre_len);
+        if typed_len == 0 {
+            return;
+        }
+        let typed: String = top_chars[bi.top_col..bi.top_col + typed_len]
+            .iter()
+            .collect();
+        for r in bi.rows {
+            let len = self.textarea.lines()[r].chars().count();
+            let col = match bi.spec {
+                // `I`: insert at the left edge; skip rows too short to
+                // reach it (vim pads with spaces — accepted v1 drift).
+                BlockColSpec::Left(c0) => {
+                    if c0 > len {
+                        continue;
+                    }
+                    c0
+                }
+                // `A`: append after the right edge, or at the row's own
+                // end when it's shorter than the block.
+                BlockColSpec::Append(c1) => (c1 + 1).min(len),
+            };
+            self.textarea
+                .move_cursor(CursorMove::Jump(r as u16, col as u16));
+            self.textarea.insert_str(&typed);
+        }
+        // Park the cursor back where the live insert ended.
+        self.textarea.move_cursor(CursorMove::Jump(
+            bi.top_row as u16,
+            (bi.top_col + typed_len) as u16,
+        ));
     }
 
     // ---------- Line ops ----------
@@ -605,6 +914,8 @@ impl BodyEditor {
         let text = match kind {
             VisualKind::Char => extract_range(lines, (sr, sc), (er, ec)),
             VisualKind::Line => extract_lines(lines, sr, er),
+            // Block routes through `yank_block`, never here.
+            VisualKind::Block => unreachable!("block yank handled by yank_block"),
         };
         self.yank = Some(Yank {
             text,
@@ -613,6 +924,7 @@ impl BodyEditor {
         let ranges = match kind {
             VisualKind::Char => self.char_ranges(sr, sc, er, ec),
             VisualKind::Line => self.line_ranges(sr, er),
+            VisualKind::Block => unreachable!("block yank handled by yank_block"),
         };
         self.arm_yank_highlight(ranges);
     }
@@ -698,6 +1010,8 @@ impl BodyEditor {
         let text = match kind {
             VisualKind::Char => extract_range(lines, (sr, sc), (er, ec)),
             VisualKind::Line => extract_lines(lines, sr, er),
+            // Block routes through `delete_block`, never here.
+            VisualKind::Block => unreachable!("block cut handled by delete_block"),
         };
         self.yank = Some(Yank {
             text,
@@ -710,6 +1024,7 @@ impl BodyEditor {
                 // keep our own kind-aware copy on `self.yank` instead.
                 self.textarea.cut();
             }
+            VisualKind::Block => unreachable!("block cut handled by delete_block"),
             VisualKind::Line => {
                 // For line-wise, redraw the selection to span whole
                 // rows including the trailing newline so cut() removes
@@ -803,13 +1118,22 @@ impl MotionTarget for BodyEditor {
         self.textarea.move_cursor(CursorMove::Down);
     }
     fn move_word_forward(&mut self) {
-        self.textarea.move_cursor(CursorMove::WordForward);
+        self.word_move(WordMotion::Forward, false);
     }
     fn move_word_back(&mut self) {
-        self.textarea.move_cursor(CursorMove::WordBack);
+        self.word_move(WordMotion::Back, false);
     }
     fn move_word_end(&mut self) {
-        self.textarea.move_cursor(CursorMove::WordEnd);
+        self.word_move(WordMotion::End, false);
+    }
+    fn move_word_forward_big(&mut self) {
+        self.word_move(WordMotion::Forward, true);
+    }
+    fn move_word_back_big(&mut self) {
+        self.word_move(WordMotion::Back, true);
+    }
+    fn move_word_end_big(&mut self) {
+        self.word_move(WordMotion::End, true);
     }
     fn move_line_start(&mut self) {
         self.textarea.move_cursor(CursorMove::Head);
@@ -894,10 +1218,87 @@ mod tests {
         KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
     }
 
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
     fn feed(ed: &mut BodyEditor, keys: &[KeyEvent]) {
         for ke in keys {
             ed.handle_key(*ke);
         }
+    }
+
+    #[test]
+    fn capital_y_yanks_line_like_yy() {
+        let mut ed = BodyEditor::new("alpha\nbeta");
+        feed(&mut ed, &[k('Y'), k('p')]);
+        assert_eq!(ed.text(), "alpha\nalpha\nbeta");
+    }
+
+    #[test]
+    fn ctrl_v_enters_block_visual() {
+        let mut ed = BodyEditor::new("abcd\nefgh");
+        ed.handle_key(ctrl('v'));
+        assert_eq!(ed.mode, BodyMode::Visual(VisualKind::Block));
+    }
+
+    #[test]
+    fn block_yank_is_rectangular() {
+        let mut ed = BodyEditor::new("abcd\nefgh\nijkl");
+        // Ctrl-V at (0,0), down twice, right once → rect cols 0..=1 × rows 0..=2.
+        feed(&mut ed, &[ctrl('v'), k('j'), k('j'), k('l'), k('y')]);
+        let y = ed.yank.as_ref().expect("yank set");
+        assert_eq!(y.text, "ab\nef\nij");
+        assert!(!y.line_wise);
+        assert_eq!(ed.mode, BodyMode::Normal);
+    }
+
+    #[test]
+    fn block_delete_removes_rectangle() {
+        let mut ed = BodyEditor::new("abcd\nefgh\nijkl");
+        feed(&mut ed, &[ctrl('v'), k('j'), k('j'), k('l'), k('d')]);
+        assert_eq!(ed.text(), "cd\ngh\nkl");
+        let y = ed.yank.as_ref().expect("yank set");
+        assert_eq!(y.text, "ab\nef\nij");
+    }
+
+    #[test]
+    fn block_insert_replays_across_rows() {
+        let mut ed = BodyEditor::new("abcd\nefgh\nijkl");
+        // Ctrl-V, down twice (column 0 across 3 rows), I, type X, Esc.
+        feed(&mut ed, &[ctrl('v'), k('j'), k('j'), k('I'), k('X'), esc()]);
+        assert_eq!(ed.text(), "Xabcd\nXefgh\nXijkl");
+        assert_eq!(ed.mode, BodyMode::Normal);
+    }
+
+    #[test]
+    fn block_append_inserts_after_right_edge() {
+        let mut ed = BodyEditor::new("ab\ncd\nef");
+        // Single-column block at col 0 across 3 rows; A appends after col 0.
+        feed(&mut ed, &[ctrl('v'), k('j'), k('j'), k('A'), k('X'), esc()]);
+        assert_eq!(ed.text(), "aXb\ncXd\neXf");
+    }
+
+    #[test]
+    fn block_insert_aborts_replay_on_newline() {
+        let mut ed = BodyEditor::new("abcd\nefgh\nijkl");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Pressing Enter changes the row count → replay is skipped; only
+        // the top-row live edit lands, the other rows stay untouched.
+        feed(
+            &mut ed,
+            &[
+                ctrl('v'),
+                k('j'),
+                k('j'),
+                k('I'),
+                k('X'),
+                enter,
+                k('Y'),
+                esc(),
+            ],
+        );
+        assert_eq!(ed.text(), "X\nYabcd\nefgh\nijkl");
     }
 
     #[test]

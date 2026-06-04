@@ -589,6 +589,7 @@ fn body_block_title(screen: &ComposeScreen, editing: bool, focused: bool) -> Str
         BodyMode::Insert => "INSERT",
         BodyMode::Visual(VisualKind::Char) => "VISUAL",
         BodyMode::Visual(VisualKind::Line) => "V-LINE",
+        BodyMode::Visual(VisualKind::Block) => "V-BLOCK",
     };
     format!("Body — {mode}")
 }
@@ -833,6 +834,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         // will see a brief cursor-position drift until the next motion;
         // acceptable v1 trade-off vs poking at tui-textarea internals.
         f.render_widget(&screen.body.textarea, body_inner);
+        paint_body_block_selection(f.buffer_mut(), body_inner, &screen.body);
         paint_body_yank_highlight(f.buffer_mut(), body_inner, &screen.body);
         let (cursor_row, col) = screen.body.textarea.cursor();
         let line_count = screen.body.textarea.lines().len();
@@ -1057,6 +1059,34 @@ fn paint_body_yank_highlight(buf: &mut ratatui::buffer::Buffer, inner: Rect, bod
         for x in x_start..x_end {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 let style = cell.style().bg(Color::Yellow).fg(Color::Black);
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// Paint the block-wise visual selection (`Ctrl-V`) over the body pane.
+/// tui-textarea's single-range selection can't draw a rectangle, so we
+/// flip `REVERSED` on each row's `[c0, c1]` span ourselves, mirroring the
+/// reader's block paint. Ranges are body-relative char coords (char ==
+/// cell here, same assumption as the yank-highlight painter).
+fn paint_body_block_selection(buf: &mut ratatui::buffer::Buffer, inner: Rect, body: &BodyEditor) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    for (row, c_start, c_end_excl) in body.block_selection_ranges() {
+        if row >= inner.height {
+            continue;
+        }
+        let y = inner.y + row;
+        let x_start = inner.x.saturating_add(c_start).min(inner.x + inner.width);
+        let x_end = inner
+            .x
+            .saturating_add(c_end_excl)
+            .min(inner.x + inner.width);
+        for x in x_start..x_end {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                let style = cell.style().add_modifier(Modifier::REVERSED);
                 cell.set_style(style);
             }
         }

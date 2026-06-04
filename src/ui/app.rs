@@ -62,11 +62,13 @@ pub enum Mode {
 }
 
 /// Vim-style visual sub-kind. Char-wise (`v`) extends cell-by-cell; line-wise
-/// (`V`) snaps both anchor and cursor to whole rendered lines.
+/// (`V`) snaps both anchor and cursor to whole rendered lines; block-wise
+/// (`Ctrl-V`) selects the rectangle between anchor and cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisualKind {
     Char,
     Line,
+    Block,
 }
 
 /// Anchor pin for visual mode. Cursor coords live on `InboxScreen`
@@ -1783,7 +1785,9 @@ impl InboxScreen {
     pub fn move_reader_cursor_to_bottom(&mut self) {
         let max_line = self.last_reader_body_only_lines.saturating_sub(1);
         self.reader_cursor_line = max_line;
-        self.reader_cursor_col = u16::MAX;
+        // Vim `G` lands at the start of the last line, not its end —
+        // matches `gg`, which parks at column 0.
+        self.reader_cursor_col = 0;
         self.follow_cursor();
     }
 
@@ -1794,6 +1798,27 @@ impl InboxScreen {
     pub fn move_reader_cursor_to_line_end(&mut self) {
         // Sentinel: clamped to real line end at draw time.
         self.reader_cursor_col = u16::MAX;
+    }
+
+    /// Vim word motion over the laid-out body. Reads the per-frame
+    /// `last_reader_body_line_text` directly (no re-layout) and drives the
+    /// cursor through the shared [`words`](crate::ui::words) scanner, so
+    /// the reader and composer agree on word boundaries. Used by both the
+    /// reader-Normal keymap and the `MotionTarget` impl (reader-Visual).
+    pub fn reader_word(&mut self, motion: crate::ui::words::WordMotion, big: bool) {
+        if self.last_reader_body_line_text.is_empty() {
+            return;
+        }
+        let (nr, nc) = crate::ui::words::word_motion(
+            &self.last_reader_body_line_text,
+            self.reader_cursor_line as usize,
+            self.reader_cursor_col as usize,
+            motion,
+            big,
+        );
+        self.reader_cursor_line = nr as u16;
+        self.reader_cursor_col = nc as u16;
+        self.follow_cursor();
     }
 
     /// Attachment count for the open message (0 when no body parsed).
@@ -1853,6 +1878,28 @@ impl MotionTarget for InboxScreen {
         // hasn't been measured yet (first frame).
         let step = (self.last_reader_inner_height / 2).max(1) as i32;
         self.move_reader_cursor(if down { step } else { -step }, 0);
+    }
+    // Word motions: now backed by the shared scanner over the laid-out
+    // body text, unlike the no-op default — `reader_word` reads
+    // `last_reader_body_line_text`, which the keymap layer can't see but
+    // `self` carries.
+    fn move_word_forward(&mut self) {
+        self.reader_word(crate::ui::words::WordMotion::Forward, false);
+    }
+    fn move_word_back(&mut self) {
+        self.reader_word(crate::ui::words::WordMotion::Back, false);
+    }
+    fn move_word_end(&mut self) {
+        self.reader_word(crate::ui::words::WordMotion::End, false);
+    }
+    fn move_word_forward_big(&mut self) {
+        self.reader_word(crate::ui::words::WordMotion::Forward, true);
+    }
+    fn move_word_back_big(&mut self) {
+        self.reader_word(crate::ui::words::WordMotion::Back, true);
+    }
+    fn move_word_end_big(&mut self) {
+        self.reader_word(crate::ui::words::WordMotion::End, true);
     }
 
     // Re-open the inherent impl block so the rest of InboxScreen's
@@ -3437,14 +3484,15 @@ mod focus_nav_tests {
     }
 
     #[test]
-    fn move_reader_cursor_to_bottom_sets_max() {
+    fn move_reader_cursor_to_bottom_lands_at_line_start() {
         let mut inbox = inbox_with_panes(true, true, true);
         inbox.last_reader_body_only_lines = 7;
         inbox.last_reader_inner_height = 3;
         inbox.last_reader_header_offset = 0;
         inbox.move_reader_cursor_to_bottom();
         assert_eq!(inbox.reader_cursor_line, 6);
-        assert_eq!(inbox.reader_cursor_col, u16::MAX);
+        // Vim `G` lands at the start of the last line, not its end.
+        assert_eq!(inbox.reader_cursor_col, 0);
     }
 
     #[test]

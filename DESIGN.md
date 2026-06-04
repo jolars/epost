@@ -206,7 +206,8 @@ prefer = "html"               # "html" | "plain"
 # Browser fallback for ":open". Receives the rewritten HTML file path as
 # the final argument. Override to e.g. firefox / qutebrowser / lynx.
 browser = ["xdg-open"]
-# Reader yanks (`Y` / `yp` / `yl`) emit OSC 52 to the host terminal by
+# Reader yanks (`Y`/`yy` line, `yip`/`yap` paragraph, `yie`/`yae` whole
+# body, `yl` link) emit OSC 52 to the host terminal by
 # default. Set `clipboard` to a command vec to pipe the selected text
 # to that command's stdin instead — for tmux setups or terminals where
 # OSC 52 is disabled. E.g. `["wl-copy"]` or `["xclip", "-selection",
@@ -259,12 +260,19 @@ smtp.command  = ["msmtp", "-t", "-a", "work"]    # per-account override
 "f"        = "link-pick"          # Vimium-style: numbers each link, type to follow
 "<Enter>"  = "link-follow"        # follow the currently-hovered link
 "o"        = "open-browser"       # pipe message to [reader].browser
-"Y"        = "yank-body"          # whole body to clipboard (OSC 52 / fallback)
+"Y"        = "yank-line"          # current line (vim `Y` == `yy`)
+"yy"       = "yank-line"          # same as Y
 "yip"      = "yank-inner-paragraph" # top-level block at the reader cursor
 "yap"      = "yank-a-paragraph"     # same block, plus a trailing newline
+"yie"      = "yank-entire"        # whole body (vim-textobj-entire: inner entire)
+"yae"      = "yank-entire"        # whole body, plus a trailing newline
 "yl"       = "yank-link"          # first link at or after the reader cursor
+"w"        = "word-forward"       # next word start ("W" = WORD, whitespace-delimited)
+"b"        = "word-back"          # prev word start ("B" = WORD)
+"e"        = "word-end"           # next word end   ("E" = WORD)
 "v"        = "visual-char"        # enter char-wise visual selection
 "V"        = "visual-line"        # enter line-wise visual selection
+"<C-v>"    = "visual-block"       # enter block-wise (rectangular) visual selection
 "<Esc>"    = "pane-focus list"
 
 [keys.visual]
@@ -276,9 +284,11 @@ smtp.command  = ["msmtp", "-t", "-a", "work"]    # per-account override
 "G"        = "extend-to-bottom"
 "0"        = "extend-to-line-start"
 "$"        = "extend-to-line-end"
+"w"        = "extend-word-forward" # b / e and the W/B/E WORD variants too
 "y"        = "yank-selection"     # copy then exit to Normal
 "v"        = "exit-or-swap-char"  # same kind exits; different kind swaps
 "V"        = "exit-or-swap-line"
+"<C-v>"    = "exit-or-swap-block" # same kind exits; different kind swaps to block
 "<Esc>"    = "exit-visual"
 
 [keys.mouse]

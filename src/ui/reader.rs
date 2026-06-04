@@ -169,6 +169,25 @@ impl LaidOutBody {
             return String::new();
         }
         let n = self.line_text.len();
+        // Block normalizes rows and columns *independently* (the rectangle
+        // between the two corners), unlike the lexicographic ordering the
+        // char/line kinds use. Handle it before that normalize.
+        if matches!(kind, VisualKind::Block) {
+            let r0 = (anchor_line.min(cursor_line) as usize).min(n - 1);
+            let r1 = (anchor_line.max(cursor_line) as usize).min(n - 1);
+            let c0 = anchor_col.min(cursor_col) as usize;
+            let c1 = anchor_col.max(cursor_col) as usize;
+            let rows: Vec<String> = (r0..=r1)
+                .map(|li| {
+                    let line = &self.line_text[li];
+                    let len = line.chars().count();
+                    let lo = c0.min(len);
+                    let hi = (c1 + 1).min(len); // c1 inclusive
+                    line.chars().skip(lo).take(hi.saturating_sub(lo)).collect()
+                })
+                .collect();
+            return rows.join("\n");
+        }
         let (start_line, start_col, end_line, end_col) =
             if (anchor_line, anchor_col) <= (cursor_line, cursor_col) {
                 (anchor_line, anchor_col, cursor_line, cursor_col)
@@ -211,6 +230,8 @@ impl LaidOutBody {
                     out
                 }
             }
+            // Block is handled by the early return above.
+            VisualKind::Block => unreachable!("block selection handled above"),
         }
     }
 
@@ -233,6 +254,28 @@ impl LaidOutBody {
             return Vec::new();
         }
         let n = self.line_text.len();
+        // Block: independent row/col normalize (a rectangle). Each row is
+        // sliced to the same `[c0, c1]` char range; rows shorter than
+        // `c0` emit nothing (no empty-line fallback, unlike char-wise).
+        if matches!(sel.kind, VisualKind::Block) {
+            let r0 = (sel.anchor_line.min(cursor_line) as usize).min(n - 1);
+            let r1 = (sel.anchor_line.max(cursor_line) as usize).min(n - 1);
+            let c0 = sel.anchor_col.min(cursor_col) as usize;
+            let c1 = sel.anchor_col.max(cursor_col) as usize;
+            let mut out: Vec<(u16, u16, u16)> = Vec::new();
+            for li in r0..=r1 {
+                let line = &self.line_text[li];
+                let len = line.chars().count();
+                let lo = c0.min(len);
+                let hi = (c1 + 1).min(len); // c1 inclusive
+                if hi > lo {
+                    let a = cell_col(line, lo);
+                    let b = cell_col(line, hi);
+                    out.push((li as u16, a, b));
+                }
+            }
+            return out;
+        }
         let (sl, sc, el, ec) = if (sel.anchor_line, sel.anchor_col) <= (cursor_line, cursor_col) {
             (sel.anchor_line, sel.anchor_col, cursor_line, cursor_col)
         } else {
@@ -260,6 +303,8 @@ impl LaidOutBody {
                     let end_excl = end_incl.saturating_add(1).min(line_chars);
                     (start.min(line_chars), end_excl)
                 }
+                // Block is handled by the early return above.
+                VisualKind::Block => unreachable!("block selection handled above"),
             };
             if a_char < b_char {
                 let a = cell_col(line, a_char as usize);
@@ -2393,6 +2438,50 @@ mod tests {
         assert!(s.contains("beta"), "{s:?}");
         assert!(s.contains("gamma"), "{s:?}");
         assert!(s.contains('\n'));
+    }
+
+    fn block_body() -> LaidOutBody {
+        LaidOutBody {
+            lines: Vec::new(),
+            links: Vec::new(),
+            images: Vec::new(),
+            line_block_idx: Vec::new(),
+            line_text: vec!["foobar".into(), "bazqux".into(), "hello".into()],
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn extract_selection_block_is_rectangular() {
+        let laid = block_body();
+        // Columns 1..=3 across all three rows → "oob" / "azq" / "ell".
+        let s = laid.extract_selection(0, 1, 2, 3, VisualKind::Block);
+        assert_eq!(s, "oob\nazq\nell");
+        // Reversed corners give the same rectangle (independent normalize).
+        let rev = laid.extract_selection(2, 3, 0, 1, VisualKind::Block);
+        assert_eq!(rev, s);
+    }
+
+    #[test]
+    fn extract_selection_block_clamps_short_rows() {
+        let mut laid = block_body();
+        laid.line_text = vec!["longline".into(), "ab".into()];
+        // Cols 3..=6: row0 → "glin", row1 "ab" is too short → empty slice.
+        let s = laid.extract_selection(0, 3, 1, 6, VisualKind::Block);
+        assert_eq!(s, "glin\n");
+    }
+
+    #[test]
+    fn selection_cell_ranges_block_per_row() {
+        let laid = block_body();
+        let sel = VisualState {
+            kind: VisualKind::Block,
+            anchor_line: 0,
+            anchor_col: 1,
+        };
+        let ranges = laid.selection_cell_ranges(&sel, 2, 3);
+        // Each row gets cols [1, 4) (c1=3 inclusive → exclusive 4).
+        assert_eq!(ranges, vec![(0, 1, 4), (1, 1, 4), (2, 1, 4)]);
     }
 
     #[test]

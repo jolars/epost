@@ -255,6 +255,12 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             // to the viewport edge if the scroll would push it off-screen.
             KeyCode::Char('e') => app.scroll_reader_line(true),
             KeyCode::Char('y') => app.scroll_reader_line(false),
+            // Ctrl-V enters block-wise visual selection in the reader.
+            // Guarded on Reader focus so it doesn't fire over the list /
+            // folder panes (where there's no body cursor to anchor).
+            KeyCode::Char('v') if app.inbox().focus == Pane::Reader => {
+                app.enter_visual(crate::ui::app::VisualKind::Block);
+            }
             _ => {}
         }
         return;
@@ -365,6 +371,12 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                         let mut seq = buf;
                         seq.push(c);
                         match seq.as_str() {
+                            // `yy` — yank the current line (vim line-wise).
+                            "y" => {
+                                app.pending_y = None;
+                                yank_line(app, cfg);
+                                return;
+                            }
                             "l" => {
                                 app.pending_y = None;
                                 yank_link(app, cfg);
@@ -378,6 +390,19 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                             "ap" => {
                                 app.pending_y = None;
                                 yank_paragraph(app, cfg, true);
+                                return;
+                            }
+                            // `yie` / `yae` — whole body (vim-textobj-entire
+                            // convention: "inner / around entire"). `yae`
+                            // adds a trailing newline like `yap`.
+                            "ie" => {
+                                app.pending_y = None;
+                                yank_body(app, cfg, false);
+                                return;
+                            }
+                            "ae" => {
+                                app.pending_y = None;
+                                yank_body(app, cfg, true);
                                 return;
                             }
                             // Still a valid prefix — keep collecting.
@@ -410,6 +435,30 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                     app.inbox_mut().move_reader_cursor_to_line_end();
                 }
                 KeyCode::Char('G') => app.inbox_mut().move_reader_cursor_to_bottom(),
+                KeyCode::Char('w') => {
+                    app.inbox_mut()
+                        .reader_word(crate::ui::words::WordMotion::Forward, false);
+                }
+                KeyCode::Char('b') => {
+                    app.inbox_mut()
+                        .reader_word(crate::ui::words::WordMotion::Back, false);
+                }
+                KeyCode::Char('e') => {
+                    app.inbox_mut()
+                        .reader_word(crate::ui::words::WordMotion::End, false);
+                }
+                KeyCode::Char('W') => {
+                    app.inbox_mut()
+                        .reader_word(crate::ui::words::WordMotion::Forward, true);
+                }
+                KeyCode::Char('B') => {
+                    app.inbox_mut()
+                        .reader_word(crate::ui::words::WordMotion::Back, true);
+                }
+                KeyCode::Char('E') => {
+                    app.inbox_mut()
+                        .reader_word(crate::ui::words::WordMotion::End, true);
+                }
                 KeyCode::Char('f') => {
                     app.link_pick_buf.clear();
                     app.mode = Mode::LinkPick;
@@ -417,7 +466,7 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                 KeyCode::Char('y') => {
                     app.pending_y = Some(String::new());
                 }
-                KeyCode::Char('Y') => yank_body(app, cfg),
+                KeyCode::Char('Y') => yank_line(app, cfg),
                 KeyCode::Char('v') => {
                     app.enter_visual(crate::ui::app::VisualKind::Char);
                 }
@@ -465,6 +514,19 @@ fn visual(app: &mut App, cfg: &Config, k: KeyEvent) {
     }
     // Compose-specific keys first: mode exit, kind swap, yank. These
     // aren't motions, so they short-circuit `motion::apply`.
+    // Ctrl-V (block) swap/exit. Must precede the plain `Char('v')` arm
+    // below, which doesn't inspect modifiers and would otherwise swallow
+    // it as char-wise.
+    if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('v')) {
+        let cur_kind = app.inbox().visual.as_ref().map(|v| v.kind);
+        if cur_kind == Some(crate::ui::app::VisualKind::Block) {
+            app.exit_visual();
+        } else {
+            app.inbox_mut()
+                .set_visual_kind(crate::ui::app::VisualKind::Block);
+        }
+        return;
+    }
     match k.code {
         KeyCode::Esc => {
             app.exit_visual();
@@ -558,6 +620,7 @@ pub(crate) fn yank_visual(app: &mut App, cfg: &Config) {
     let kind = match sel.kind {
         crate::ui::app::VisualKind::Char => "selection",
         crate::ui::app::VisualKind::Line => "lines",
+        crate::ui::app::VisualKind::Block => "block",
     };
     set_yank_highlight(app, cfg, ranges);
     dispatch_yank(app, cfg, text, format!("yanked {kind}"));
@@ -677,9 +740,12 @@ fn exit_command(app: &mut App) {
     app.inbox_mut().list_visual = None;
 }
 
-/// Yank the entire parsed body. `Y` in Reader pane.
-fn yank_body(app: &mut App, cfg: &Config) {
-    let text = match app.inbox_parsed() {
+/// Yank the entire parsed body. `yie` (inner entire) / `yae` (a entire)
+/// in the Reader pane — `trailing` appends a newline for `yae`, mirroring
+/// `yap`. The whole body is too large to flash meaningfully, so no
+/// highlight is armed.
+fn yank_body(app: &mut App, cfg: &Config, trailing: bool) {
+    let mut text = match app.inbox_parsed() {
         Some(p) => text::extract_body(&p.blocks),
         None => {
             app.status_error = Some("yank: no parsed body".into());
@@ -690,7 +756,31 @@ fn yank_body(app: &mut App, cfg: &Config) {
         app.status_error = Some("yank: empty body".into());
         return;
     }
-    dispatch_yank(app, cfg, text, "yanked body".to_string());
+    if trailing {
+        text.push('\n');
+    }
+    dispatch_yank(app, cfg, text, "yanked entire body".to_string());
+}
+
+/// Yank the current reader line. `Y` / `yy` in the Reader pane, matching
+/// vim's line-wise yank (the line plus its trailing newline). Reads the
+/// per-frame `last_reader_body_line_text` so it lines up exactly with
+/// what's on screen, and flashes the whole row.
+fn yank_line(app: &mut App, cfg: &Config) {
+    let inbox = app.inbox();
+    let cursor = inbox.reader_cursor_line as usize;
+    let Some(line) = inbox.last_reader_body_line_text.get(cursor).cloned() else {
+        app.status_error = Some("yank: no line at cursor".into());
+        return;
+    };
+    let width = crate::ui::reader::cells(&line);
+    let ranges = if width > 0 {
+        vec![(cursor as u16, 0, width)]
+    } else {
+        Vec::new()
+    };
+    set_yank_highlight(app, cfg, ranges);
+    dispatch_yank(app, cfg, format!("{line}\n"), "yanked line".to_string());
 }
 
 /// Yank the top-level block at the reader cursor: `yip` (inner

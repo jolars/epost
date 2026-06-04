@@ -19,3 +19,4 @@ pub mod style;
 pub mod tabs;
 pub mod text_input;
 pub mod tty;
+pub mod words;
