@@ -255,10 +255,13 @@ pub struct App {
     /// next key decides what it composes — today only `/` for global
     /// search, future room for `gg`/`G` etc.
     pub pending_g: bool,
-    /// Pending `y` prefix in Normal mode (Reader focus only). Mirrors
-    /// `pending_g`: `y` arms it; the next key decides — `p` for paragraph,
-    /// `l` for link. Any other key clears it and falls through.
-    pub pending_y: bool,
+    /// Pending `y` sequence in Normal mode (Reader focus only). `None`
+    /// when idle; `y` arms it with an empty buffer and each subsequent key
+    /// is pushed on. Recognised sequences: `yl` (link), `yip` (inner
+    /// paragraph), `yap` (a paragraph — block + trailing newline). `yi` /
+    /// `ya` are kept as live prefixes; anything else clears the buffer and
+    /// falls through to the rest of the Reader keymap.
+    pub pending_y: Option<String>,
     /// Transient status / error displayed in the cmdline row. Cleared
     /// when the user enters a new command or moves selection.
     pub status_error: Option<String>,
@@ -600,7 +603,7 @@ impl App {
             link_pick_buf: String::new(),
             attachment_pick_buf: String::new(),
             pending_g: false,
-            pending_y: false,
+            pending_y: None,
             status_error: watcher_warning,
             quit: false,
             screens: vec![Screen::Inbox(inbox)],
@@ -667,6 +670,14 @@ impl App {
     /// Borrow the currently-active compose screen, if any.
     pub fn active_compose_mut(&mut self) -> Option<&mut ComposeScreen> {
         match self.screens.get_mut(self.active)? {
+            Screen::Compose(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Read-only borrow of the currently-active compose screen, if any.
+    pub fn active_compose(&self) -> Option<&ComposeScreen> {
+        match self.screens.get(self.active)? {
             Screen::Compose(s) => Some(s),
             _ => None,
         }

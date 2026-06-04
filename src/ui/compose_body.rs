@@ -15,6 +15,8 @@
 //! Out of scope (deferred): text objects, counts, registers, macros,
 //! search, ex-commands beyond what the host cmdline already provides.
 
+use std::time::{Duration, Instant};
+
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
@@ -52,6 +54,20 @@ struct Yank {
     line_wise: bool,
 }
 
+/// Transient "highlight on yank" flash for the body editor. Mirrors the
+/// reader's `YankHighlight`: `yy` / visual-mode `y` stash the yanked
+/// region's cell ranges plus the arm time, the compose draw paints a
+/// yellow-on-black flash over them, and the host loop clears it once the
+/// configured `[reader].yank_highlight_ms` window elapses. Ranges are
+/// `(row, col_start, col_end_excl)` in textarea char coords — the painter
+/// maps them straight onto the body pane the same way the cursor does
+/// (no scroll subtraction; bodies that fit the pane are the common case).
+#[derive(Debug, Clone)]
+pub struct BodyYankHighlight {
+    pub ranges: Vec<(u16, u16, u16)>,
+    pub armed_at: Instant,
+}
+
 pub enum KeyOutcome {
     Consumed,
     PassThrough,
@@ -76,6 +92,9 @@ pub struct BodyEditor {
     visual_anchor: (usize, usize),
     pending: Pending,
     yank: Option<Yank>,
+    /// Active yank-highlight flash, if any. Painted by `compose::draw`
+    /// and expired by the host loop via [`Self::expire_yank_highlight`].
+    pub yank_highlight: Option<BodyYankHighlight>,
 }
 
 impl BodyEditor {
@@ -97,6 +116,7 @@ impl BodyEditor {
             visual_anchor: (0, 0),
             pending: Pending::None,
             yank: None,
+            yank_highlight: None,
         }
     }
 
@@ -110,6 +130,7 @@ impl BodyEditor {
         self.textarea.cancel_selection();
         self.mode = BodyMode::Normal;
         self.pending = Pending::None;
+        self.yank_highlight = None;
     }
 
     /// Data-space cursor (row, col into the textarea's line vector).
@@ -563,6 +584,8 @@ impl BodyEditor {
             text: format!("{line}\n"),
             line_wise: true,
         });
+        let ranges = self.line_ranges(row, row);
+        self.arm_yank_highlight(ranges);
     }
 
     fn yank_selection(&mut self, kind: VisualKind) {
@@ -587,6 +610,81 @@ impl BodyEditor {
             text,
             line_wise: matches!(kind, VisualKind::Line),
         });
+        let ranges = match kind {
+            VisualKind::Char => self.char_ranges(sr, sc, er, ec),
+            VisualKind::Line => self.line_ranges(sr, er),
+        };
+        self.arm_yank_highlight(ranges);
+    }
+
+    /// Cell ranges (`(row, col_start, col_end_excl)`, char coords) for a
+    /// char-wise selection from `(sr, sc)` to `(er, ec)` exclusive. First
+    /// line runs from `sc`, last line to `ec`, interior lines span their
+    /// full width.
+    fn char_ranges(&self, sr: usize, sc: usize, er: usize, ec: usize) -> Vec<(u16, u16, u16)> {
+        let lines = self.textarea.lines();
+        let mut out = Vec::new();
+        for row in sr..=er {
+            let Some(line) = lines.get(row) else { continue };
+            let w = line.chars().count() as u16;
+            let start = if row == sr { sc as u16 } else { 0 };
+            let end = if row == er { ec as u16 } else { w };
+            let end = end.min(w);
+            if end > start {
+                out.push((row as u16, start, end));
+            }
+        }
+        out
+    }
+
+    /// Cell ranges for a line-wise selection over rows `sr..=er`. Each row
+    /// spans its full width, floored at one cell so an empty line still
+    /// shows a flash.
+    fn line_ranges(&self, sr: usize, er: usize) -> Vec<(u16, u16, u16)> {
+        let lines = self.textarea.lines();
+        (sr..=er)
+            .filter_map(|row| {
+                lines
+                    .get(row)
+                    .map(|l| (row as u16, 0u16, (l.chars().count() as u16).max(1)))
+            })
+            .collect()
+    }
+
+    /// Arm a transient yank-highlight flash over `ranges`. Empty ranges
+    /// clear any existing flash instead of arming an invisible one.
+    fn arm_yank_highlight(&mut self, ranges: Vec<(u16, u16, u16)>) {
+        if ranges.is_empty() {
+            self.yank_highlight = None;
+            return;
+        }
+        self.yank_highlight = Some(BodyYankHighlight {
+            ranges,
+            armed_at: Instant::now(),
+        });
+    }
+
+    /// Clear the yank highlight once `ms` has elapsed since it was armed
+    /// (or immediately when `ms == 0`, the disable switch). Called from
+    /// the host loop's tick.
+    pub fn expire_yank_highlight(&mut self, ms: u16) {
+        if let Some(hl) = self.yank_highlight.as_ref()
+            && (ms == 0 || hl.armed_at.elapsed() >= Duration::from_millis(ms as u64))
+        {
+            self.yank_highlight = None;
+        }
+    }
+
+    /// Time left before the yank-highlight flash should clear, or `None`
+    /// when no flash is armed (or highlighting is disabled). Floored at
+    /// 1 ms so a just-expired flash still wakes the loop to clear it.
+    pub fn yank_highlight_deadline(&self, ms: u16) -> Option<Duration> {
+        if ms == 0 {
+            return None;
+        }
+        let hl = self.yank_highlight.as_ref()?;
+        let remaining = Duration::from_millis(ms as u64).saturating_sub(hl.armed_at.elapsed());
+        Some(remaining.max(Duration::from_millis(1)))
     }
 
     fn cut_selection(&mut self, kind: VisualKind) {
@@ -829,6 +927,43 @@ mod tests {
         let mut ed = BodyEditor::new("alpha\nbeta");
         feed(&mut ed, &[k('y'), k('y'), k('p')]);
         assert_eq!(ed.text(), "alpha\nalpha\nbeta");
+    }
+
+    #[test]
+    fn yy_arms_yank_highlight_over_the_line() {
+        let mut ed = BodyEditor::new("alpha\nbeta");
+        feed(&mut ed, &[k('y'), k('y')]);
+        let hl = ed.yank_highlight.as_ref().expect("highlight armed");
+        // Row 0, full width of "alpha" (5 cells), starting at col 0.
+        assert_eq!(hl.ranges, vec![(0, 0, 5)]);
+    }
+
+    #[test]
+    fn visual_char_yank_arms_highlight_matching_selection() {
+        let mut ed = BodyEditor::new("hello world");
+        feed(&mut ed, &[k('v'), k('e'), k('y')]);
+        let hl = ed.yank_highlight.as_ref().expect("highlight armed");
+        // "hello" is cols 0..5 on row 0 (cursor cell included via the
+        // Forward step in yank_selection).
+        assert_eq!(hl.ranges, vec![(0, 0, 5)]);
+    }
+
+    #[test]
+    fn expire_yank_highlight_clears_immediately_when_disabled() {
+        let mut ed = BodyEditor::new("alpha");
+        feed(&mut ed, &[k('y'), k('y')]);
+        assert!(ed.yank_highlight.is_some());
+        ed.expire_yank_highlight(0);
+        assert!(ed.yank_highlight.is_none());
+    }
+
+    #[test]
+    fn yank_highlight_deadline_none_when_disabled_or_idle() {
+        let mut ed = BodyEditor::new("alpha");
+        assert!(ed.yank_highlight_deadline(150).is_none());
+        feed(&mut ed, &[k('y'), k('y')]);
+        assert!(ed.yank_highlight_deadline(150).is_some());
+        assert!(ed.yank_highlight_deadline(0).is_none());
     }
 
     #[test]

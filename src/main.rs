@@ -119,7 +119,7 @@ fn run(
         // While a yank-highlight is active, tighten the deadline so the
         // expiry sweep in `tick` fires within the configured window
         // (default 150 ms) instead of waiting for the 250 ms idle tick.
-        let timeout = next_deadline(&app).unwrap_or(IDLE_TICK);
+        let timeout = next_deadline(&app, cfg).unwrap_or(IDLE_TICK);
         match event_rx.recv_timeout(timeout) {
             Ok(ev) => process_event(&mut app, cfg, ev),
             Err(RecvTimeoutError::Timeout) => {}
@@ -166,22 +166,30 @@ fn yank_highlight_deadline(app: &App) -> Option<Duration> {
     Some(remaining.max(Duration::from_millis(1)))
 }
 
-/// Earliest deadline the main loop has to honour: the shorter of the
-/// yank-highlight expiry and the address-completion debounce. `None`
-/// when neither is armed — caller falls back to `IDLE_TICK`. Both
-/// individual sources are independently clamped to a 1ms floor so a
-/// just-expired deadline still wakes the loop instead of spinning.
-fn next_deadline(app: &App) -> Option<Duration> {
+/// Time until the active compose tab's body yank-highlight expires, or
+/// `None` when none is armed. Reuses `[reader].yank_highlight_ms` as the
+/// shared flash duration; clamped to `IDLE_TICK` like the reader's.
+fn compose_yank_highlight_deadline(app: &App, cfg: &Config) -> Option<Duration> {
+    let remaining = app
+        .active_compose()?
+        .body
+        .yank_highlight_deadline(cfg.reader.yank_highlight_ms)?;
+    Some(remaining.min(IDLE_TICK).max(Duration::from_millis(1)))
+}
+
+/// Earliest deadline the main loop has to honour: the shortest of the
+/// reader yank-highlight expiry, the compose body yank-highlight expiry,
+/// and the address-completion debounce. `None` when none is armed — caller
+/// falls back to `IDLE_TICK`. Each source is independently clamped to a
+/// 1ms floor so a just-expired deadline still wakes the loop instead of
+/// spinning.
+fn next_deadline(app: &App, cfg: &Config) -> Option<Duration> {
     let yh = yank_highlight_deadline(app);
+    let cyh = compose_yank_highlight_deadline(app, cfg);
     let ab = app
         .address_debounce_remaining()
         .map(|d| d.min(IDLE_TICK).max(Duration::from_millis(1)));
-    match (yh, ab) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    [yh, cyh, ab].into_iter().flatten().min()
 }
 
 fn process_event(app: &mut App, cfg: &Config, ev: AppEvent) {
@@ -210,6 +218,9 @@ fn tick(
     app.poll_clipboard();
     app.poll_address_book(cfg);
     expire_yank_highlight(app);
+    if let Some(c) = app.active_compose_mut() {
+        c.body.expire_yank_highlight(cfg.reader.yank_highlight_ms);
+    }
     app.ensure_body_for_selection();
 
     finalize_finished_editors(app);

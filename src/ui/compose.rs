@@ -833,6 +833,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         // will see a brief cursor-position drift until the next motion;
         // acceptable v1 trade-off vs poking at tui-textarea internals.
         f.render_widget(&screen.body.textarea, body_inner);
+        paint_body_yank_highlight(f.buffer_mut(), body_inner, &screen.body);
         let (cursor_row, col) = screen.body.textarea.cursor();
         let line_count = screen.body.textarea.lines().len();
         pane_scrollbar(f, body_area, cursor_row, line_count, body_focused);
@@ -1026,6 +1027,40 @@ fn draw_from_picker(f: &mut Frame, from_row: Rect, picker: &FromPicker, bounds: 
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Paint the body editor's transient yank-highlight flash: a
+/// yellow-on-black background over the yanked cells, drawn on top of the
+/// rendered textarea. Coordinates are textarea char `(row, col)` mapped
+/// straight onto `body_inner` (no scroll subtraction — same simplifying
+/// assumption the cursor placement makes). A background color rather than
+/// REVERSED so it reads as feedback even right after a visual selection.
+/// The host loop clears the highlight once `[reader].yank_highlight_ms`
+/// elapses, so a present highlight here is always within its window.
+fn paint_body_yank_highlight(buf: &mut ratatui::buffer::Buffer, inner: Rect, body: &BodyEditor) {
+    let Some(hl) = body.yank_highlight.as_ref() else {
+        return;
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    for (row, c_start, c_end_excl) in &hl.ranges {
+        if *row >= inner.height {
+            continue;
+        }
+        let y = inner.y + row;
+        let x_start = inner.x.saturating_add(*c_start).min(inner.x + inner.width);
+        let x_end = inner
+            .x
+            .saturating_add(*c_end_excl)
+            .min(inner.x + inner.width);
+        for x in x_start..x_end {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                let style = cell.style().bg(Color::Yellow).fg(Color::Black);
+                cell.set_style(style);
+            }
+        }
+    }
 }
 
 fn render_field(f: &mut Frame, area: Rect, label: &str, input: &TextInput, focused: bool) {

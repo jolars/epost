@@ -13,11 +13,14 @@ use crate::ui::app::{InboxScreen, Mode, Pane, ParsedBody, ScanState, VisualKind,
 use crate::ui::images::ImageKey;
 use crate::ui::style::{pane_block, pane_scrollbar};
 
-/// Brief "highlight on yank" state. After `yp` / `yl` / a visual-mode `y`
+/// Brief "highlight on yank" state. After `yip` / `yap` / `yl` / a visual-mode `y`
 /// fires, the yanked region's body-relative cell ranges are stashed here
 /// alongside an `Instant` deadline; the next `tick` re-runs layout, paints
-/// `Modifier::REVERSED` over the covered cells, and clears the highlight
-/// once `expires_at` is past. Mirrors vim's `vim-highlightedyank`.
+/// a yellow-on-black flash over the covered cells, and clears the highlight
+/// once `expires_at` is past. Mirrors vim's `vim-highlightedyank`. The flash
+/// is deliberately a background color, *not* `Modifier::REVERSED` — a visual
+/// selection already renders REVERSED, so reusing it would give no feedback
+/// when yanking straight out of visual mode.
 ///
 /// Ranges are body-relative (`line_text` row, char cols) so a scroll
 /// after the yank still lands the flash in the right place — the painter
@@ -762,12 +765,14 @@ fn paint_cursor_cell(
     }
 }
 
-/// Paint a transient yank highlight by flipping `Modifier::REVERSED`
-/// on every cell covered by `ranges`. Same coordinate convention as
+/// Paint a transient yank highlight as a yellow-on-black flash over
+/// every cell covered by `ranges`. Same coordinate convention as
 /// `paint_selection`: ranges are body-relative `(line, col_start,
 /// col_end_excl)`, translated to absolute rows via `header_offset` +
 /// `scroll`. No cursor cell — the highlight is purely the yanked
-/// region, no extending end-point to advertise.
+/// region, no extending end-point to advertise. A background color
+/// (not `Modifier::REVERSED`) so the flash reads as feedback even when
+/// the yank came straight out of a REVERSED visual selection.
 fn paint_yank_highlight(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -793,8 +798,7 @@ fn paint_yank_highlight(
             .min(inner.x + inner.width);
         for x in x_start..x_end {
             if let Some(cell) = buf.cell_mut((x, row)) {
-                let mut style = cell.style();
-                style = style.add_modifier(Modifier::REVERSED);
+                let style = cell.style().bg(Color::Yellow).fg(Color::Black);
                 cell.set_style(style);
             }
         }

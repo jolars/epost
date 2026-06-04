@@ -101,12 +101,13 @@ pub struct Reader {
     /// is no useful default.
     #[serde(default)]
     pub drag: Option<Vec<String>>,
-    /// Milliseconds to flash the yanked region after `yp` / `yl` / a
-    /// visual-mode `y`. Mirrors vim's `vim-highlightedyank` plugin —
-    /// since the cmdline status row is easy to miss, the brief REVERSED
-    /// flash confirms both that the yank fired and what was copied (the
-    /// latter matters because `yp` infers the paragraph from cursor
-    /// position). `0` disables the flash.
+    /// Milliseconds to flash the yanked region after a reader yank
+    /// (`yip` / `yap` / `yl` / visual-mode `y`) or a compose body yank
+    /// (`yy` / visual-mode `y`). Mirrors vim's `vim-highlightedyank`
+    /// plugin — since the cmdline status row is easy to miss, the brief
+    /// yellow-on-black flash confirms both that the yank fired and what
+    /// was copied (the latter matters because `yip`/`yap` infer the
+    /// paragraph from cursor position). `0` disables the flash.
     #[serde(default = "default_yank_highlight_ms")]
     pub yank_highlight_ms: u16,
 }

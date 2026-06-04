@@ -349,24 +349,50 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             _ => {}
         },
         Pane::Reader => {
-            // `y` prefix in Reader: `yp` yank-paragraph, `yl` yank-link.
-            // Mirrors `pending_g` — armed on `y`, cleared on the next
-            // key. Anything we don't recognise clears the prefix and
-            // falls through to the rest of the Reader keymap so e.g.
-            // `y` then `j` still scrolls.
-            if app.pending_y {
-                app.pending_y = false;
+            // `y` sequence in Reader: `yl` yank-link, `yip` yank inner
+            // paragraph, `yap` yank a paragraph (block + trailing
+            // newline). Armed on `y` with an empty buffer; each key is
+            // appended and matched. `yi` / `ya` stay live as prefixes;
+            // anything unrecognised clears the buffer and falls through to
+            // the rest of the Reader keymap so e.g. `y` then `j` scrolls.
+            if let Some(buf) = app.pending_y.clone() {
                 match k.code {
-                    KeyCode::Char('p') => {
-                        yank_paragraph(app, cfg);
+                    KeyCode::Esc => {
+                        app.pending_y = None;
                         return;
                     }
-                    KeyCode::Char('l') => {
-                        yank_link(app, cfg);
-                        return;
+                    KeyCode::Char(c) => {
+                        let mut seq = buf;
+                        seq.push(c);
+                        match seq.as_str() {
+                            "l" => {
+                                app.pending_y = None;
+                                yank_link(app, cfg);
+                                return;
+                            }
+                            "ip" => {
+                                app.pending_y = None;
+                                yank_paragraph(app, cfg, false);
+                                return;
+                            }
+                            "ap" => {
+                                app.pending_y = None;
+                                yank_paragraph(app, cfg, true);
+                                return;
+                            }
+                            // Still a valid prefix — keep collecting.
+                            "i" | "a" => {
+                                app.pending_y = Some(seq);
+                                return;
+                            }
+                            // Dead end — drop the sequence and let the key
+                            // fall through to the normal Reader keymap.
+                            _ => app.pending_y = None,
+                        }
                     }
-                    KeyCode::Esc => return,
-                    _ => { /* fall through */ }
+                    // Non-char key (arrows, etc.): abandon the sequence and
+                    // fall through.
+                    _ => app.pending_y = None,
                 }
             }
             match k.code {
@@ -389,7 +415,7 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                     app.mode = Mode::LinkPick;
                 }
                 KeyCode::Char('y') => {
-                    app.pending_y = true;
+                    app.pending_y = Some(String::new());
                 }
                 KeyCode::Char('Y') => yank_body(app, cfg),
                 KeyCode::Char('v') => {
@@ -667,15 +693,17 @@ fn yank_body(app: &mut App, cfg: &Config) {
     dispatch_yank(app, cfg, text, "yanked body".to_string());
 }
 
-/// Yank the top-level block at the reader cursor. `yp` in Reader pane.
-/// Cursor lives in body-relative coords (clamped into viewport each
-/// draw), so this effectively yanks the topmost visible block until
-/// visual mode introduces independent cursor movement.
-fn yank_paragraph(app: &mut App, cfg: &Config) {
+/// Yank the top-level block at the reader cursor: `yip` (inner
+/// paragraph) when `a_paragraph` is false, `yap` (a paragraph) when
+/// true. Both yank the same block; `yap` appends a trailing newline so
+/// pasting separates it from following text, matching vim's `ap`/`ip`
+/// distinction. The cursor lives in body-relative coords, so this acts
+/// on whichever top-level block the reader cursor sits in.
+fn yank_paragraph(app: &mut App, cfg: &Config, a_paragraph: bool) {
     let inbox = app.inbox();
     let width = inbox.last_reader_inner_width.max(8);
     let cursor = inbox.reader_cursor_line;
-    let (text, ranges) = match app.inbox_parsed() {
+    let (mut text, ranges) = match app.inbox_parsed() {
         Some(p) if !p.blocks.is_empty() => {
             let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
             match laid.block_at(cursor) {
@@ -685,16 +713,22 @@ fn yank_paragraph(app: &mut App, cfg: &Config) {
         }
         Some(_) => (String::new(), Vec::new()),
         None => {
-            app.status_error = Some("yp: no parsed body".into());
+            app.status_error = Some("yank: no parsed body".into());
             return;
         }
     };
     if text.is_empty() {
-        app.status_error = Some("yp: no paragraph at cursor".into());
+        app.status_error = Some("yank: no paragraph at cursor".into());
         return;
     }
+    let label = if a_paragraph {
+        text.push('\n');
+        "yanked a paragraph"
+    } else {
+        "yanked paragraph"
+    };
     set_yank_highlight(app, cfg, ranges);
-    dispatch_yank(app, cfg, text, "yanked paragraph".to_string());
+    dispatch_yank(app, cfg, text, label.to_string());
 }
 
 /// Yank the URL of the first link at or after the reader cursor. `yl`
