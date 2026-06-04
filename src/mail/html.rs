@@ -161,6 +161,18 @@ fn walk_block_element(tag: &str, node: &Handle, out: &mut Vec<Block>) {
                 out.push(Block::Image { cid, src, alt });
                 return;
             }
+            // Generic containers (notably Outlook/Word's nested <div>
+            // wrappers) frequently hold block-level children — other
+            // divs, <p>, lists. `collect_inline` refuses to descend past
+            // a block child, so collecting these as a single paragraph
+            // silently drops the entire subtree. Recurse with walk_blocks
+            // when there's a block child so the structure is preserved;
+            // <p> never legally contains blocks (html5ever closes it
+            // first), so it always takes the inline path.
+            if tag != "p" && has_block_child(node) {
+                walk_blocks(node, out);
+                return;
+            }
             let runs = collect_inline(node);
             if !runs.is_empty() {
                 out.push(Block::Paragraph(runs));
@@ -207,6 +219,13 @@ fn walk_block_element(tag: &str, node: &Handle, out: &mut Vec<Block>) {
             walk_blocks(node, out);
         }
     }
+}
+
+fn has_block_child(node: &Handle) -> bool {
+    node.children
+        .borrow()
+        .iter()
+        .any(|c| matches!(&c.data, NodeData::Element { name, .. } if is_block(name.local.as_ref())))
 }
 
 fn walk_inline(node: &Handle, buf: &mut Vec<Inline>, parent_style: InlineStyle) {
@@ -275,7 +294,21 @@ fn walk_inline_child(node: &Handle, buf: &mut Vec<Inline>, style: InlineStyle) {
         }
         NodeData::Element { name, .. } => {
             let tag = name.local.as_ref();
-            if is_dropped(tag) || is_block(tag) {
+            if is_dropped(tag) {
+                return;
+            }
+            if is_block(tag) {
+                // Block element reached in an inline-only context — e.g.
+                // a <div> inside a table cell (Outlook wraps cell text in
+                // divs). The cell IR holds only inline runs, so flatten
+                // the block's content into the run rather than dropping
+                // it. A leading break keeps adjacent blocks from fusing.
+                if !buf.is_empty() {
+                    buf.push(Inline::LineBreak);
+                }
+                for c in node.children.borrow().iter() {
+                    walk_inline_child(c, buf, style);
+                }
                 return;
             }
             walk_inline(node, buf, style);
@@ -730,6 +763,46 @@ mod tests {
             "expected Block::Image, got {:?}",
             blocks[0]
         );
+    }
+
+    #[test]
+    fn div_wrapping_block_children_is_not_dropped() {
+        // Outlook/Word nests content in container <div>s whose only
+        // children are more blocks. collect_inline bails on block
+        // children, so before the fix the whole subtree vanished.
+        let blocks = parse(r#"<div><div><p>Dear Johan</p><p>second</p></div></div>"#);
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph(vec![text("Dear Johan")]),
+                Block::Paragraph(vec![text("second")]),
+            ],
+            "expected both paragraphs, got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn div_with_mixed_inline_and_block_keeps_both() {
+        let blocks = parse(r#"<div>intro text<p>para</p></div>"#);
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph(vec![text("intro text")]),
+                Block::Paragraph(vec![text("para")]),
+            ],
+            "got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn table_cell_with_div_content_renders_text() {
+        // The Outlook "external sender" banner wraps cell text in a
+        // <div>; the inline-only cell path dropped it, leaving | | .
+        let blocks = parse(r#"<table><tr><td><div>cell text</div></td></tr></table>"#);
+        let Block::Table { rows } = &blocks[0] else {
+            panic!("expected table, got {blocks:?}");
+        };
+        assert_eq!(rows[0][0], vec![text("cell text")]);
     }
 
     #[test]

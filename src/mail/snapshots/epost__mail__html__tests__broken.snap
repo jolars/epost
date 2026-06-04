@@ -6,9 +6,55 @@ expression: blocks
     level: 1
     text:
       - Text:
-          content: Broken markup
+          content: "Broken markup "
           style:
             bold: false
             italic: false
+            underline: false
+            code: false
+      - LineBreak
+      - Text:
+          content: "This paragraph starts but never closes. "
+          style:
+            bold: false
+            italic: false
+            underline: false
+            code: false
+      - Text:
+          content: "Bold opens here "
+          style:
+            bold: true
+            italic: false
+            underline: false
+            code: false
+      - LineBreak
+      - Text:
+          content: "And here's another paragraph started mid-"
+          style:
+            bold: true
+            italic: false
+            underline: false
+            code: false
+      - Text:
+          content: "italic without close. "
+          style:
+            bold: true
+            italic: true
+            underline: false
+            code: false
+      - LineBreak
+      - Text:
+          content: "list item one list item two "
+          style:
+            bold: true
+            italic: true
+            underline: false
+            code: false
+      - LineBreak
+      - Text:
+          content: "End of fixture (note: html5ever will fix up the missing closes)."
+          style:
+            bold: true
+            italic: true
             underline: false
             code: false
