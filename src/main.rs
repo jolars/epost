@@ -23,6 +23,27 @@ use crate::ui::embed::EditorSession;
 use crate::ui::events::{self, AppEvent};
 use crate::ui::tty;
 
+/// Initialise file-based logging when `$EPOST_LOG` names a path. The
+/// TUI owns stdout/stderr, so logs must go to a file — never the
+/// terminal. Filtering follows `$RUST_LOG` (default `epost=debug`), so
+/// `EPOST_LOG=/tmp/epost.log task run` captures the watcher trace and
+/// `RUST_LOG=epost=trace EPOST_LOG=… ` widens it. No-op when `$EPOST_LOG`
+/// is unset, so normal runs pay nothing.
+fn init_logging() {
+    use std::fs::OpenOptions;
+    let Some(path) = std::env::var_os("EPOST_LOG") else {
+        return;
+    };
+    let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let env = env_logger::Env::default().default_filter_or("epost=debug");
+    let _ = env_logger::Builder::from_env(env)
+        .target(env_logger::Target::Pipe(Box::new(file)))
+        .try_init();
+    log::info!("epost starting — logging enabled");
+}
+
 /// Soft tick used as a heartbeat when the scan worker is still
 /// running — once a worker exists we'll have completion-driven wakes
 /// too, but the initial scan from Step 2 doesn't push to the event
@@ -45,6 +66,7 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    init_logging();
     let path = args.config.unwrap_or_else(config::default_path);
 
     let cfg = match config::load(&path) {

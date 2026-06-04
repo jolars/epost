@@ -124,6 +124,24 @@ struct DirtyState {
     last_event_at: Option<Instant>,
 }
 
+/// Normalise a path so lookup keys and event-parent lookups share one
+/// form. `notify`'s inotify backend reports event paths as the watch
+/// path *as registered* joined with the changed filename, applying only
+/// minimal normalisation: a watch registered on a **relative** path is
+/// reported back with the process CWD prepended (and `.`/`..` left
+/// intact), so the event parent (`/cwd/./dev/…/new`) never equals the
+/// verbatim relative string we stored as the key (`./dev/…/new`) and
+/// every external event is silently dropped — no live updates. We saw
+/// exactly this under the dev config's relative `maildir` paths.
+/// Canonicalising both the stored keys and the event parents to the
+/// same real, absolute, symlink-resolved form makes the lookup hit
+/// regardless of how the path was spelled (relative, `.`/`..`, or a
+/// symlinked maildir). Falls back to the input on error (e.g. a
+/// transient permission issue) so we degrade rather than panic.
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 type LookupMap = HashMap<PathBuf, FolderKey>;
 
 /// Map from a watched directory (account root, or — under verbatim — a
@@ -198,6 +216,11 @@ pub fn start(
     let watcher_arc = Arc::new(Mutex::new(watcher));
 
     register_initial(&watcher_arc, &lookup, &discovery_roots, accounts)?;
+    log::info!(
+        "watch: started — {} accounts, {} folder dirs watched",
+        accounts.len(),
+        lookup.lock().expect("lookup poisoned").len()
+    );
 
     let dt_inner = watcher_arc.clone();
     let dt_lookup = lookup.clone();
@@ -245,13 +268,24 @@ fn register_initial(
     let mut dr = discovery_roots.lock().expect("discovery_roots poisoned");
     for spec in accounts {
         if !spec.root.is_dir() {
+            log::warn!(
+                "watch: account {:?} root {} is not a dir — skipping (no live updates for it)",
+                spec.name,
+                spec.root.display()
+            );
             continue;
         }
         // Account root, non-recursive: catches new top-level sub-folder
         // creation (both `.Sub` under maildir++ and `Sub/` under verbatim).
-        w.watch(&spec.root, RecursiveMode::NonRecursive)
-            .with_context(|| format!("watching maildir root {}", spec.root.display()))?;
-        dr.insert(spec.root.clone(), spec.name.clone());
+        let root = canonical(&spec.root);
+        w.watch(&root, RecursiveMode::NonRecursive)
+            .with_context(|| format!("watching maildir root {}", root.display()))?;
+        log::debug!(
+            "watch: account {:?} root watched: {}",
+            spec.name,
+            root.display()
+        );
+        dr.insert(root, spec.name.clone());
 
         // Watch every binding's `{cur,new}`. The INBOX binding
         // (`folders[0]`) and every role/extra after it share the
@@ -289,16 +323,30 @@ fn install_folder_watches(
     layout: Layout,
 ) {
     for sd in ["cur", "new"] {
-        let dir = folder_root.join(sd);
-        if dir.is_dir() && w.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
-            lk.insert(dir, (account.to_string(), label.to_string()));
+        let dir = canonical(&folder_root.join(sd));
+        if !dir.is_dir() {
+            log::debug!(
+                "watch: {account}/{label}: {} absent — not watched",
+                dir.display()
+            );
+            continue;
+        }
+        match w.watch(&dir, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                log::debug!("watch: {account}/{label}: watching {}", dir.display());
+                lk.insert(dir, (account.to_string(), label.to_string()));
+            }
+            Err(e) => log::warn!(
+                "watch: {account}/{label}: failed to watch {}: {e}",
+                dir.display()
+            ),
         }
     }
-    if matches!(layout, Layout::Verbatim)
-        && folder_root.is_dir()
-        && w.watch(folder_root, RecursiveMode::NonRecursive).is_ok()
-    {
-        dr.insert(folder_root.to_path_buf(), account.to_string());
+    if matches!(layout, Layout::Verbatim) {
+        let root = canonical(folder_root);
+        if root.is_dir() && w.watch(&root, RecursiveMode::NonRecursive).is_ok() {
+            dr.insert(root, account.to_string());
+        }
     }
 }
 
@@ -309,14 +357,17 @@ fn handle_event(
     self_writes: &SelfWrites,
 ) {
     if !is_event_interesting(&ev.kind) {
+        log::trace!("watch: ignoring event kind {:?} {:?}", ev.kind, ev.paths);
         return;
     }
+    log::debug!("watch: event {:?} paths={:?}", ev.kind, ev.paths);
 
     let mut to_mark: Vec<FolderKey> = Vec::new();
 
     for path in &ev.paths {
         // Suppress our own writes.
         if self_writes.consume(path) {
+            log::debug!("watch: suppressed self-write {}", path.display());
             continue;
         }
 
@@ -326,13 +377,28 @@ fn handle_event(
         // config, new folders only appear when the user adds them
         // to their config.
         if let Some(folder_dir) = path.parent() {
+            // Canonicalise to the same form the lookup keys were stored
+            // in — see `canonical`. Without this, a watch registered on a
+            // relative or symlinked path never matches the event parent.
+            let folder_dir = canonical(folder_dir);
             let hit = lookup
                 .lock()
                 .expect("lookup poisoned")
-                .get(folder_dir)
+                .get(&folder_dir)
                 .cloned();
-            if let Some(key) = hit {
-                to_mark.push(key);
+            match hit {
+                Some(key) => {
+                    log::debug!(
+                        "watch: matched {} -> {:?}, marking dirty",
+                        path.display(),
+                        key
+                    );
+                    to_mark.push(key);
+                }
+                None => log::debug!(
+                    "watch: no lookup entry for parent dir {} (event dropped)",
+                    folder_dir.display()
+                ),
             }
         }
     }
@@ -391,6 +457,7 @@ fn debounce_loop(
             let drained = std::mem::take(&mut g.dirty);
             g.last_event_at = None;
             drop(g);
+            log::debug!("watch: flushing FoldersDirty {drained:?}");
             let _ = out.send(WatcherEvent::FoldersDirty(drained));
             let _ = wake_tx.send(AppEvent::Wake);
             continue;
@@ -455,6 +522,65 @@ fn flush_due(state: &DirtyState, now: Instant, debounce: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_to_end_delivery_fires_folders_dirty() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("gmail");
+        // Inbox lives in a subdir, mirroring the real config where the
+        // maildir root itself is not a maildir.
+        let inbox = root.join("Inbox");
+        for sub in ["cur", "new", "tmp"] {
+            fs::create_dir_all(inbox.join(sub)).unwrap();
+        }
+
+        let mut acc = crate::config::Account {
+            maildir: root.clone(),
+            from: "x".into(),
+            layout: Layout::Verbatim,
+            inbox: None,
+            archive: None,
+            sent: None,
+            spam: None,
+            trash: None,
+            drafts: None,
+            extra_folders: vec![],
+            smtp: None,
+            primary: false,
+        };
+        let _ = &mut acc;
+        let spec = AccountSpec::from_account("gmail", &acc);
+        // Sanity: the INBOX binding must resolve to the Inbox subdir.
+        assert_eq!(spec.folders[0].path, inbox);
+
+        let (wake_tx, _wake_rx) = mpsc::channel();
+        let (_watcher, rx) = start(
+            &[spec],
+            SelfWrites::new(),
+            WatcherConfig {
+                debounce: Duration::from_millis(50),
+            },
+            wake_tx,
+        )
+        .unwrap();
+
+        // Simulate an mbsync delivery: write to tmp/, rename into new/.
+        let tmp_file = inbox.join("tmp").join("1.deliver");
+        fs::write(&tmp_file, b"From: a@b\r\n\r\nhi\r\n").unwrap();
+        fs::rename(&tmp_file, inbox.join("new").join("1.deliver")).unwrap();
+
+        let ev = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("expected FoldersDirty within 3s");
+        let WatcherEvent::FoldersDirty(set) = ev;
+        assert!(
+            set.contains(&("gmail".to_string(), "INBOX".to_string())),
+            "dirty set should contain gmail/INBOX, got {set:?}"
+        );
+    }
 
     #[test]
     fn self_writes_record_then_consume() {
@@ -557,6 +683,56 @@ mod tests {
         assert!(
             !sw.consume(&path),
             "registry entry should already be consumed"
+        );
+    }
+
+    #[test]
+    fn handle_event_matches_non_canonical_event_parent() {
+        // Regression for the live-update bug: lookup keys are stored
+        // canonicalised, but `notify` can report event paths in a
+        // non-canonical form (relative watches come back CWD-prefixed
+        // with `.`/`..` intact). The event parent must be canonicalised
+        // before the lookup or the dirty mark is dropped and the list
+        // never refreshes. Here the key is the real dir; the event path
+        // carries a `/./` segment that must collapse to match.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let cur = tmp.path().join("Inbox").join("cur");
+        fs::create_dir_all(&cur).unwrap();
+
+        let lookup = Arc::new(Mutex::new(HashMap::new()));
+        lookup
+            .lock()
+            .unwrap()
+            .insert(canonical(&cur), ("gmail".into(), "INBOX".into()));
+        let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
+        let sw = SelfWrites::new();
+
+        // Event path with a non-canonical `/./Inbox/./cur/` parent.
+        let noisy = tmp
+            .path()
+            .join(".")
+            .join("Inbox")
+            .join(".")
+            .join("cur")
+            .join("1.M0.h:2,S");
+        let ev = notify::Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![noisy],
+            attrs: Default::default(),
+        };
+        handle_event(ev, &lookup, &state, &sw);
+
+        assert!(
+            state
+                .0
+                .lock()
+                .unwrap()
+                .dirty
+                .contains(&("gmail".to_string(), "INBOX".to_string())),
+            "non-canonical event parent must still match the canonical lookup key"
         );
     }
 

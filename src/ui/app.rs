@@ -1723,13 +1723,22 @@ impl InboxScreen {
             };
             match watch::start(&accounts, self_writes, wcfg, tx) {
                 Ok((w, rx)) => {
+                    log::info!("app: watcher started for {} accounts", accounts.len());
                     watcher = Some(w);
                     watch_rx = Some(rx);
                 }
                 Err(e) => {
+                    log::error!("app: watcher failed to start: {e:#}");
                     watcher_warning = Some(format!("watcher disabled: {e:#}"));
                 }
             }
+        } else {
+            log::warn!(
+                "app: watcher NOT started (watch.enabled={}, accounts={}, event_tx={})",
+                cfg.watch.enabled,
+                accounts.len(),
+                switch_event_tx.is_some()
+            );
         }
 
         Self {
@@ -2859,7 +2868,10 @@ impl InboxScreen {
         if let Some(rx) = self.watch_rx.as_ref() {
             loop {
                 match rx.try_recv() {
-                    Ok(WatcherEvent::FoldersDirty(set)) => self.pending_dirty.extend(set),
+                    Ok(WatcherEvent::FoldersDirty(set)) => {
+                        log::debug!("poll_watch: received FoldersDirty {set:?}");
+                        self.pending_dirty.extend(set);
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         self.watch_rx = None;
@@ -2894,6 +2906,12 @@ impl InboxScreen {
         //    in-flight worker. Coalesce all pending dirt into one call.
         if self.rescan_rx.is_none() && !self.pending_dirty.is_empty() {
             let dirty = std::mem::take(&mut self.pending_dirty);
+            log::debug!(
+                "poll_watch: kicking rescan for {:?} (scope account={:?} folder={:?})",
+                dirty,
+                self.current_account,
+                self.current_folder
+            );
             let accounts: HashMap<String, AccountSpec> = cfg
                 .accounts
                 .iter()
@@ -2928,8 +2946,17 @@ impl InboxScreen {
                 }
         });
         if !view_touched {
+            log::debug!(
+                "apply_rescan: dirty {dirty:?} does not touch current view (account={:?} folder={:?}); list left unchanged",
+                self.current_account,
+                self.current_folder
+            );
             return;
         }
+        log::debug!(
+            "apply_rescan: view touched by {dirty:?}; refreshing list ({} rows)",
+            data.threads.len()
+        );
         let old_ref = self.selected_message_row().map(MsgRef::of);
         self.scan = ScanState::Ready(data.threads);
         self.selected = match (old_ref, &self.scan) {
