@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use anyhow::{Context, Result};
 
@@ -11,6 +11,7 @@ use crate::mail::parse;
 use crate::store::AccountSpec;
 use crate::store::index::{FolderStat, Index, MessageRow};
 use crate::store::thread::{ThreadedRow, build_threads};
+use crate::ui::events::AppEvent;
 
 /// Per-scope folder stats: `scope = None` is the unified "[all]" group;
 /// `Some(name)` is one account. The sidebar renders one group block per
@@ -68,6 +69,53 @@ pub fn start_catchup_worker(
         let _ = tx.send(result);
     });
     rx
+}
+
+/// Outcome of an off-thread folder switch. Carries the `generation` that
+/// requested it so a late result from a switch the user has already cycled
+/// past can be discarded; `result` is the threaded rows for the target
+/// scope or a formatted error string. Unlike [`ScanData`] there are no
+/// folder-stat groups: a scope switch walks nothing on disk, so the
+/// sidebar roll-up is unchanged.
+pub struct SwitchOutcome {
+    pub generation: u64,
+    pub result: std::result::Result<Vec<ThreadedRow>, String>,
+}
+
+/// Load one scope's threaded list off the UI thread. The index read +
+/// JWZ thread build is O(folder) and used to block the event loop inside
+/// `switch_to_scope`; this mirrors the `start_*_worker` shape so the UI
+/// just polls a receiver. On completion the worker also pushes an
+/// `AppEvent::Wake` (when an event channel is plumbed in) so the result
+/// surfaces without waiting for the idle heartbeat.
+pub fn start_switch_worker(
+    account: Option<String>,
+    folder: String,
+    cache_path: PathBuf,
+    generation: u64,
+    event_tx: Option<Sender<AppEvent>>,
+) -> Receiver<SwitchOutcome> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = switch_run(&cache_path, account.as_deref(), &folder);
+        let _ = tx.send(SwitchOutcome { generation, result });
+        if let Some(wake) = event_tx {
+            let _ = wake.send(AppEvent::Wake);
+        }
+    });
+    rx
+}
+
+fn switch_run(
+    cache_path: &Path,
+    account: Option<&str>,
+    folder: &str,
+) -> std::result::Result<Vec<ThreadedRow>, String> {
+    let idx = Index::open(cache_path).map_err(|e| format!("open index: {e:#}"))?;
+    let rows = idx
+        .list_folder(account, folder)
+        .map_err(|e| format!("list {folder}: {e:#}"))?;
+    Ok(build_threads(rows))
 }
 
 fn run_inbox_only(
@@ -447,6 +495,74 @@ mod tests {
             1,
             "Archive must NOT be re-walked"
         );
+    }
+
+    #[test]
+    fn switch_worker_returns_target_scope_threads() {
+        use std::fs;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("idx.sqlite");
+        let root = tmp.path().join("dev");
+        for sub in ["cur", "new", "tmp"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+            fs::create_dir_all(root.join(".Archive").join(sub)).unwrap();
+        }
+        let write_eml = |p: &Path, mid: &str| {
+            let mut f = fs::File::create(p).unwrap();
+            writeln!(f, "Message-ID: <{mid}>").unwrap();
+            writeln!(f, "Date: Thu, 1 Jan 1970 00:00:00 +0000").unwrap();
+            writeln!(f, "From: a@b").unwrap();
+            writeln!(f, "Subject: t").unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "body").unwrap();
+        };
+        write_eml(&root.join("cur").join("1.M0.h:2,S"), "inbox-a");
+        write_eml(
+            &root.join(".Archive").join("cur").join("2.M0.h:2,S"),
+            "arch-a",
+        );
+        write_eml(
+            &root.join(".Archive").join("cur").join("3.M0.h:2,S"),
+            "arch-b",
+        );
+
+        // Seed the index (eager INBOX + catch-up so Archive lands too).
+        let mut accounts: HashMap<String, AccountSpec> = HashMap::new();
+        accounts.insert(
+            "dev".to_string(),
+            AccountSpec::from_account(
+                "dev",
+                &test_account(root.clone(), Layout::Maildirpp, &[("archive", "Archive")]),
+            ),
+        );
+        let specs: Vec<AccountSpec> = accounts.values().cloned().collect();
+        start_inbox_worker(specs.clone(), cache.clone(), (None, "INBOX".to_string()))
+            .recv()
+            .unwrap()
+            .unwrap();
+        start_catchup_worker(specs, cache.clone(), (None, "INBOX".to_string()))
+            .recv()
+            .unwrap()
+            .unwrap();
+
+        // Switch worker reads only the requested scope. The `generation`
+        // it was handed is echoed back verbatim for the apply-step guard.
+        let out = start_switch_worker(Some("dev".into()), "Archive".into(), cache.clone(), 7, None)
+            .recv()
+            .unwrap();
+        assert_eq!(out.generation, 7);
+        let threads = out.result.expect("switch should succeed");
+        assert_eq!(threads.len(), 2, "Archive has two messages");
+
+        // And INBOX returns its single row, unaffected.
+        let out = start_switch_worker(Some("dev".into()), "INBOX".into(), cache, 8, None)
+            .recv()
+            .unwrap();
+        assert_eq!(out.generation, 8);
+        assert_eq!(out.result.unwrap().len(), 1);
     }
 
     /// Look up `total` for a `(scope, folder)` across the grouped sidebar

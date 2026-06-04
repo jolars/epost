@@ -213,6 +213,7 @@ fn tick(
 ) -> Result<()> {
     app.poll_scan(cfg);
     app.poll_watch(cfg);
+    app.poll_switch();
     app.poll_pending_sends();
     app.poll_sync();
     app.poll_clipboard();

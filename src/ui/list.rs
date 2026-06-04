@@ -70,10 +70,19 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen) {
             f.render_widget(widget, area);
         }
         ScanState::Ready(rows) => {
+            // Only the visible window is turned into `ListItem`s. Building one
+            // per folder row every frame (render_row does date formatting,
+            // unicode-width math, truncation, span allocs) was O(folder) per
+            // draw even though ratatui only paints the viewport. We own the
+            // scroll math now (clamp_offset), so the slice is all we render.
+            let height = (area.height.saturating_sub(2) as usize).max(1);
             let row_width = (area.width.saturating_sub(2) as usize)
                 .saturating_sub(disp_w(LIST_HIGHLIGHT_SYMBOL));
             let now = Zoned::now();
-            let items: Vec<ListItem> = rows
+            let selected = selected_in.min(rows.len() - 1);
+            let offset = clamp_offset(initial_offset, selected, height, rows.len());
+            let end = (offset + height).min(rows.len());
+            let items: Vec<ListItem> = rows[offset..end]
                 .iter()
                 .map(|t| ListItem::new(render_row(t, row_width, &now)))
                 .collect();
@@ -89,23 +98,47 @@ pub fn draw(f: &mut Frame, area: Rect, inbox: &mut InboxScreen) {
             } else {
                 Style::default().bg(Color::DarkGray).fg(Color::Gray)
             };
+            // No `.scroll_padding` here: items is already the windowed slice
+            // rendered from the top, so the selection is window-relative and
+            // ratatui must not re-scroll inside it.
             let widget = List::new(items)
                 .block(block)
                 .highlight_style(highlight)
-                .highlight_symbol(LIST_HIGHLIGHT_SYMBOL)
-                .scroll_padding(SCROLL_PADDING);
+                .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
             let mut state = ListState::default();
-            *state.offset_mut() = initial_offset;
-            let selected = selected_in.min(rows.len().saturating_sub(1));
-            state.select(Some(selected));
+            state.select(Some(selected - offset));
             f.render_stateful_widget(widget, area, &mut state);
-            new_offset = state.offset();
+            new_offset = offset;
             pane_scrollbar(f, area, selected, rows.len(), focused);
-            paint_list_visual(f, area, inbox, new_offset, selected, rows.len());
+            paint_list_visual(f, area, inbox, offset, selected, rows.len());
         }
     }
 
     inbox.list_offset = new_offset;
+}
+
+/// Vim `scrolloff`-style offset clamp. Slides `offset` the minimum amount so
+/// the `selected` row keeps at least `SCROLL_PADDING` rows of margin from each
+/// visible edge, then pins it within `0 ..= len - height` so the window never
+/// runs past the end of the list. Replaces ratatui's `List::scroll_padding`,
+/// which we can no longer lean on now that we render only the visible slice
+/// (its math assumes the item vec is the whole folder). Returns `0` for an
+/// empty list or zero-height viewport.
+fn clamp_offset(offset: usize, selected: usize, height: usize, len: usize) -> usize {
+    if height == 0 || len == 0 {
+        return 0;
+    }
+    // Bound the margin so the top and bottom bands can't overlap on a short
+    // viewport (otherwise the two adjustments below fight each other).
+    let pad = SCROLL_PADDING.min(height.saturating_sub(1) / 2);
+    let max_offset = len.saturating_sub(height);
+    let mut offset = offset.min(max_offset);
+    if selected < offset + pad {
+        offset = selected.saturating_sub(pad);
+    } else if selected + pad + 1 > offset + height {
+        offset = (selected + pad + 1).saturating_sub(height);
+    }
+    offset.min(max_offset)
 }
 
 /// Reverse-video band over the rows in the active list-visual selection.
@@ -480,6 +513,45 @@ mod tests {
     fn truncate_to_short_unchanged() {
         assert_eq!(truncate_to("hello", 10), "hello");
         assert_eq!(truncate_to("hello", 5), "hello");
+    }
+
+    #[test]
+    fn clamp_offset_keeps_window_inside_list() {
+        // 100 rows, 10-row viewport.
+        let len = 100;
+        let h = 10;
+        // Top of list: offset pinned to 0, no negative underflow.
+        assert_eq!(clamp_offset(0, 0, h, len), 0);
+        assert_eq!(clamp_offset(5, 1, h, len), 0);
+        // Bottom of list: window never runs past the end (max = len - h).
+        assert_eq!(clamp_offset(0, 99, h, len), len - h);
+        // A stale offset far below the cursor scrolls up to bring the
+        // cursor into view with the top padding margin (selected - pad).
+        assert_eq!(clamp_offset(500, 50, h, len), 48);
+    }
+
+    #[test]
+    fn clamp_offset_respects_scroll_padding() {
+        let len = 100;
+        let h = 20;
+        let pad = SCROLL_PADDING; // 2
+        // Cursor sitting inside the viewport (with margin) doesn't move it.
+        let off = clamp_offset(40, 50, h, len);
+        assert!(off <= 50 - pad, "top margin: {off}");
+        assert!(50 < off + h - pad, "bottom margin honored");
+        // Walking the cursor up to the top padding band scrolls up by 1.
+        assert_eq!(clamp_offset(40, 41, h, len), 39);
+        // Walking down into the bottom band scrolls down by 1.
+        assert_eq!(clamp_offset(40, 58, h, len), 41);
+    }
+
+    #[test]
+    fn clamp_offset_degenerate_inputs() {
+        // Empty list / zero viewport → offset 0, no panic.
+        assert_eq!(clamp_offset(7, 3, 0, 10), 0);
+        assert_eq!(clamp_offset(7, 3, 10, 0), 0);
+        // List shorter than the viewport → everything fits at offset 0.
+        assert_eq!(clamp_offset(3, 4, 20, 5), 0);
     }
 
     #[test]

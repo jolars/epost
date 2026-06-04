@@ -474,14 +474,13 @@ pub struct InboxScreen {
     /// Cleared on scope switch, search entry/exit, and after any range
     /// action consumes it.
     pub list_visual: Option<usize>,
-    /// Persisted top-row offset for the messages list. Without this,
-    /// every render starts from `offset = 0` and ratatui re-derives the
-    /// offset from `selected` alone — which scrolls the viewport back
-    /// when the cursor walks up from a previously-scrolled position.
-    /// Combined with `List::scroll_padding`, this gives vim-style
-    /// `scrolloff` behavior: the cursor moves freely inside the
-    /// viewport, and only triggers a scroll when it gets within the
-    /// padding band of the top/bottom edge.
+    /// Persisted top-row offset for the messages list. The list pane
+    /// renders only the visible window (`rows[offset..offset+height]`)
+    /// rather than building a `ListItem` per folder row every frame, so
+    /// it owns the scroll math: `list::clamp_offset` slides this the
+    /// minimum amount to keep `selected` within a `SCROLL_PADDING` band
+    /// of the viewport edges (vim `scrolloff`). Reset to 0 on scope
+    /// switch.
     pub list_offset: usize,
     /// Boxed so its size doesn't bloat `Screen::Inbox` past the
     /// `large_enum_variant` threshold (same reason `search` is boxed).
@@ -535,6 +534,23 @@ pub struct InboxScreen {
     /// channel so a long catch-up doesn't block (or get blocked by)
     /// the watcher's per-folder rescans. `None` once consumed.
     catchup_rx: Option<Receiver<ScanResult>>,
+    /// Event channel clone, handed to the folder-switch worker so it can
+    /// `Wake` the main loop when its result lands. `None` in tests where
+    /// no channel is plumbed in (the result is then drained by the next
+    /// `poll_switch` on the idle heartbeat).
+    event_tx: Option<Sender<AppEvent>>,
+    /// In-flight off-thread folder switch. `switch_to_scope` spawns the
+    /// worker (index read + JWZ build for the target scope) and parks the
+    /// receiver here; `poll_switch` drains it. Replaced on every switch,
+    /// which drops the prior receiver so a superseded worker's result is
+    /// discarded at the channel.
+    switch_rx: Option<Receiver<scan::SwitchOutcome>>,
+    /// Monotonic switch counter, bumped on every `switch_to_scope`. The
+    /// apply step discards any result whose generation no longer matches
+    /// — latest target wins when the user cycles folders faster than the
+    /// loads finish (Alt-j Alt-j Alt-j). Belt-and-suspenders alongside
+    /// the receiver-replacement above.
+    switch_generation: u64,
     /// `(account, folder)` pairs whose maildir contents have been
     /// walked at least once this session. Drives the lazy-on-switch
     /// path: scope-switching to a pair not in this set kicks an
@@ -1046,6 +1062,20 @@ impl App {
         inbox.poll_watch(cfg, cache_path, status_error);
     }
 
+    /// Drain the off-thread folder-switch worker into the list view.
+    /// Called every main-loop tick alongside `poll_scan` / `poll_watch`.
+    pub fn poll_switch(&mut self) {
+        let Self {
+            screens,
+            status_error,
+            ..
+        } = self;
+        let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+            unreachable!("inbox is pinned at index 0")
+        };
+        inbox.poll_switch(status_error);
+    }
+
     /// Tab navigation. With only the inbox screen in Step 1 / Step 2,
     /// cycling is a no-op; the wiring is in place so Step 8's compose
     /// tabs participate without further keymap changes.
@@ -1507,13 +1537,12 @@ impl App {
         let Self {
             screens,
             cache_path,
-            status_error,
             ..
         } = self;
         let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
             unreachable!("inbox is pinned at index 0")
         };
-        inbox.switch_to_scope(account, folder, cache_path, status_error);
+        inbox.switch_to_scope(account, folder, cache_path);
     }
 
     /// Enter visual mode at the current cursor position. Pairs
@@ -1608,7 +1637,6 @@ impl App {
         let Self {
             screens,
             cache_path,
-            status_error,
             ..
         } = self;
         let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
@@ -1632,7 +1660,7 @@ impl App {
             (current_idx + n - 1) % n
         };
         let (target_scope, target_folder) = order[next_idx].clone();
-        inbox.switch_to_scope(target_scope, &target_folder, cache_path, status_error);
+        inbox.switch_to_scope(target_scope, &target_folder, cache_path);
     }
 }
 
@@ -1669,6 +1697,9 @@ impl InboxScreen {
         // (in tests no event channel is plumbed in). On failure surface
         // a one-shot warning and degrade to "no live updates" rather
         // than crashing — startup full rescan already ran.
+        // Kept for the folder-switch worker; the watcher block below
+        // consumes the original `event_tx`.
+        let switch_event_tx = event_tx.clone();
         let mut watcher: Option<Watcher> = None;
         let mut watch_rx: Option<Receiver<WatcherEvent>> = None;
         let mut watcher_warning: Option<String> = None;
@@ -1725,6 +1756,9 @@ impl InboxScreen {
             current_folder: "INBOX".to_string(),
             scan_rx,
             catchup_rx: None,
+            event_tx: switch_event_tx,
+            switch_rx: None,
+            switch_generation: 0,
             scanned_folders: HashSet::new(),
             watcher,
             watch_rx,
@@ -2536,13 +2570,7 @@ impl InboxScreen {
     /// view. No-op when already on `(account, folder)`. Always clears
     /// any active search — scope changes invalidate the cached haystack
     /// and the user expects sidebar nav to drop search state.
-    pub fn switch_to_scope(
-        &mut self,
-        account: Option<String>,
-        folder: &str,
-        cache_path: &Path,
-        status_error: &mut Option<String>,
-    ) {
+    pub fn switch_to_scope(&mut self, account: Option<String>, folder: &str, cache_path: &Path) {
         let same_scope =
             account.as_deref() == self.current_account.as_deref() && folder == self.current_folder;
         // A no-op scope-switch still drops a stray search — the user is
@@ -2554,33 +2582,24 @@ impl InboxScreen {
         if same_scope {
             return;
         }
-        let idx = match Index::open(cache_path) {
-            Ok(i) => i,
-            Err(e) => {
-                *status_error = Some(format!("switch scope: open index: {e:#}"));
-                return;
-            }
-        };
-        let rows = match idx.list_folder(account.as_deref(), folder) {
-            Ok(r) => r,
-            Err(e) => {
-                *status_error = Some(format!("switch scope: list {folder}: {e:#}"));
-                return;
-            }
-        };
-        self.scan = ScanState::Ready(build_threads(rows));
+        // Set the target scope eagerly so the top-bar badge updates this
+        // frame. The folder load (index read + JWZ thread build) is
+        // O(folder) and used to block the event loop right here; it now
+        // runs on a std::thread worker and lands via `poll_switch`.
         self.current_account = account.clone();
         self.current_folder = folder.to_string();
         // If this folder hasn't been walked yet this session (eager
         // INBOX-only startup → catch-up may still be in flight, or the
         // user navigated faster than the background pass), enqueue it
         // for the rescan worker. `poll_watch` will pick it up next
-        // tick. Index rows shown right now come from whatever was
-        // cached on disk; the rescan replaces them once it lands. For
-        // the unified `[all]` scope, queue every account's copy of the
-        // folder since the view aggregates across accounts.
+        // tick. For the unified `[all]` scope, queue every account's copy
+        // of the folder since the view aggregates across accounts.
         self.queue_lazy_scan(account.as_deref(), folder);
+        // Placeholder until the worker reports — same as startup. Keeps
+        // the user from acting on the previous scope's rows mid-switch.
+        self.scan = ScanState::Scanning;
         self.selected = 0;
+        self.list_offset = 0;
         self.list_visual = None;
         self.reader_scroll = 0;
         self.reader_cursor_line = 0;
@@ -2596,6 +2615,60 @@ impl InboxScreen {
         // image placements from the previous body don't ghost over
         // the new scope's first message.
         self.body_changed_this_tick = true;
+        // Bump the generation so a late result from a switch the user has
+        // already cycled past is discarded by `poll_switch`. Replacing
+        // `switch_rx` drops the prior receiver, so the superseded worker's
+        // send fails and its result never arrives anyway — the generation
+        // is the explicit guard documenting the latest-wins contract.
+        self.switch_generation = self.switch_generation.wrapping_add(1);
+        self.switch_rx = Some(scan::start_switch_worker(
+            account,
+            folder.to_string(),
+            cache_path.to_path_buf(),
+            self.switch_generation,
+            self.event_tx.clone(),
+        ));
+    }
+
+    /// Drain the off-thread folder-switch worker. Applies the threaded
+    /// rows only when the result's `generation` still matches the latest
+    /// switch — a stale result (the user cycled past this scope before the
+    /// worker finished) is dropped so the newest target wins. Errors
+    /// surface to the cmdline status row. Called every tick alongside
+    /// `poll_scan`.
+    pub fn poll_switch(&mut self, status_error: &mut Option<String>) {
+        let Some(rx) = self.switch_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(outcome) => {
+                self.switch_rx = None;
+                if outcome.generation != self.switch_generation {
+                    // Superseded by a newer switch; ignore its rows.
+                    return;
+                }
+                match outcome.result {
+                    Ok(threads) => {
+                        self.scan = ScanState::Ready(threads);
+                        self.selected = 0;
+                        self.list_offset = 0;
+                        self.body_changed_this_tick = true;
+                    }
+                    Err(msg) => {
+                        *status_error = Some(format!("switch scope: {msg}"));
+                        self.scan = ScanState::Failed(msg);
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                // The held receiver always belongs to the latest switch
+                // (we replace it on every switch), so a disconnect here is
+                // the active worker dying.
+                self.switch_rx = None;
+                self.scan = ScanState::Failed("switch worker died before reporting".into());
+            }
+        }
     }
 
     /// Enqueue a rescan for `(account, folder)` if it hasn't been
@@ -3762,6 +3835,22 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         panic!("scan worker never reported");
     }
 
+    /// Pump `poll_switch` until the in-flight folder-switch worker reports.
+    /// `switch_to_scope` is async now (rows land via `poll_switch`), so any
+    /// test asserting on the post-switch list must drain first. A no-op
+    /// (same-scope) switch leaves `switch_rx` unset and returns at once.
+    pub(super) fn drain_switch(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.poll_switch();
+            if app.inbox().switch_rx.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("switch worker never reported");
+    }
+
     #[test]
     fn cross_account_same_msgid_move_targets_only_selected_account() {
         // Regression for the real-mail corruption: one Message-ID
@@ -4329,13 +4418,16 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         assert!(folders.contains(&"Sent"));
 
         // INBOX → Sent (next in canonical order: INBOX, then Sent).
+        // current_folder updates synchronously; the rows land off-thread.
         app.cycle_folder(true);
         assert_eq!(app.inbox().current_folder, "Sent");
+        drain_switch(&mut app);
         assert_eq!(app.inbox().threaded().len(), 1);
 
         // Wrap back to INBOX.
         app.cycle_folder(true);
         assert_eq!(app.inbox().current_folder, "INBOX");
+        drain_switch(&mut app);
         assert_eq!(app.inbox().threaded().len(), 1);
 
         // And cycle backwards lands on Sent again.
@@ -4397,19 +4489,43 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         // Scope to personal — only the personal INBOX row remains.
         app.switch_to_scope(Some("personal".into()), "INBOX");
         assert_eq!(app.inbox().current_account.as_deref(), Some("personal"));
+        drain_switch(&mut app);
         assert_eq!(app.inbox().threaded().len(), 1);
         let mid = app.inbox().selected_msgid().unwrap();
         assert_eq!(mid, "personal-1@x");
 
         // Scope to work.
         app.switch_to_scope(Some("work".into()), "INBOX");
+        drain_switch(&mut app);
         assert_eq!(app.inbox().threaded().len(), 1);
         assert_eq!(app.inbox().selected_msgid().as_deref(), Some("work-1@x"));
 
         // Back to all.
         app.switch_to_scope(None, "INBOX");
         assert_eq!(app.inbox().current_account, None);
+        drain_switch(&mut app);
         assert_eq!(app.inbox().threaded().len(), 2);
+    }
+
+    #[test]
+    fn rapid_scope_switch_latest_target_wins() {
+        // Two switches back-to-back without draining between (the
+        // Alt-j Alt-j race). The first worker is superseded — its
+        // receiver is dropped, so its result never applies — and after
+        // draining only the latest target's rows land.
+        let tmp = TempDir::new().unwrap();
+        let cfg = two_account_config(&tmp);
+        let cache = tmp.path().join("index.sqlite");
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_scan(&mut app, &cfg);
+
+        app.switch_to_scope(Some("personal".into()), "INBOX");
+        app.switch_to_scope(Some("work".into()), "INBOX");
+        drain_switch(&mut app);
+
+        assert_eq!(app.inbox().current_account.as_deref(), Some("work"));
+        assert_eq!(app.inbox().threaded().len(), 1);
+        assert_eq!(app.inbox().selected_msgid().as_deref(), Some("work-1@x"));
     }
 
     #[test]
@@ -4653,13 +4769,22 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
     #[test]
     fn eager_pass_indexes_inbox_but_not_sent() {
         // The startup worker is INBOX-only; Sent must wait for the
-        // catch-up. Confirmed by inspecting the index between the eager
-        // result landing and the catch-up completing.
+        // catch-up. Inspect the index content via a direct eager-only
+        // worker *before* any `App` exists — going through `App` would
+        // spawn the catch-up worker the moment the eager result lands,
+        // and that background thread races us to write Sent into the
+        // shared index (an otherwise-flaky read).
         let tmp = TempDir::new().unwrap();
         let (cfg, cache) = one_account_two_folders(&tmp);
 
-        let mut app = App::new(&cfg, cache.clone(), None, None);
-        drain_inbox_only(&mut app, &cfg);
+        scan::start_inbox_worker(
+            account_specs(&cfg),
+            cache.clone(),
+            (None, "INBOX".to_string()),
+        )
+        .recv()
+        .unwrap()
+        .unwrap();
 
         let idx = crate::store::index::Index::open(&cache).unwrap();
         assert!(
@@ -4668,9 +4793,15 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         );
         assert!(
             idx.get("sent-1@x", "personal", "Sent").unwrap().is_none(),
-            "Sent must NOT be in the index after the eager pass alone"
+            "Sent must NOT be indexed by the eager pass alone"
         );
-        // Track-set reflects the same: INBOX scanned, Sent not yet.
+
+        // The App's in-memory track-set reflects the same split: INBOX
+        // scanned this session, Sent not yet. `scanned_folders` is mutated
+        // only by `poll_scan` (never by the catch-up's index writes), so
+        // this stays deterministic even with the catch-up worker live.
+        let mut app = App::new(&cfg, cache, None, None);
+        drain_inbox_only(&mut app, &cfg);
         assert!(
             app.inbox()
                 .scanned_folders
