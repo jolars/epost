@@ -263,9 +263,11 @@ fn register_initial(
     discovery_roots: &Arc<Mutex<DiscoveryRoots>>,
     accounts: &[AccountSpec],
 ) -> Result<()> {
+    // The `watcher` mutex may be held across `w.watch()`: notify's
+    // callback never touches it. The `lookup` / `discovery_roots`
+    // mutexes must NOT be held across `w.watch()` — see the comment in
+    // `install_folder_watches`.
     let mut w = watcher.lock().expect("watcher poisoned");
-    let mut lk = lookup.lock().expect("lookup poisoned");
-    let mut dr = discovery_roots.lock().expect("discovery_roots poisoned");
     for spec in accounts {
         if !spec.root.is_dir() {
             log::warn!(
@@ -285,7 +287,10 @@ fn register_initial(
             spec.name,
             root.display()
         );
-        dr.insert(root, spec.name.clone());
+        discovery_roots
+            .lock()
+            .expect("discovery_roots poisoned")
+            .insert(root, spec.name.clone());
 
         // Watch every binding's `{cur,new}`. The INBOX binding
         // (`folders[0]`) and every role/extra after it share the
@@ -296,8 +301,8 @@ fn register_initial(
         for binding in &spec.folders {
             install_folder_watches(
                 &mut w,
-                &mut lk,
-                &mut dr,
+                lookup,
+                discovery_roots,
                 &spec.name,
                 &binding.label,
                 &binding.path,
@@ -313,10 +318,25 @@ fn register_initial(
 /// `folder_root` to `discovery_roots` so nested sub-folder creation
 /// events get picked up. Best-effort: a stale `.lock` or unusual
 /// permission shouldn't fail the whole watcher.
+///
+/// CRITICAL: `w.watch()` must never be called while the `lookup` mutex
+/// is held. notify's inotify backend services `watch()` synchronously
+/// on its event-loop thread and blocks the caller until that thread
+/// replies — but that same thread also delivers events into our
+/// callback, which locks `lookup` (see `handle_event`). Holding `lookup`
+/// across `w.watch()` therefore deadlocks: the event-loop thread waits
+/// for `lookup` inside the callback while we wait for the event-loop
+/// thread to ack the watch. After a cross-folder move (`d` / `:trash` /
+/// `:archive`), `register_folder` drives `apply_register` here exactly
+/// while the move's own inotify events are in flight, so the window is
+/// wide open. We lock `lookup` / `discovery_roots` only for the brief
+/// insert *after* `watch()` returns. The `watcher` mutex (held by
+/// callers via `w`) is safe to hold across `watch()` — the callback
+/// never touches it.
 fn install_folder_watches(
     w: &mut RecommendedWatcher,
-    lk: &mut LookupMap,
-    dr: &mut DiscoveryRoots,
+    lookup: &Arc<Mutex<LookupMap>>,
+    discovery_roots: &Arc<Mutex<DiscoveryRoots>>,
     account: &str,
     label: &str,
     folder_root: &Path,
@@ -334,7 +354,10 @@ fn install_folder_watches(
         match w.watch(&dir, RecursiveMode::NonRecursive) {
             Ok(()) => {
                 log::debug!("watch: {account}/{label}: watching {}", dir.display());
-                lk.insert(dir, (account.to_string(), label.to_string()));
+                lookup
+                    .lock()
+                    .expect("lookup poisoned")
+                    .insert(dir, (account.to_string(), label.to_string()));
             }
             Err(e) => log::warn!(
                 "watch: {account}/{label}: failed to watch {}: {e}",
@@ -345,7 +368,10 @@ fn install_folder_watches(
     if matches!(layout, Layout::Verbatim) {
         let root = canonical(folder_root);
         if root.is_dir() && w.watch(&root, RecursiveMode::NonRecursive).is_ok() {
-            dr.insert(root, account.to_string());
+            discovery_roots
+                .lock()
+                .expect("discovery_roots poisoned")
+                .insert(root, account.to_string());
         }
     }
 }
@@ -490,13 +516,15 @@ fn apply_register(
             folder_root,
             layout,
         } => {
+            // Hold only the `watcher` mutex across `w.watch()`; the
+            // `lookup` / `discovery_roots` mutexes are locked per-insert
+            // inside `install_folder_watches`. Holding `lookup` here
+            // would deadlock against notify's callback — see that fn.
             let mut w = watcher.lock().expect("watcher poisoned");
-            let mut lk = lookup.lock().expect("lookup poisoned");
-            let mut dr = discovery_roots.lock().expect("discovery_roots poisoned");
             install_folder_watches(
                 &mut w,
-                &mut lk,
-                &mut dr,
+                lookup,
+                discovery_roots,
                 account,
                 label,
                 folder_root,
