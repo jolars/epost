@@ -110,6 +110,17 @@ pub struct Reader {
     /// paragraph from cursor position). `0` disables the flash.
     #[serde(default = "default_yank_highlight_ms")]
     pub yank_highlight_ms: u16,
+    /// Emit OSC 8 terminal hyperlinks around links in the reader so capable
+    /// terminals (kitty, wezterm, foot, iTerm2) render them clickable.
+    /// Default `true`. The anchor is folded into each link's first cell,
+    /// which inflates that cell's measured width in ratatui's diff and so
+    /// re-renders extra cells per keystroke on link-dense mail — usually
+    /// invisible, but set `false` if it flickers on your terminal. Links
+    /// stay underlined and reachable via the `f` picker / `:open` either
+    /// way. The cursor's own line is left un-anchored so motions over links
+    /// render cleanly.
+    #[serde(default = "yes")]
+    pub osc8_links: bool,
 }
 
 impl Default for Reader {
@@ -121,6 +132,7 @@ impl Default for Reader {
             mouse: true,
             drag: None,
             yank_highlight_ms: default_yank_highlight_ms(),
+            osc8_links: true,
         }
     }
 }
@@ -789,6 +801,20 @@ mod tests {
         )
         .unwrap();
         assert!(!cfg.reader.mouse);
+    }
+
+    #[test]
+    fn reader_osc8_links_defaults_on_and_can_be_disabled() {
+        let default: Config = toml::from_str("").unwrap();
+        assert!(default.reader.osc8_links, "osc8_links defaults to on");
+        let off: Config = toml::from_str(
+            r#"
+            [reader]
+            osc8_links = false
+            "#,
+        )
+        .unwrap();
+        assert!(!off.reader.osc8_links);
     }
 
     #[test]

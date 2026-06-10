@@ -573,12 +573,13 @@ fixture lets us catch layout drift without needing a window open.
 - **Inline images:** kitty graphics protocol, iTerm2 inline images, sixel,
   or halfblocks (256-color block characters) --- ratatui-image picks one
   automatically; user can override or disable.
-- **Hyperlinks:** links render underlined/blue in the reader and are opened
-  via the Vimium-style picker (`f`) or `:open`. (Terminal-native OSC 8
-  hyperlinks were tried and removed --- injecting the URL into a ratatui cell
-  symbol inflates that cell's measured width, which breaks the diff renderer:
-  dropped characters, an invisible/erratic cursor over links, and a
-  near-full-screen redraw on every keystroke on link-dense mail.)
+- **Hyperlinks:** links render underlined/blue and are opened via the
+  Vimium-style picker (`f`) or `:open`. Terminal-native OSC 8 hyperlinks are
+  also emitted (opt-in `[reader].osc8_links`, default on) by folding each
+  anchor into the link's first cell; the cursor's own line is left
+  un-anchored so motions stay clean. The fold works around ratatui counting
+  the embedded URL toward the cell's display width — see
+  `emit_osc8_hyperlinks`.
 - **Resize:** crossterm `Resize` events trigger a re-layout of the reader
   cells and re-emission of inline image draws at the new geometry.
 

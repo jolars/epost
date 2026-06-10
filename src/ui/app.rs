@@ -287,6 +287,10 @@ pub struct App {
     /// Capped at max_height_cells from `[images]`. Surfaced to the reader
     /// so layout caps reservation height the same way the decode does.
     pub image_max_height_cells: u16,
+    /// `[reader].osc8_links`: whether the reader emits OSC 8 terminal
+    /// hyperlinks around links. Read once at startup; the reader draw
+    /// consults it each frame.
+    pub osc8_links: bool,
     /// SQLite cache path. Kept so flag flips can briefly re-open the
     /// index and mirror the new `path` / `flags` without holding a
     /// long-lived `Connection` on the UI thread.
@@ -644,6 +648,7 @@ impl App {
             active: 0,
             picker,
             image_max_height_cells: cfg.images.max_height_cells,
+            osc8_links: cfg.reader.osc8_links,
             cache_path,
             self_writes,
             sync_rx: None,
@@ -3502,6 +3507,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         mode,
         link_pick_buf,
         attachment_pick_buf,
+        osc8_links,
         ..
     } = app;
     match screens.get_mut(*active) {
@@ -3521,7 +3527,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 list::draw(f, rect, inbox);
             }
             if let Some(rect) = reader_area {
-                reader::draw(f, rect, inbox, *mode, link_pick_buf, attachment_pick_buf);
+                reader::draw(
+                    f,
+                    rect,
+                    inbox,
+                    *mode,
+                    link_pick_buf,
+                    attachment_pick_buf,
+                    *osc8_links,
+                );
             }
         }
         Some(Screen::Compose(c)) => compose::draw(f, body, c),
