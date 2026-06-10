@@ -98,6 +98,52 @@ pub(crate) fn wrap_plain_line(line: &str, width: u16) -> Vec<String> {
     out
 }
 
+/// Hard-wrap a single laid-out `Line` to `width` cells, splitting spans at
+/// the boundary while preserving each span's style. The final layout
+/// safety net: word-wrapping handles prose, but an un-word-wrappable atom
+/// (a remote-image placeholder with a long URL, or a single word longer
+/// than the pane) can still produce an over-width line, which `Paragraph`
+/// would re-wrap and desync the reader cursor. A line already within
+/// `width` is returned unchanged as a single piece. Characters are never
+/// dropped; a lone grapheme wider than `width` is left whole on its row.
+fn hard_wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let total: u16 = line
+        .spans
+        .iter()
+        .map(|s| cells(s.content.as_ref()))
+        .fold(0u16, |a, w| a.saturating_add(w));
+    if total <= width {
+        return vec![line];
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w: u16 = 0;
+    for span in line.spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+            if cur_w + cw > width && cur_w > 0 {
+                if !buf.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                out.push(Line::from(std::mem::take(&mut cur)));
+                cur_w = 0;
+            }
+            buf.push(ch);
+            cur_w += cw;
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, style));
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(Line::from(cur));
+    }
+    out
+}
+
 /// Display column (0-based cell offset) of the char at index `char_idx`
 /// within `line` — i.e. the cell width of the prefix preceding it.
 /// Measured as a *string* prefix rather than a per-char width sum so that
@@ -1054,6 +1100,42 @@ where
             out_block_idx.push(block_idx);
         }
     }
+    // Final safety pass: hard-wrap any laid-out line wider than the pane.
+    // The reader's cursor / selection / scroll math assumes one body line
+    // renders as exactly one terminal row. A line wider than `ctx_width`
+    // breaks that: ratatui's `Paragraph` re-wraps it, every row below
+    // shifts, and the cursor lands on a blank `line_text` while the user
+    // looks at real content (the "cursor stuck / `w` skips the link, only
+    // on some mail" bug). Word-wrapping handles ordinary prose; what slips
+    // through is un-word-wrappable atoms — a remote-image placeholder
+    // carrying a long URL, or a single word longer than the pane.
+    let mut wrapped_lines: Vec<Line<'static>> = Vec::with_capacity(out_lines.len());
+    let mut wrapped_block_idx: Vec<Option<usize>> = Vec::with_capacity(out_block_idx.len());
+    let mut line_shift: Vec<usize> = Vec::with_capacity(out_lines.len());
+    for (line, bidx) in out_lines.into_iter().zip(out_block_idx) {
+        line_shift.push(wrapped_lines.len());
+        for piece in hard_wrap_line(line, ctx_width) {
+            wrapped_lines.push(piece);
+            wrapped_block_idx.push(bidx);
+        }
+    }
+    // Remap line-indexed references onto the post-wrap positions. Image
+    // slots sit on reserved-blank rows that are never over-width, so they
+    // map 1:1 (just shifted by any splits above them). Link segments are
+    // word-wrapped and so over-width only when a single link word exceeds
+    // the pane; those collapse onto the first chunk, mildly offsetting the
+    // `yl` yank-highlight — an acceptable edge for pathological links.
+    for slot in &mut out_images {
+        slot.line = line_shift.get(slot.line).copied().unwrap_or(slot.line);
+    }
+    let mut links = links;
+    for slot in &mut links {
+        for seg in &mut slot.segments {
+            seg.line = line_shift.get(seg.line).copied().unwrap_or(seg.line);
+        }
+    }
+    let out_lines = wrapped_lines;
+    let out_block_idx = wrapped_block_idx;
     // Per-line plain text, derived from final spans. Done here (rather
     // than during emit) so post-emit fixups — the `> ` blockquote
     // prefix in particular — are captured automatically. Visual-mode
@@ -1793,6 +1875,37 @@ mod tests {
             rejoined.split_whitespace().collect::<Vec<_>>(),
             long.split_whitespace().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn hard_wrap_line_splits_overlong_and_preserves_text() {
+        // A laid-out line wider than the pane (e.g. a remote-image
+        // placeholder with a long URL) must be split so no body line
+        // exceeds the width — otherwise Paragraph re-wraps it and desyncs
+        // the cursor. Styles are preserved; no characters are dropped.
+        let url = format!("[remote image: https://example.com/{}]", "a".repeat(120));
+        let line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(url.clone(), Style::default().fg(Color::Magenta)),
+        ]);
+        let pieces = super::hard_wrap_line(line, 40);
+        assert!(
+            pieces.len() >= 3,
+            "expected multiple rows, got {}",
+            pieces.len()
+        );
+        let mut rejoined = String::new();
+        for p in &pieces {
+            let w: u16 = p.spans.iter().map(|s| cells(s.content.as_ref())).sum();
+            assert!(w <= 40, "piece over width: {w}");
+            for s in &p.spans {
+                rejoined.push_str(s.content.as_ref());
+            }
+        }
+        assert_eq!(rejoined, format!("  {url}"), "no characters lost");
+        // A within-width line is returned untouched as one piece.
+        let short = Line::from(Span::raw("short enough"));
+        assert_eq!(super::hard_wrap_line(short, 40).len(), 1);
     }
 
     #[test]
