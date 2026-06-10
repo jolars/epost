@@ -2157,12 +2157,14 @@ impl InboxScreen {
         self.last_parsed_msgid = Some(msgid.clone());
         self.body_changed_this_tick = true;
         // New body means the old cursor position is meaningless — reset
-        // so `yp`/`yl` operate on the new message's first content.
-        // `reader_scroll` is intentionally left alone here: the
-        // selection-change flow elsewhere already preserves scroll
-        // semantics, and changing that is out of scope for the yank
-        // work. Visual mode anchors against the old body's coords too,
-        // so drop it.
+        // so `yp`/`yl` operate on the new message's first content. Scroll
+        // is reset alongside the cursor: a new message opens at the top,
+        // like every mail client. Leaving the old scroll in place left the
+        // viewport at the previous message's bottom while the cursor reset
+        // to line 0, so the draw-time keep-in-view clamp would drag the
+        // cursor down to the viewport edge — landing "beyond" the content.
+        // Visual mode anchors against the old body's coords too, so drop it.
+        self.reader_scroll = 0;
         self.reader_cursor_line = 0;
         self.reader_cursor_col = 0;
         self.reader_goal_col = 0;
