@@ -246,6 +246,21 @@ impl LaidOutBody {
         best.map(|(s, _)| s).or_else(|| self.links.first())
     }
 
+    /// Link whose rendered text sits directly under the cursor cell
+    /// `(line, col)` — the segment on `line` whose `[col_start, col_end)`
+    /// span contains `col`. Returns `None` when the cursor isn't over any
+    /// link (unlike [`first_link_at_or_after`], which falls back to the
+    /// nearest link). Drives vim-style `gx` "open the thing under the
+    /// cursor". `col` is a char index; link segments are cell columns —
+    /// these coincide for the narrow text links carry in practice.
+    pub fn link_at(&self, line: u16, col: u16) -> Option<&LinkSlot> {
+        self.links.iter().find(|slot| {
+            slot.segments
+                .iter()
+                .any(|s| s.line == line as usize && col >= s.col_start && col < s.col_end)
+        })
+    }
+
     /// Extract the text spanned by a visual-mode selection. Endpoints
     /// are body-relative coords (`line` into `line_text`, `col` as a
     /// char index into the line's string). The endpoints normalize so
@@ -2654,6 +2669,25 @@ mod tests {
         // single link in the body).
         let s = laid.first_link_at_or_after(9999).expect("fallback link");
         assert_eq!(s.href, "https://only");
+    }
+
+    #[test]
+    fn link_at_matches_only_under_cursor() {
+        // "go LINK back" — only the cells over the anchor resolve.
+        let blocks = html::parse(r#"<p>go <a href="https://x">LINK</a> back</p>"#);
+        let laid = layout(&blocks, 40, &[], None, None);
+        let seg = laid.links[0].segments.first().expect("segment").clone();
+        // A cell inside the anchor span hits.
+        let hit = laid
+            .link_at(seg.line as u16, seg.col_start)
+            .expect("link under cursor");
+        assert_eq!(hit.href, "https://x");
+        // A cell just before the anchor (the leading "go ") misses.
+        assert!(seg.col_start == 0 || laid.link_at(seg.line as u16, seg.col_start - 1).is_none());
+        // A cell at/after the anchor end (the trailing " back") misses.
+        assert!(laid.link_at(seg.line as u16, seg.col_end).is_none());
+        // Another line entirely misses.
+        assert!(laid.link_at(seg.line as u16 + 50, seg.col_start).is_none());
     }
 
     #[test]

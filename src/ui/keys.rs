@@ -114,14 +114,19 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                 }
                 return;
             }
-            // `g`-prefixed attachment verbs, Reader focus only: `gx` opens
-            // the attachment under the cursor in the external viewer, `gs`
-            // saves it, `gd` drags it, `gf` opens the numeric attachment
-            // picker. Anything else falls through.
+            // `g`-prefixed verbs, Reader focus only: `gx` opens the link
+            // under the cursor (falling back to the attachment under the
+            // cursor) in the external opener, `gs` saves the attachment,
+            // `gd` drags it, `gf` opens the numeric attachment picker.
+            // Anything else falls through.
             if app.inbox().focus == Pane::Reader {
                 match k.code {
                     KeyCode::Char('x') => {
-                        cmdline::open_attachment_under_cursor(app, cfg);
+                        // Vim `gx`: a link under the cursor wins; otherwise
+                        // fall through to the attachment opener.
+                        if !open_link_under_cursor(app, cfg) {
+                            cmdline::open_attachment_under_cursor(app, cfg);
+                        }
                         return;
                     }
                     KeyCode::Char('s') => {
@@ -1177,6 +1182,29 @@ fn dispatch_yank(app: &mut App, cfg: &Config, text: String, ok_status: String) {
             app.status_error = Some(format!("yank: {e}"));
         }
     }
+}
+
+/// `gx` on the reader: open whatever sits under the cursor in the
+/// external opener. A link directly under the cursor wins (vim's `gx`
+/// semantics); otherwise we fall through to the attachment verb so a
+/// cursor parked on an attachment chip — or the lone-attachment
+/// fallback — still works. Returns `true` once a link was opened.
+fn open_link_under_cursor(app: &mut App, cfg: &Config) -> bool {
+    let inbox = app.inbox();
+    let width = inbox.last_reader_inner_width.max(8);
+    let line = inbox.reader_cursor_line;
+    let col = inbox.reader_cursor_col;
+    let Some(p) = app.inbox_parsed() else {
+        return false;
+    };
+    let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
+    let Some(href) = laid.link_at(line, col).map(|s| s.href.clone()) else {
+        return false;
+    };
+    if let Err(e) = crate::ui::browser::open_url(&href, &cfg.reader.browser) {
+        app.status_error = Some(format!("open: {e:#}"));
+    }
+    true
 }
 
 fn follow_link(app: &mut App, cfg: &Config, buf: &str) {
