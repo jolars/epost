@@ -614,7 +614,13 @@ pub fn draw(
     pane_scrollbar(f, area, inbox.reader_scroll as usize, total_lines, focused);
     if let Some(laid) = laid {
         let scroll = inbox.reader_scroll as i32;
-        emit_osc8_hyperlinks(f.buffer_mut(), inner, &laid.links, scroll);
+        emit_osc8_hyperlinks(
+            f.buffer_mut(),
+            inner,
+            &laid.links,
+            inbox.last_reader_header_offset,
+            scroll,
+        );
         // Visual-mode selection paint goes on top of the rendered text
         // (REVERSED modifier on covered cells). Done before the OSC 8
         // emit would have stripped escapes, but after Paragraph laid
@@ -854,13 +860,33 @@ fn paint_yank_highlight(
     }
 }
 
-/// Wrap each visible link segment with the OSC 8 hyperlink anchor by
-/// patching the rendered buffer cells. The start sequence
-/// `ESC ] 8 ; ; URL ESC \` is prepended to the first cell of the
-/// segment and the close `ESC ] 8 ; ; ESC \` is appended to the last
-/// cell, so the terminal sees the bytes between as part of the anchor
-/// without the buffer's normal control-char stripping (which would
-/// otherwise drop the escapes if we tried to embed them in a `Span`).
+/// Wrap each visible link segment with an OSC 8 hyperlink anchor by
+/// patching the rendered buffer cells. The whole anchor — open
+/// `ESC ] 8 ; ; URL ESC \`, the segment's visible text, and the close
+/// `ESC ] 8 ; ; ESC \` — is collapsed into the segment's *first* cell
+/// and every remaining cell of the segment is marked `skip`.
+///
+/// Why not the obvious "prepend open to first cell, append close to last
+/// cell"? ratatui measures a cell's display width as `symbol().width()`,
+/// and the embedded URL bytes (`]8;;`, the URL, `\`) all count as visible
+/// width even though the terminal renders them as zero-width escapes. Its
+/// diff then does `to_skip = symbol().width() - 1`, which — because
+/// `to_skip` is *reassigned every iteration*, not decremented — skips
+/// exactly the one cell after the inflated cell, leaving it stale. With
+/// the anchor split across the first and last cell that dropped the second
+/// character of the link and the first character after it. Collapsing the
+/// anchor into one cell means only that cell is "wide"; the single skipped
+/// cell is an *interior* link cell (also `skip`-flagged here), so the
+/// terminal — which prints the first cell's full symbol across the
+/// segment's columns and absolutely-positions every later cell — drops
+/// nothing visible. This is the standard ratatui idiom for holding
+/// multi-cell content in one cell.
+///
+/// `header_offset` is the number of header rows (From / Subject / …) the
+/// body is rendered below; segment lines are body-relative, so it must be
+/// added to land the anchor on the right row (mirroring `paint_selection`
+/// et al.). Without it the anchors — and their one-cell skips — scattered
+/// onto the header-offset rows above each link, corrupting unrelated text.
 ///
 /// Capable terminals (kitty, wezterm, foot, iTerm2, recent gnome-terminal)
 /// render this as a clickable / copyable hyperlink; others ignore the
@@ -869,37 +895,51 @@ fn emit_osc8_hyperlinks(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
     links: &[LinkSlot],
+    header_offset: u16,
     scroll: i32,
 ) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    const CLOSE: &str = "\x1b]8;;\x1b\\";
     let inner_right = inner.x.saturating_add(inner.width);
     let inner_bottom = inner.y.saturating_add(inner.height);
     for slot in links {
         if slot.href.is_empty() {
             continue;
         }
-        let start_seq = format!("\x1b]8;;{}\x1b\\", slot.href);
+        let open = format!("\x1b]8;;{}\x1b\\", slot.href);
         for seg in &slot.segments {
-            let row_signed = inner.y as i32 + seg.line as i32 - scroll;
+            let row_signed = inner.y as i32 + header_offset as i32 + seg.line as i32 - scroll;
             if row_signed < inner.y as i32 || row_signed >= inner_bottom as i32 {
                 continue;
             }
             let row = row_signed as u16;
             let abs_start = inner.x.saturating_add(seg.col_start).min(inner_right);
             let abs_end = inner.x.saturating_add(seg.col_end).min(inner_right);
-            if abs_start >= abs_end {
+            // A single-cell segment has no interior cell to absorb the
+            // width-inflation skip (see above), so the dropped cell would
+            // be the one *after* the link. Leave it styled-but-not-anchored
+            // rather than corrupt the following character.
+            if abs_end.saturating_sub(abs_start) < 2 {
                 continue;
             }
-            let last_col = abs_end - 1;
-            if let Some(cell) = buf.cell_mut((abs_start, row)) {
-                let symbol = cell.symbol().to_string();
-                cell.set_symbol(&format!("{start_seq}{symbol}"));
+            // Reconstruct the segment's visible text from the cells the
+            // Paragraph already laid down, then fold the full anchor into
+            // the first cell and skip the rest of the segment.
+            let mut text = String::new();
+            for x in abs_start..abs_end {
+                if let Some(cell) = buf.cell((x, row)) {
+                    text.push_str(cell.symbol());
+                }
             }
-            if let Some(cell) = buf.cell_mut((last_col, row)) {
-                let symbol = cell.symbol().to_string();
-                cell.set_symbol(&format!("{symbol}\x1b]8;;\x1b\\"));
+            if let Some(cell) = buf.cell_mut((abs_start, row)) {
+                cell.set_symbol(&format!("{open}{text}{CLOSE}"));
+            }
+            for x in (abs_start + 1)..abs_end {
+                if let Some(cell) = buf.cell_mut((x, row)) {
+                    cell.set_skip(true);
+                }
             }
         }
     }
@@ -2048,23 +2088,32 @@ mod tests {
                 }
             }
         }
-        super::emit_osc8_hyperlinks(&mut buf, inner, &laid.links, 0);
-        // Link "click" starts at column 4 (after "see ").
+        super::emit_osc8_hyperlinks(&mut buf, inner, &laid.links, 0, 0);
+        // The whole anchor collapses into the segment's first cell:
+        // "click" starts at column 4 (after "see "), so cell (4,0) holds
+        // open + "click" + close, and the interior cells are `skip`.
         let first_cell = buf.cell((4, 0)).expect("first link cell");
         let first_sym = first_cell.symbol();
-        assert!(
-            first_sym.starts_with("\x1b]8;;https://x.example/p\x1b\\"),
+        assert_eq!(
+            first_sym, "\x1b]8;;https://x.example/p\x1b\\click\x1b]8;;\x1b\\",
             "first link cell symbol was {first_sym:?}"
         );
-        assert!(first_sym.ends_with('c'), "{first_sym:?}");
-        // Last cell of the link is column 8 ("click" cells 4..9, last = 8).
-        let last_cell = buf.cell((8, 0)).expect("last link cell");
-        let last_sym = last_cell.symbol();
-        assert!(
-            last_sym.ends_with("\x1b]8;;\x1b\\"),
-            "last link cell symbol was {last_sym:?}"
-        );
-        assert!(last_sym.starts_with('k'), "{last_sym:?}");
+        // Interior link cells ("lick", cols 5..9) keep their glyph but are
+        // skipped so ratatui's wide-symbol diff can't drop a real cell.
+        for x in 5..9 {
+            let cell = buf.cell((x, 0)).expect("interior link cell");
+            assert!(cell.skip, "cell {x} should be skipped: {:?}", cell.symbol());
+            assert!(
+                !cell.symbol().contains('\x1b'),
+                "interior cell {x} leaked OSC 8: {:?}",
+                cell.symbol()
+            );
+        }
+        // The cell right after the link ("done"'s leading space at col 9)
+        // is untouched — not skipped, no escapes — so nothing is dropped.
+        let after = buf.cell((9, 0)).expect("post-link cell");
+        assert!(!after.skip, "post-link cell wrongly skipped");
+        assert!(!after.symbol().contains('\x1b'), "{:?}", after.symbol());
         // Non-link cells must not carry any OSC 8 bytes.
         let outside = buf.cell((0, 0)).expect("first cell");
         assert!(!outside.symbol().contains('\x1b'), "{:?}", outside.symbol());
@@ -2090,12 +2139,57 @@ mod tests {
             }],
         }];
         // scroll past the segment's line — patch must be a no-op.
-        super::emit_osc8_hyperlinks(&mut buf, inner, &links, 5);
+        super::emit_osc8_hyperlinks(&mut buf, inner, &links, 0, 5);
         for x in 0..inner.width {
             for y in 0..inner.height {
                 let sym = buf.cell((x, y)).unwrap().symbol();
                 assert!(!sym.contains('\x1b'), "leaked OSC 8 at ({x},{y}): {sym:?}");
             }
+        }
+    }
+
+    #[test]
+    fn osc8_anchor_honors_header_offset() {
+        use ratatui::buffer::Buffer;
+        // Segment lines are body-relative; the anchor must land
+        // `header_offset` rows lower than the segment's body line. A bug
+        // that omitted the offset scattered anchors (and their one-cell
+        // skips) onto the header rows above each link, corrupting text
+        // that wasn't a link at all.
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(inner);
+        // Paint "abcd" at row 4 (body line 0 + header_offset 4).
+        for (i, ch) in "abcd".chars().enumerate() {
+            buf.cell_mut((i as u16, 4))
+                .unwrap()
+                .set_symbol(&ch.to_string());
+        }
+        let links = vec![LinkSlot {
+            id: 1,
+            href: "https://x".to_string(),
+            segments: vec![LinkSegment {
+                line: 0,
+                col_start: 0,
+                col_end: 4,
+            }],
+        }];
+        super::emit_osc8_hyperlinks(&mut buf, inner, &links, 4, 0);
+        // Body row 0 lands at absolute row 4: the anchor is there...
+        assert!(
+            buf.cell((0, 4)).unwrap().symbol().contains('\x1b'),
+            "anchor missing at the offset row"
+        );
+        // ...and row 0 (a header row) is left clean.
+        for x in 0..inner.width {
+            assert!(
+                !buf.cell((x, 0)).unwrap().symbol().contains('\x1b'),
+                "OSC 8 leaked onto header row at col {x}"
+            );
         }
     }
 
