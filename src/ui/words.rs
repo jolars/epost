@@ -31,6 +31,8 @@ pub enum WordMotion {
     Back,
     /// `e` / `E` — end of the next word.
     End,
+    /// `ge` / `gE` — end of the previous word.
+    EndBack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +175,12 @@ pub fn word_motion(
             .find(|&j| is_word_start(&positions, j, big))
             // No previous word start: clamp to buffer start, matching
             // vim `b` at the first word.
+            .unwrap_or(0),
+        WordMotion::EndBack => (0..start)
+            .rev()
+            .find(|&j| is_word_end(&positions, j, big))
+            // No previous word end: clamp to buffer start, matching vim
+            // `ge` at the first word.
             .unwrap_or(0),
     };
     (positions[target].row, positions[target].col)

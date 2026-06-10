@@ -7,17 +7,24 @@
 //!
 //! v1 scope:
 //! - Motions: `h j k l`, `w b e` + `W B E` (WORD, via the shared
-//!   [`words`](crate::ui::words) scanner), `0 $ ^`, `gg G`, `Ctrl-d` /
-//!   `Ctrl-u`.
-//! - Insert entry: `i a A I o O`.
-//! - Edits: `x X`, `dd`, `yy` / `Y`, `p P`, `u`, `Ctrl-R`.
-//! - Visual: `v V`, and block-wise `Ctrl-V`; in Visual `y d x c` plus
-//!   Esc / same-kind toggle / opposite-kind swap. Block-visual also
-//!   takes `I` / `A` / `c` block-insert (type on the top row, replayed
-//!   across the rest on Esc).
+//!   [`words`](crate::ui::words) scanner), `0 $ ^`, `gg G`, `ge gE`,
+//!   `f F t T`, `Ctrl-d` / `Ctrl-u`. All accept a count.
+//! - Operators composing with any motion / text object / count:
+//!   `d c y`, `> <` (indent), `gu gU g~` (case), `gw gq` (reflow). The
+//!   doubled form (`dd cc yy >> guu gqq` …) is linewise over `count`
+//!   lines. Text objects: `iw aw i" a" i' i` i( a( ib ab i{ aB i[ i<
+//!   ip ap`.
+//! - Insert entry: `i a A I o O`. Replace: `r{char}`, `R` (overtype mode).
+//! - Single-key edits: `x X ~ J gJ s S C D`, `yy`/`Y`, `p P`, `u`, `Ctrl-R`.
+//! - Visual: `v V`, block-wise `Ctrl-V`; in Visual `y d x c` plus the
+//!   operators above, Esc / same-kind toggle / opposite-kind swap.
+//!   Block-visual also takes `I` / `A` / `c` block-insert (type on the
+//!   top row, replayed across the rest on Esc).
 //!
-//! Out of scope (deferred): block-paste (`p` of a rectangle), counts,
-//! registers, macros, search, ex-commands beyond the host cmdline.
+//! Out of scope (deferred): block-paste (`p` of a rectangle), dot-repeat
+//! (`.`), named registers, macros, `;`/`,` find-repeat, ex-commands
+//! beyond the host cmdline. Case/reflow/indent operators are 2 undo
+//! steps (delete + insert); deletes and yanks are 1.
 
 use std::time::{Duration, Instant};
 
@@ -25,14 +32,23 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
 use tui_textarea::{CursorMove, TextArea};
+use unicode_width::UnicodeWidthStr;
 
-use crate::ui::motion::{self, MotionTarget};
+use crate::ui::motion::{self, Motion, MotionKind, MotionSpan, MotionTarget, Region};
+use crate::ui::textobj::{self, TextObjKind};
 use crate::ui::words::{self, WordMotion};
+
+/// Reflow width fallback when the caller passes 0. Also the indent step
+/// for `>` / `<`.
+const SHIFTWIDTH: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
     Normal,
     Insert,
+    /// `R` — overtype mode: typed chars replace the char under the cursor
+    /// instead of inserting before it.
+    Replace,
     Visual(VisualKind),
 }
 
@@ -85,15 +101,73 @@ struct BlockInsert {
     pre_rows: usize,
 }
 
-/// Operator-pending latch for two-key chords (`dd`, `yy`, `gg`). Only
-/// supports same-character pairs in v1 — text objects / motions after
-/// an operator are deferred.
+/// A vim operator awaiting a motion / text object / doubled form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pending {
-    None,
-    D,
-    Y,
-    G,
+enum Operator {
+    Delete,
+    Change,
+    Yank,
+    Indent,
+    Dedent,
+    Lower,
+    Upper,
+    ToggleCase,
+    /// `gw` — reflow, keep the cursor.
+    ReflowKeep,
+    /// `gq` — reflow, move the cursor to the end of the formatted text.
+    ReflowMove,
+}
+
+/// The key that, when typed immediately after the operator, runs its
+/// linewise doubled form (`dd`, `cc`, `>>`, `guu`, `gqq`, …).
+fn op_double_key(op: Operator) -> char {
+    match op {
+        Operator::Delete => 'd',
+        Operator::Change => 'c',
+        Operator::Yank => 'y',
+        Operator::Indent => '>',
+        Operator::Dedent => '<',
+        Operator::Lower => 'u',
+        Operator::Upper => 'U',
+        Operator::ToggleCase => '~',
+        Operator::ReflowKeep => 'w',
+        Operator::ReflowMove => 'q',
+    }
+}
+
+/// `f F t T` — find-char on the current line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindKind {
+    Forward,
+    Back,
+    Till,
+    TillBack,
+}
+
+/// Operator-pending / multi-key parse state. Counts multiply: `2d3w`
+/// deletes 6 words. A leading `g` and the various "awaiting the next
+/// key" latches are mutually consumed one keystroke later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OpState {
+    /// Count typed before the operator (`2` in `2dw`).
+    count1: Option<usize>,
+    op: Option<Operator>,
+    /// Count typed after the operator (`3` in `d3w`).
+    count2: Option<usize>,
+    /// Saw a `g`; the next key completes a g-chord (`gg`, `gu`, `ge`, …).
+    await_g: bool,
+    /// Awaiting the text-object char after `i` / `a`; bool = "around".
+    await_obj: Option<bool>,
+    /// Awaiting the target char of an `f`/`F`/`t`/`T` find.
+    await_find: Option<FindKind>,
+    /// Awaiting the replacement char of `r`; the count is the run length.
+    await_replace: Option<usize>,
+}
+
+impl OpState {
+    fn eff_count(&self) -> usize {
+        self.count1.unwrap_or(1) * self.count2.unwrap_or(1)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +220,11 @@ pub struct BodyEditor {
     /// In-flight block insert, set by `I`/`A`/`c` in block-visual and
     /// consumed by the `Esc` that ends the insert.
     block_insert: Option<BlockInsert>,
-    pending: Pending,
+    /// Operator-pending / count / chord parse state.
+    ops: OpState,
+    /// Reflow width for `gw` / `gq`, refreshed from `[compose].text_width`
+    /// on every keystroke (the editor doesn't store the whole config).
+    text_width: u16,
     yank: Option<Yank>,
     /// Active yank-highlight flash, if any. Painted by `compose::draw`
     /// and expired by the host loop via [`Self::expire_yank_highlight`].
@@ -191,7 +269,8 @@ impl BodyEditor {
             visual_anchor: (0, 0),
             block_anchor: None,
             block_insert: None,
-            pending: Pending::None,
+            ops: OpState::default(),
+            text_width: 72,
             yank: None,
             yank_highlight: None,
             goal_col: GoalCol::Col(0),
@@ -208,7 +287,7 @@ impl BodyEditor {
         self.textarea.set_lines(lines, (0, 0));
         self.textarea.cancel_selection();
         self.mode = BodyMode::Normal;
-        self.pending = Pending::None;
+        self.ops = OpState::default();
         self.block_anchor = None;
         self.block_insert = None;
         self.yank_highlight = None;
@@ -231,13 +310,18 @@ impl BodyEditor {
     pub fn cursor_style(&self) -> SetCursorStyle {
         match self.mode {
             BodyMode::Insert => SetCursorStyle::SteadyBar,
+            BodyMode::Replace => SetCursorStyle::SteadyUnderScore,
             BodyMode::Normal | BodyMode::Visual(_) => SetCursorStyle::SteadyBlock,
         }
     }
 
-    pub fn handle_key(&mut self, k: KeyEvent) -> KeyOutcome {
+    pub fn handle_key(&mut self, k: KeyEvent, text_width: u16) -> KeyOutcome {
+        // Refresh the reflow width each keystroke — the editor doesn't
+        // hold the config, the host threads `[compose].text_width` in.
+        self.text_width = if text_width == 0 { 72 } else { text_width };
         match self.mode {
             BodyMode::Insert => self.handle_insert(k),
+            BodyMode::Replace => self.handle_replace(k),
             BodyMode::Normal => self.handle_normal(k),
             BodyMode::Visual(kind) => self.handle_visual(k, kind),
         }
@@ -307,73 +391,205 @@ impl BodyEditor {
         KeyOutcome::Consumed
     }
 
-    // ---------- Normal mode ----------
+    // ---------- Replace mode ----------
+
+    fn handle_replace(&mut self, k: KeyEvent) -> KeyOutcome {
+        // `R` overtype: printable chars replace the char under the cursor
+        // (appending past EOL), Backspace steps left, Esc returns to
+        // Normal nudging back one cell like Insert. Other keys are
+        // swallowed so nothing escapes mid-overtype.
+        match k.code {
+            KeyCode::Esc => {
+                self.mode = BodyMode::Normal;
+                self.textarea.move_cursor(CursorMove::Back);
+            }
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                let (row, col) = self.textarea.cursor();
+                if col < self.textarea.lines()[row].chars().count() {
+                    self.textarea.delete_next_char();
+                }
+                self.textarea.insert_char(c);
+            }
+            KeyCode::Enter => self.textarea.insert_newline(),
+            KeyCode::Backspace | KeyCode::Left => self.textarea.move_cursor(CursorMove::Back),
+            KeyCode::Right => self.textarea.move_cursor(CursorMove::Forward),
+            _ => {}
+        }
+        KeyOutcome::Consumed
+    }
+
+    // ---------- Normal mode (operator-pending engine) ----------
 
     fn handle_normal(&mut self, k: KeyEvent) -> KeyOutcome {
-        // Operator-pending: only same-char chords in v1. Any other key
-        // cancels the pending operator and is re-dispatched as a fresh
-        // Normal-mode key (vim-like — the pending state never leaks).
-        match self.pending {
-            Pending::D => {
-                self.pending = Pending::None;
-                if matches!(k.code, KeyCode::Char('d')) {
-                    self.delete_current_line();
-                    return KeyOutcome::Consumed;
-                }
-                // fall through to normal dispatch
-            }
-            Pending::Y => {
-                self.pending = Pending::None;
-                if matches!(k.code, KeyCode::Char('y')) {
-                    self.yank_current_line();
-                    return KeyOutcome::Consumed;
-                }
-            }
-            Pending::G => {
-                self.pending = Pending::None;
-                if matches!(k.code, KeyCode::Char('g')) {
-                    self.textarea.move_cursor(CursorMove::Top);
-                    self.textarea.move_cursor(CursorMove::Head);
-                    self.sync_goal();
-                    return KeyOutcome::Consumed;
-                }
-            }
-            Pending::None => {}
+        // --- multi-key continuations: each consumes its own latch ---
+        if let Some(n) = self.ops.await_replace.take() {
+            self.do_replace_char(n, k);
+            self.ops = OpState::default();
+            return KeyOutcome::Consumed;
+        }
+        if let Some(fk) = self.ops.await_find.take() {
+            let (op, count) = (self.ops.op, self.ops.eff_count());
+            self.do_find(fk, op, count, k);
+            self.ops = OpState::default();
+            return KeyOutcome::Consumed;
+        }
+        if let Some(around) = self.ops.await_obj.take() {
+            let op = self.ops.op;
+            self.do_text_object(op, around, k);
+            self.ops = OpState::default();
+            return KeyOutcome::Consumed;
+        }
+        if self.ops.await_g {
+            self.ops.await_g = false;
+            return self.handle_g(k);
         }
 
-        // Ctrl-R → redo, Ctrl-C → passthrough. Ctrl-d / Ctrl-u are
-        // motions and route through `motion::key_to_motion` below.
+        // --- count digits ---
+        if let KeyCode::Char(c) = k.code {
+            let slot_has = if self.ops.op.is_some() {
+                self.ops.count2
+            } else {
+                self.ops.count1
+            };
+            // `0` is the LineStart motion unless a count is in progress.
+            if !k.modifiers.contains(KeyModifiers::CONTROL)
+                && c.is_ascii_digit()
+                && (c != '0' || slot_has.is_some())
+            {
+                let d = c as usize - '0' as usize;
+                let slot = if self.ops.op.is_some() {
+                    &mut self.ops.count2
+                } else {
+                    &mut self.ops.count1
+                };
+                *slot = Some(slot.unwrap_or(0) * 10 + d);
+                return KeyOutcome::Consumed;
+            }
+        }
+
+        // --- Ctrl chords (Ctrl-d/u are operator-capable motions) ---
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(m) = motion::key_to_motion(k) {
-                motion::apply(self, m);
-                return KeyOutcome::Consumed;
+                return self.run_motion(m);
             }
             return self.handle_normal_ctrl(k);
         }
 
-        // Passthrough first so cmdline keys reach the app.
+        // --- passthrough to the host cmdline / field cycle ---
         match k.code {
             KeyCode::Char(':')
             | KeyCode::Char('/')
             | KeyCode::Char('?')
             | KeyCode::Tab
-            | KeyCode::BackTab => return KeyOutcome::PassThrough,
+            | KeyCode::BackTab => {
+                self.ops = OpState::default();
+                return KeyOutcome::PassThrough;
+            }
             _ => {}
         }
 
-        // Motions: hjkl / w / b / e / 0 / $ / ^ / G — shared with the
-        // reader via the MotionTarget impl above.
+        // --- operator-pending intro keys (before motion translation) ---
+        if let Some(op) = self.ops.op {
+            match k.code {
+                KeyCode::Char(c) if c == op_double_key(op) => {
+                    let n = self.ops.eff_count();
+                    self.apply_linewise_lines(op, n);
+                    self.ops = OpState::default();
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('i') => {
+                    self.ops.await_obj = Some(false);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('a') => {
+                    self.ops.await_obj = Some(true);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('f') => {
+                    self.ops.await_find = Some(FindKind::Forward);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('F') => {
+                    self.ops.await_find = Some(FindKind::Back);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('t') => {
+                    self.ops.await_find = Some(FindKind::Till);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('T') => {
+                    self.ops.await_find = Some(FindKind::TillBack);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('g') => {
+                    self.ops.await_g = true;
+                    return KeyOutcome::Consumed;
+                }
+                _ => {}
+            }
+        }
+
+        // --- motions: operator target (run_motion applies the op) or
+        //     plain count-repeated movement ---
         if let Some(m) = motion::key_to_motion(k) {
-            motion::apply(self, m);
-            return KeyOutcome::Consumed;
+            return self.run_motion(m);
+        }
+
+        // An operator was pending but the key isn't a valid continuation
+        // (e.g. `dz`): abandon it (and its counts) and handle the key
+        // fresh. Fresh keys (no op) keep any count they were building.
+        if self.ops.op.take().is_some() {
+            self.ops = OpState::default();
         }
 
         match k.code {
+            // ---- pending-state setters: keep counts, await next key ----
+            KeyCode::Char('d') => {
+                self.ops.op = Some(Operator::Delete);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('c') => {
+                self.ops.op = Some(Operator::Change);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('y') => {
+                self.ops.op = Some(Operator::Yank);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('>') => {
+                self.ops.op = Some(Operator::Indent);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('<') => {
+                self.ops.op = Some(Operator::Dedent);
+                return KeyOutcome::Consumed;
+            }
             KeyCode::Char('g') => {
-                self.pending = Pending::G;
+                self.ops.await_g = true;
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('f') => {
+                self.ops.await_find = Some(FindKind::Forward);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('F') => {
+                self.ops.await_find = Some(FindKind::Back);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('t') => {
+                self.ops.await_find = Some(FindKind::Till);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('T') => {
+                self.ops.await_find = Some(FindKind::TillBack);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('r') => {
+                self.ops.await_replace = Some(self.ops.eff_count());
+                return KeyOutcome::Consumed;
             }
 
-            // Insert entry
+            // ---- actions: do work, then fall through to the reset ----
             KeyCode::Char('i') => self.mode = BodyMode::Insert,
             KeyCode::Char('a') => {
                 self.textarea.move_cursor(CursorMove::Forward);
@@ -384,7 +600,7 @@ impl BodyEditor {
                 self.mode = BodyMode::Insert;
             }
             KeyCode::Char('I') => {
-                self.textarea.move_cursor(CursorMove::Head);
+                self.move_first_non_blank();
                 self.mode = BodyMode::Insert;
             }
             KeyCode::Char('o') => {
@@ -398,20 +614,34 @@ impl BodyEditor {
                 self.textarea.move_cursor(CursorMove::Up);
                 self.mode = BodyMode::Insert;
             }
+            KeyCode::Char('R') => self.mode = BodyMode::Replace,
 
-            // Edits
             KeyCode::Char('x') => {
-                self.textarea.delete_next_char();
+                let n = self.ops.eff_count();
+                self.delete_chars_at_cursor(n);
             }
             KeyCode::Char('X') => {
-                self.textarea.delete_char();
+                let n = self.ops.eff_count();
+                self.delete_chars_before_cursor(n);
             }
-            KeyCode::Char('d') => {
-                self.pending = Pending::D;
+            KeyCode::Char('~') => {
+                let n = self.ops.eff_count();
+                self.toggle_case_at_cursor(n);
             }
-            KeyCode::Char('y') => {
-                self.pending = Pending::Y;
+            KeyCode::Char('J') => {
+                let n = self.ops.eff_count();
+                self.join_lines(n, true);
             }
+            KeyCode::Char('s') => {
+                let n = self.ops.eff_count();
+                self.substitute_chars(n);
+            }
+            KeyCode::Char('S') => {
+                let n = self.ops.eff_count();
+                self.substitute_lines(n);
+            }
+            KeyCode::Char('C') => self.change_to_eol(),
+            KeyCode::Char('D') => self.delete_to_eol(),
             // `Y` is vim's line-yank, same as `yy`.
             KeyCode::Char('Y') => self.yank_current_line(),
             KeyCode::Char('p') => self.paste_after(),
@@ -426,7 +656,92 @@ impl BodyEditor {
 
             _ => {}
         }
+        self.ops = OpState::default();
         KeyOutcome::Consumed
+    }
+
+    /// Dispatch a motion key: when an operator is pending, resolve the
+    /// motion to a region and apply the operator; otherwise move the
+    /// cursor `count` times. Always clears the parse state.
+    fn run_motion(&mut self, m: Motion) -> KeyOutcome {
+        let count = self.ops.eff_count();
+        if let Some(op) = self.ops.op {
+            let cursor = self.textarea.cursor();
+            let m = self.remap_change_word(op, m, cursor);
+            if let Some(span) = motion::resolve_motion_span(self.textarea.lines(), cursor, m, count)
+            {
+                let region = motion::span_to_region(self.textarea.lines(), span);
+                self.apply_operator(op, region);
+            }
+        } else {
+            for _ in 0..count {
+                motion::apply(self, m);
+            }
+        }
+        self.ops = OpState::default();
+        KeyOutcome::Consumed
+    }
+
+    /// Vim's `cw` special case: Change + `w`/`W` on a non-blank char acts
+    /// like `ce`/`cE` (no trailing whitespace swallowed).
+    fn remap_change_word(&self, op: Operator, m: Motion, cursor: (usize, usize)) -> Motion {
+        if op != Operator::Change {
+            return m;
+        }
+        let on_blank = self
+            .textarea
+            .lines()
+            .get(cursor.0)
+            .and_then(|l| l.chars().nth(cursor.1))
+            .map(|c| c.is_whitespace())
+            .unwrap_or(true);
+        match m {
+            Motion::WordForward if !on_blank => Motion::WordEnd,
+            Motion::WordForwardBig if !on_blank => Motion::WordEndBig,
+            _ => m,
+        }
+    }
+
+    /// Resolve the second key of a `g`-chord. The operator (if any) is
+    /// still live, so `dgg` / `dge` work as operator targets, while `gu`
+    /// / `gU` / `g~` / `gw` / `gq` *introduce* an operator that awaits a
+    /// further motion.
+    fn handle_g(&mut self, k: KeyEvent) -> KeyOutcome {
+        match k.code {
+            KeyCode::Char('g') => self.run_motion(Motion::FirstLine),
+            KeyCode::Char('e') => self.run_motion(Motion::WordEndBack),
+            KeyCode::Char('E') => self.run_motion(Motion::WordEndBackBig),
+            KeyCode::Char('u') if self.ops.op.is_none() => {
+                self.ops.op = Some(Operator::Lower);
+                KeyOutcome::Consumed
+            }
+            KeyCode::Char('U') if self.ops.op.is_none() => {
+                self.ops.op = Some(Operator::Upper);
+                KeyOutcome::Consumed
+            }
+            KeyCode::Char('~') if self.ops.op.is_none() => {
+                self.ops.op = Some(Operator::ToggleCase);
+                KeyOutcome::Consumed
+            }
+            KeyCode::Char('w') if self.ops.op.is_none() => {
+                self.ops.op = Some(Operator::ReflowKeep);
+                KeyOutcome::Consumed
+            }
+            KeyCode::Char('q') if self.ops.op.is_none() => {
+                self.ops.op = Some(Operator::ReflowMove);
+                KeyOutcome::Consumed
+            }
+            KeyCode::Char('J') if self.ops.op.is_none() => {
+                let n = self.ops.eff_count();
+                self.join_lines(n, false);
+                self.ops = OpState::default();
+                KeyOutcome::Consumed
+            }
+            _ => {
+                self.ops = OpState::default();
+                KeyOutcome::Consumed
+            }
+        }
     }
 
     fn handle_normal_ctrl(&mut self, k: KeyEvent) -> KeyOutcome {
@@ -446,7 +761,499 @@ impl BodyEditor {
             KeyCode::Char('c') => return KeyOutcome::PassThrough,
             _ => {}
         }
+        self.ops = OpState::default();
         KeyOutcome::Consumed
+    }
+
+    // ---------- Operator application ----------
+
+    /// Apply `op` to a normalised [`Region`]. The single sink for both
+    /// Normal-mode operators (`d{motion}`, `ciw`, `gqap`, …) and the
+    /// visual-mode operators that route through [`Self::visual_region`].
+    fn apply_operator(&mut self, op: Operator, region: Region) {
+        let text = self.region_text(&region);
+        match op {
+            Operator::Yank => {
+                self.yank = Some(Yank {
+                    text,
+                    line_wise: region.linewise,
+                });
+                let ranges = self.region_ranges(&region);
+                self.arm_yank_highlight(ranges);
+                self.textarea.cancel_selection();
+                self.textarea.move_cursor(CursorMove::Jump(
+                    region.start.0 as u16,
+                    region.start.1 as u16,
+                ));
+                self.sync_goal();
+            }
+            Operator::Delete => {
+                self.yank = Some(Yank {
+                    text,
+                    line_wise: region.linewise,
+                });
+                self.delete_region(&region);
+                self.sync_goal();
+            }
+            Operator::Change => {
+                if region.linewise {
+                    self.yank = Some(Yank {
+                        text,
+                        line_wise: true,
+                    });
+                    self.change_lines(region.start.0, region.end.0);
+                } else {
+                    if region.start != region.end {
+                        self.yank = Some(Yank {
+                            text,
+                            line_wise: false,
+                        });
+                        self.delete_region(&region);
+                    }
+                    self.mode = BodyMode::Insert;
+                }
+            }
+            Operator::Lower | Operator::Upper | Operator::ToggleCase => {
+                let body = if region.linewise {
+                    text.trim_end_matches('\n')
+                } else {
+                    text.as_str()
+                };
+                let new = transform_case(body, op);
+                self.replace_region(&region, &new);
+                self.textarea.cancel_selection();
+                self.textarea.move_cursor(CursorMove::Jump(
+                    region.start.0 as u16,
+                    region.start.1 as u16,
+                ));
+                self.sync_goal();
+            }
+            Operator::Indent | Operator::Dedent => {
+                self.shift_lines(region.start.0, region.end.0, matches!(op, Operator::Indent));
+            }
+            Operator::ReflowKeep | Operator::ReflowMove => {
+                self.reflow_region(
+                    region.start.0,
+                    region.end.0,
+                    matches!(op, Operator::ReflowMove),
+                );
+            }
+        }
+    }
+
+    /// Build a linewise region of `n` lines from the cursor row and apply
+    /// `op` to it — the doubled-operator form (`dd`, `cc`, `2yy`, `guu`).
+    fn apply_linewise_lines(&mut self, op: Operator, n: usize) {
+        let (row, _) = self.textarea.cursor();
+        let last = self.textarea.lines().len().saturating_sub(1);
+        let bot = (row + n.saturating_sub(1)).min(last);
+        self.apply_operator(
+            op,
+            Region {
+                start: (row, 0),
+                end: (bot, 0),
+                linewise: true,
+            },
+        );
+    }
+
+    fn region_text(&self, region: &Region) -> String {
+        let lines = self.textarea.lines();
+        if region.linewise {
+            extract_lines(lines, region.start.0, region.end.0)
+        } else {
+            extract_range(lines, region.start, region.end)
+        }
+    }
+
+    fn region_ranges(&self, region: &Region) -> Vec<(u16, u16, u16)> {
+        if region.linewise {
+            self.line_ranges(region.start.0, region.end.0)
+        } else {
+            self.char_ranges(region.start.0, region.start.1, region.end.0, region.end.1)
+        }
+    }
+
+    /// Cut a charwise or linewise region. Linewise routes through
+    /// [`Self::cut_lines`] so the trailing-newline bookkeeping stays in
+    /// one place; charwise is a single `cut()` (one undo step).
+    fn delete_region(&mut self, region: &Region) {
+        self.textarea.cancel_selection();
+        if region.linewise {
+            self.cut_lines(region.start.0, region.end.0);
+        } else if region.start != region.end {
+            self.textarea.move_cursor(CursorMove::Jump(
+                region.start.0 as u16,
+                region.start.1 as u16,
+            ));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(region.end.0 as u16, region.end.1 as u16));
+            self.textarea.cut();
+        }
+    }
+
+    /// Cut whole lines `top..=bot` (including the joining newline) as a
+    /// single history step, handling the interior / last-line / single-
+    /// line cases so no stray empty row is left behind.
+    fn cut_lines(&mut self, top: usize, bot: usize) {
+        let line_count = self.textarea.lines().len();
+        self.textarea.cancel_selection();
+        if bot + 1 < line_count {
+            self.textarea.move_cursor(CursorMove::Jump(top as u16, 0));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump((bot + 1) as u16, 0));
+            self.textarea.cut();
+        } else if top > 0 {
+            let prev_end = self.textarea.lines()[top - 1].chars().count() as u16;
+            let bot_end = self.textarea.lines()[bot].chars().count() as u16;
+            self.textarea
+                .move_cursor(CursorMove::Jump((top - 1) as u16, prev_end));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(bot as u16, bot_end));
+            self.textarea.cut();
+        } else {
+            let bot_end = self.textarea.lines()[bot].chars().count() as u16;
+            self.textarea.move_cursor(CursorMove::Jump(0, 0));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(bot as u16, bot_end));
+            self.textarea.cut();
+        }
+    }
+
+    /// `cc` / `S`: collapse lines `top..=bot` to a single empty line and
+    /// drop into Insert (vim keeps the row, unlike `dd`).
+    fn change_lines(&mut self, top: usize, bot: usize) {
+        let bot_end = self.textarea.lines()[bot].chars().count() as u16;
+        self.textarea.cancel_selection();
+        self.textarea.move_cursor(CursorMove::Jump(top as u16, 0));
+        self.textarea.start_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(bot as u16, bot_end));
+        self.textarea.cut();
+        self.textarea.cancel_selection();
+        self.mode = BodyMode::Insert;
+    }
+
+    /// Replace a region's text in place (case ops, reflow, indent). Uses
+    /// `insert_str` over a selection, which is 2 history steps (delete +
+    /// insert) — accepted v1 drift.
+    fn replace_region(&mut self, region: &Region, new: &str) {
+        self.textarea.cancel_selection();
+        if region.linewise {
+            let bot_end = self.textarea.lines()[region.end.0].chars().count() as u16;
+            self.textarea
+                .move_cursor(CursorMove::Jump(region.start.0 as u16, 0));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(region.end.0 as u16, bot_end));
+            self.textarea.insert_str(new);
+        } else if region.start != region.end {
+            self.textarea.move_cursor(CursorMove::Jump(
+                region.start.0 as u16,
+                region.start.1 as u16,
+            ));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(region.end.0 as u16, region.end.1 as u16));
+            self.textarea.insert_str(new);
+        }
+    }
+
+    /// `>` / `<`: add or remove one [`SHIFTWIDTH`] of leading whitespace
+    /// per line, replacing the whole block in one `insert_str`.
+    fn shift_lines(&mut self, top: usize, bot: usize, indent: bool) {
+        let joined = {
+            let lines = self.textarea.lines();
+            (top..=bot)
+                .map(|r| shift_line(&lines[r], indent))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let bot_end = self.textarea.lines()[bot].chars().count() as u16;
+        self.textarea.cancel_selection();
+        self.textarea.move_cursor(CursorMove::Jump(top as u16, 0));
+        self.textarea.start_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(bot as u16, bot_end));
+        self.textarea.insert_str(joined);
+        let col = self.textarea.lines()[top]
+            .chars()
+            .position(|c| !c.is_whitespace())
+            .unwrap_or(0);
+        self.textarea.cancel_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(top as u16, col as u16));
+        self.sync_goal();
+    }
+
+    /// `gw` / `gq`: rewrap the paragraph(s) in `top..=bot` to the
+    /// configured width. `gq` parks the cursor on the last reflowed line;
+    /// `gw` restores the pre-op cursor (clamped).
+    fn reflow_region(&mut self, top: usize, bot: usize, move_to_end: bool) {
+        let saved = self.textarea.cursor();
+        let text = {
+            let lines = self.textarea.lines();
+            (top..=bot)
+                .map(|r| lines[r].clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let wrapped = reflow_paragraph(&text, self.text_width as usize);
+        let new_bot = top + wrapped.len().saturating_sub(1);
+        let joined = wrapped.join("\n");
+        let bot_end = self.textarea.lines()[bot].chars().count() as u16;
+        self.textarea.cancel_selection();
+        self.textarea.move_cursor(CursorMove::Jump(top as u16, 0));
+        self.textarea.start_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(bot as u16, bot_end));
+        self.textarea.insert_str(joined);
+        self.textarea.cancel_selection();
+        if move_to_end {
+            self.textarea
+                .move_cursor(CursorMove::Jump(new_bot as u16, 0));
+        } else {
+            let last = self.textarea.lines().len().saturating_sub(1);
+            let r = saved.0.min(last);
+            let cmax = self.textarea.lines()[r].chars().count().saturating_sub(1);
+            self.textarea
+                .move_cursor(CursorMove::Jump(r as u16, saved.1.min(cmax) as u16));
+        }
+        self.sync_goal();
+    }
+
+    // ---------- Single-key edits ----------
+
+    fn delete_chars_at_cursor(&mut self, n: usize) {
+        let (row, col) = self.textarea.cursor();
+        let len = self.textarea.lines()[row].chars().count();
+        if col >= len {
+            return;
+        }
+        let region = Region {
+            start: (row, col),
+            end: (row, (col + n).min(len)),
+            linewise: false,
+        };
+        self.yank = Some(Yank {
+            text: self.region_text(&region),
+            line_wise: false,
+        });
+        self.delete_region(&region);
+        self.sync_goal();
+    }
+
+    fn delete_chars_before_cursor(&mut self, n: usize) {
+        let (row, col) = self.textarea.cursor();
+        if col == 0 {
+            return;
+        }
+        let region = Region {
+            start: (row, col.saturating_sub(n)),
+            end: (row, col),
+            linewise: false,
+        };
+        self.yank = Some(Yank {
+            text: self.region_text(&region),
+            line_wise: false,
+        });
+        self.delete_region(&region);
+        self.sync_goal();
+    }
+
+    fn toggle_case_at_cursor(&mut self, n: usize) {
+        for _ in 0..n.max(1) {
+            let (row, col) = self.textarea.cursor();
+            let chars: Vec<char> = self.textarea.lines()[row].chars().collect();
+            if col >= chars.len() {
+                break;
+            }
+            let toggled = toggle_case_char(chars[col]);
+            self.textarea.cancel_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(row as u16, col as u16));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(row as u16, (col + 1) as u16));
+            self.textarea.insert_str(toggled.to_string());
+        }
+        self.sync_goal();
+    }
+
+    /// `J` (`with_space`) / `gJ`. With count `n`, joins `n` lines (so at
+    /// least one join). Removes the next line's leading indent and, for
+    /// `J`, inserts a single separating space unless either side is empty.
+    fn join_lines(&mut self, n: usize, with_space: bool) {
+        let joins = n.saturating_sub(1).max(1);
+        for _ in 0..joins {
+            let (row, _) = self.textarea.cursor();
+            if row + 1 >= self.textarea.lines().len() {
+                break;
+            }
+            let cur_len = self.textarea.lines()[row].chars().count();
+            let next = self.textarea.lines()[row + 1].clone();
+            let lead = next.chars().take_while(|c| c.is_whitespace()).count();
+            let cur_ends_blank = self.textarea.lines()[row]
+                .chars()
+                .last()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(true);
+            let next_empty = next.trim().is_empty();
+            self.textarea.cancel_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(row as u16, cur_len as u16));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump((row + 1) as u16, lead as u16));
+            self.textarea.cut();
+            if with_space && cur_len > 0 && !cur_ends_blank && !next_empty {
+                self.textarea.insert_str(" ");
+                self.textarea.move_cursor(CursorMove::Back);
+            }
+        }
+        self.sync_goal();
+    }
+
+    /// `s` — substitute `n` chars (`cl`): delete then Insert.
+    fn substitute_chars(&mut self, n: usize) {
+        let (row, col) = self.textarea.cursor();
+        let len = self.textarea.lines()[row].chars().count();
+        let region = Region {
+            start: (row, col),
+            end: (row, (col + n).min(len)),
+            linewise: false,
+        };
+        if region.start != region.end {
+            self.yank = Some(Yank {
+                text: self.region_text(&region),
+                line_wise: false,
+            });
+            self.delete_region(&region);
+        }
+        self.mode = BodyMode::Insert;
+    }
+
+    /// `S` — substitute `n` lines (`cc`).
+    fn substitute_lines(&mut self, n: usize) {
+        let (row, _) = self.textarea.cursor();
+        let last = self.textarea.lines().len().saturating_sub(1);
+        let bot = (row + n.saturating_sub(1)).min(last);
+        let region = Region {
+            start: (row, 0),
+            end: (bot, 0),
+            linewise: true,
+        };
+        self.yank = Some(Yank {
+            text: self.region_text(&region),
+            line_wise: true,
+        });
+        self.change_lines(row, bot);
+    }
+
+    /// `C` — change to end of line (`c$`).
+    fn change_to_eol(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let len = self.textarea.lines()[row].chars().count();
+        let region = Region {
+            start: (row, col),
+            end: (row, len),
+            linewise: false,
+        };
+        if region.start != region.end {
+            self.yank = Some(Yank {
+                text: self.region_text(&region),
+                line_wise: false,
+            });
+            self.delete_region(&region);
+        }
+        self.mode = BodyMode::Insert;
+    }
+
+    /// `D` — delete to end of line (`d$`).
+    fn delete_to_eol(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let len = self.textarea.lines()[row].chars().count();
+        let region = Region {
+            start: (row, col),
+            end: (row, len),
+            linewise: false,
+        };
+        self.yank = Some(Yank {
+            text: self.region_text(&region),
+            line_wise: false,
+        });
+        self.delete_region(&region);
+        self.sync_goal();
+    }
+
+    /// `r{char}` — replace the next `n` chars (clamped to EOL) with the
+    /// typed char, leaving the cursor on the last replaced cell.
+    fn do_replace_char(&mut self, n: usize, k: KeyEvent) {
+        let KeyCode::Char(ch) = k.code else {
+            return; // Esc / other cancels
+        };
+        let (row, col) = self.textarea.cursor();
+        let len = self.textarea.lines()[row].chars().count();
+        if col >= len {
+            return;
+        }
+        let n = n.min(len - col).max(1);
+        let repl: String = std::iter::repeat_n(ch, n).collect();
+        self.textarea.cancel_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(row as u16, col as u16));
+        self.textarea.start_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(row as u16, (col + n) as u16));
+        self.textarea.insert_str(repl);
+        self.textarea.move_cursor(CursorMove::Back);
+        self.sync_goal();
+    }
+
+    /// `f F t T` — resolve the find against the current line. With an
+    /// operator pending, apply it to the spanned region; otherwise move.
+    fn do_find(&mut self, fk: FindKind, op: Option<Operator>, count: usize, k: KeyEvent) {
+        let KeyCode::Char(ch) = k.code else {
+            return;
+        };
+        let cursor = self.textarea.cursor();
+        let chars: Vec<char> = self.textarea.lines()[cursor.0].chars().collect();
+        let Some(span) = find_span(cursor, &chars, fk, ch, count) else {
+            return;
+        };
+        if let Some(op) = op {
+            let region = motion::span_to_region(self.textarea.lines(), span);
+            self.apply_operator(op, region);
+        } else {
+            self.textarea.cancel_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(span.end.0 as u16, span.end.1 as u16));
+            self.sync_goal();
+        }
+    }
+
+    /// `i{obj}` / `a{obj}` after an operator — resolve the text object and
+    /// apply. Text objects require a pending operator (no visual entry
+    /// from Normal here).
+    fn do_text_object(&mut self, op: Option<Operator>, around: bool, k: KeyEvent) {
+        let KeyCode::Char(c) = k.code else { return };
+        let (Some(obj), Some(op)) = (textobj::key_to_text_object(c), op) else {
+            return;
+        };
+        let kind = if around {
+            TextObjKind::Around
+        } else {
+            TextObjKind::Inner
+        };
+        let cursor = self.textarea.cursor();
+        if let Some(span) = textobj::resolve_text_object(self.textarea.lines(), cursor, obj, kind) {
+            let region = motion::span_to_region(self.textarea.lines(), span);
+            self.apply_operator(op, region);
+        }
     }
 
     /// Re-establish the vim goal column from the live cursor column.
@@ -530,6 +1337,7 @@ impl BodyEditor {
     // ---------- Visual mode ----------
 
     fn enter_visual(&mut self, kind: VisualKind) {
+        self.ops = OpState::default();
         self.visual_anchor = self.textarea.cursor();
         self.block_anchor = if kind == VisualKind::Block {
             Some(self.visual_anchor)
@@ -541,9 +1349,79 @@ impl BodyEditor {
     }
 
     fn exit_visual_to_normal(&mut self) {
+        self.ops = OpState::default();
         self.textarea.cancel_selection();
         self.block_anchor = None;
         self.mode = BodyMode::Normal;
+    }
+
+    /// The current char/line visual selection as an operator [`Region`].
+    /// Char-wise is inclusive of the cursor cell (vim semantics); block
+    /// returns `None` (it routes through its own rectangle path).
+    fn visual_region(&self, kind: VisualKind) -> Option<Region> {
+        let anchor = self.visual_anchor;
+        let cur = self.textarea.cursor();
+        match kind {
+            VisualKind::Char => {
+                let (lo, hi) = if anchor <= cur {
+                    (anchor, cur)
+                } else {
+                    (cur, anchor)
+                };
+                let len = self
+                    .textarea
+                    .lines()
+                    .get(hi.0)
+                    .map(|l| l.chars().count())
+                    .unwrap_or(0);
+                Some(Region {
+                    start: lo,
+                    end: (hi.0, (hi.1 + 1).min(len)),
+                    linewise: false,
+                })
+            }
+            VisualKind::Line => {
+                let (top, bot) = (anchor.0.min(cur.0), anchor.0.max(cur.0));
+                Some(Region {
+                    start: (top, 0),
+                    end: (bot, 0),
+                    linewise: true,
+                })
+            }
+            VisualKind::Block => None,
+        }
+    }
+
+    /// Apply a non-`d`/`y`/`c` operator (`> < gu gU g~ gw gq`) to the
+    /// current selection and leave visual. Block selections are skipped.
+    fn visual_apply(&mut self, kind: VisualKind, op: Operator) {
+        if let Some(region) = self.visual_region(kind) {
+            self.apply_operator(op, region);
+        }
+        self.exit_visual_to_normal();
+    }
+
+    /// Reshape the selection to the text object under the cursor (`viw`,
+    /// `va"`, `vip`). Anchor moves to the object start, cursor to its end.
+    fn visual_select_object(&mut self, around: bool, k: KeyEvent) {
+        let KeyCode::Char(c) = k.code else { return };
+        let Some(obj) = textobj::key_to_text_object(c) else {
+            return;
+        };
+        let objkind = if around {
+            TextObjKind::Around
+        } else {
+            TextObjKind::Inner
+        };
+        let cursor = self.textarea.cursor();
+        if let Some(span) =
+            textobj::resolve_text_object(self.textarea.lines(), cursor, obj, objkind)
+        {
+            self.visual_anchor = span.start;
+            self.textarea
+                .move_cursor(CursorMove::Jump(span.end.0 as u16, span.end.1 as u16));
+            self.refresh_visual_selection();
+        }
     }
 
     /// Switch visual kind in place, keeping the anchor. Char/Line drive
@@ -608,17 +1486,54 @@ impl BodyEditor {
             }
             return KeyOutcome::Consumed;
         }
-        // `gg` chord resolution: a prior `g` armed `Pending::G`; this
-        // call's `g` triggers FirstLine, anything else clears the latch
-        // and re-dispatches as a fresh key.
-        if matches!(self.pending, Pending::G) {
-            self.pending = Pending::None;
-            if matches!(k.code, KeyCode::Char('g')) {
-                motion::apply(self, motion::Motion::FirstLine);
-                self.refresh_visual_selection();
-                return KeyOutcome::Consumed;
+        // Text object after `i`/`a`: reshape the selection to the object.
+        if let Some(around) = self.ops.await_obj.take() {
+            self.visual_select_object(around, k);
+            return KeyOutcome::Consumed;
+        }
+        // `g`-chord resolution: a prior `g` armed `await_g`. `gg`/`ge`/`gE`
+        // extend the selection; `gu`/`gU`/`g~`/`gw`/`gq` apply that
+        // operator to it; anything else clears the latch.
+        if self.ops.await_g {
+            self.ops.await_g = false;
+            match k.code {
+                KeyCode::Char('g') => {
+                    motion::apply(self, Motion::FirstLine);
+                    self.refresh_visual_selection();
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('e') => {
+                    motion::apply(self, Motion::WordEndBack);
+                    self.refresh_visual_selection();
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('E') => {
+                    motion::apply(self, Motion::WordEndBackBig);
+                    self.refresh_visual_selection();
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('u') => {
+                    self.visual_apply(kind, Operator::Lower);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('U') => {
+                    self.visual_apply(kind, Operator::Upper);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('~') => {
+                    self.visual_apply(kind, Operator::ToggleCase);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('w') => {
+                    self.visual_apply(kind, Operator::ReflowKeep);
+                    return KeyOutcome::Consumed;
+                }
+                KeyCode::Char('q') => {
+                    self.visual_apply(kind, Operator::ReflowMove);
+                    return KeyOutcome::Consumed;
+                }
+                _ => {}
             }
-            // fall through
         }
 
         // Passthrough: ex-cmdline / field-cycle. The user's selection
@@ -710,10 +1625,29 @@ impl BodyEditor {
                 return KeyOutcome::Consumed;
             }
 
-            // Arm the `gg` chord; resolution handled at the top of the
-            // next `handle_visual` call.
+            // Indent / dedent the selected lines.
+            KeyCode::Char('>') => {
+                self.visual_apply(kind, Operator::Indent);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('<') => {
+                self.visual_apply(kind, Operator::Dedent);
+                return KeyOutcome::Consumed;
+            }
+
+            // Reshape the selection to a text object (`iw`, `i"`, `ip`, …).
+            KeyCode::Char('i') if kind != VisualKind::Block => {
+                self.ops.await_obj = Some(false);
+                return KeyOutcome::Consumed;
+            }
+            KeyCode::Char('a') if kind != VisualKind::Block => {
+                self.ops.await_obj = Some(true);
+                return KeyOutcome::Consumed;
+            }
+
+            // Arm a `g`-chord; resolved at the top of the next call.
             KeyCode::Char('g') => {
-                self.pending = Pending::G;
+                self.ops.await_g = true;
                 return KeyOutcome::Consumed;
             }
 
@@ -909,48 +1843,6 @@ impl BodyEditor {
     }
 
     // ---------- Line ops ----------
-
-    fn delete_current_line(&mut self) {
-        // Implemented as a selection-then-cut so the change is a single
-        // history step (one `u` press undoes the whole line removal).
-        // Compounding `delete_line_by_end` + `delete_next_char` would
-        // record two steps and take two undo presses to revert.
-        let (row, _) = self.textarea.cursor();
-        let line = self.textarea.lines().get(row).cloned().unwrap_or_default();
-        let line_count = self.textarea.lines().len();
-        self.yank = Some(Yank {
-            text: format!("{line}\n"),
-            line_wise: true,
-        });
-        self.textarea.cancel_selection();
-        if row + 1 < line_count {
-            // Select from (row, 0) to (row + 1, 0) — covers the line
-            // plus its trailing newline.
-            self.textarea.move_cursor(CursorMove::Jump(row as u16, 0));
-            self.textarea.start_selection();
-            self.textarea
-                .move_cursor(CursorMove::Jump((row + 1) as u16, 0));
-            self.textarea.cut();
-        } else if row > 0 {
-            // Last line of a multi-line buffer: extend back through the
-            // preceding newline so the buffer doesn't end up with a
-            // trailing empty row.
-            let prev_end = self.textarea.lines()[row - 1].chars().count() as u16;
-            let end = self.textarea.lines()[row].chars().count() as u16;
-            self.textarea
-                .move_cursor(CursorMove::Jump((row - 1) as u16, prev_end));
-            self.textarea.start_selection();
-            self.textarea.move_cursor(CursorMove::Jump(row as u16, end));
-            self.textarea.cut();
-        } else {
-            // Single-line buffer: select the line and cut — leaves [""].
-            let end = self.textarea.lines()[row].chars().count() as u16;
-            self.textarea.move_cursor(CursorMove::Jump(0, 0));
-            self.textarea.start_selection();
-            self.textarea.move_cursor(CursorMove::Jump(0, end));
-            self.textarea.cut();
-        }
-    }
 
     fn yank_current_line(&mut self) {
         let (row, _) = self.textarea.cursor();
@@ -1209,8 +2101,26 @@ impl MotionTarget for BodyEditor {
         self.word_move(WordMotion::End, true);
         self.sync_goal();
     }
+    fn move_word_end_back(&mut self) {
+        self.word_move(WordMotion::EndBack, false);
+        self.sync_goal();
+    }
+    fn move_word_end_back_big(&mut self) {
+        self.word_move(WordMotion::EndBack, true);
+        self.sync_goal();
+    }
     fn move_line_start(&mut self) {
         self.textarea.move_cursor(CursorMove::Head);
+        self.sync_goal();
+    }
+    fn move_first_non_blank(&mut self) {
+        let (row, _) = self.textarea.cursor();
+        let col = self.textarea.lines()[row]
+            .chars()
+            .position(|c| !c.is_whitespace())
+            .unwrap_or(0);
+        self.textarea
+            .move_cursor(CursorMove::Jump(row as u16, col as u16));
         self.sync_goal();
     }
     fn move_line_end(&mut self) {
@@ -1280,6 +2190,172 @@ fn extract_lines(lines: &[String], start_row: usize, end_row: usize) -> String {
     out
 }
 
+fn toggle_case_char(c: char) -> char {
+    if c.is_uppercase() {
+        c.to_lowercase().next().unwrap_or(c)
+    } else if c.is_lowercase() {
+        c.to_uppercase().next().unwrap_or(c)
+    } else {
+        c
+    }
+}
+
+/// Map a string through a case operator (`gu` / `gU` / `g~`). Uses the
+/// full Unicode case mappings so e.g. `ß` → `SS` survives.
+fn transform_case(s: &str, op: Operator) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match op {
+            Operator::Lower => out.extend(c.to_lowercase()),
+            Operator::Upper => out.extend(c.to_uppercase()),
+            Operator::ToggleCase => {
+                if c.is_uppercase() {
+                    out.extend(c.to_lowercase());
+                } else if c.is_lowercase() {
+                    out.extend(c.to_uppercase());
+                } else {
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// One step of indent (`>`) or dedent (`<`). Blank lines are left alone;
+/// dedent removes up to [`SHIFTWIDTH`] leading spaces or a single tab.
+fn shift_line(line: &str, indent: bool) -> String {
+    if line.trim().is_empty() {
+        return line.to_string();
+    }
+    if indent {
+        let mut s = " ".repeat(SHIFTWIDTH);
+        s.push_str(line);
+        return s;
+    }
+    let mut removed = 0;
+    let mut cut = 0;
+    for (i, c) in line.char_indices() {
+        if c == ' ' && removed < SHIFTWIDTH {
+            removed += 1;
+            cut = i + c.len_utf8();
+        } else if c == '\t' && removed == 0 {
+            cut = i + c.len_utf8();
+            break;
+        } else {
+            break;
+        }
+    }
+    line[cut..].to_string()
+}
+
+/// Resolve an `f`/`F`/`t`/`T` find on a single line's chars to a span
+/// from the cursor to the target. Forward finds are inclusive, backward
+/// finds exclusive (so `dF` / `dT` stop before the cursor cell). `None`
+/// when the char isn't found `count` times.
+fn find_span(
+    cursor: (usize, usize),
+    chars: &[char],
+    fk: FindKind,
+    ch: char,
+    count: usize,
+) -> Option<MotionSpan> {
+    let (row, col) = cursor;
+    let count = count.max(1);
+    match fk {
+        FindKind::Forward | FindKind::Till => {
+            let mut seen = 0;
+            let mut hit = None;
+            for (i, &c) in chars.iter().enumerate().skip(col + 1) {
+                if c == ch {
+                    seen += 1;
+                    if seen == count {
+                        hit = Some(i);
+                        break;
+                    }
+                }
+            }
+            let i = hit?;
+            let target = if matches!(fk, FindKind::Till) {
+                i.saturating_sub(1)
+            } else {
+                i
+            };
+            Some(MotionSpan {
+                start: (row, col),
+                end: (row, target),
+                kind: MotionKind::CharInclusive,
+            })
+        }
+        FindKind::Back | FindKind::TillBack => {
+            let mut seen = 0;
+            let mut hit = None;
+            for i in (0..col).rev() {
+                if chars[i] == ch {
+                    seen += 1;
+                    if seen == count {
+                        hit = Some(i);
+                        break;
+                    }
+                }
+            }
+            let i = hit?;
+            let target = if matches!(fk, FindKind::TillBack) {
+                i + 1
+            } else {
+                i
+            };
+            Some(MotionSpan {
+                start: (row, col),
+                end: (row, target),
+                kind: MotionKind::CharExclusive,
+            })
+        }
+    }
+}
+
+/// Greedy reflow to `width` display columns. Blank lines separate
+/// paragraphs (preserved); words are never split, so a word wider than
+/// `width` overflows onto its own line. Width 0 falls back to one column.
+fn reflow_paragraph(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim().is_empty() {
+            out.push(String::new());
+            i += 1;
+            continue;
+        }
+        let mut words: Vec<&str> = Vec::new();
+        while i < lines.len() && !lines[i].trim().is_empty() {
+            words.extend(lines[i].split_whitespace());
+            i += 1;
+        }
+        let mut line = String::new();
+        for w in words {
+            if line.is_empty() {
+                line.push_str(w);
+            } else if line.width() + 1 + w.width() <= width {
+                line.push(' ');
+                line.push_str(w);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line.push_str(w);
+            }
+        }
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1298,7 +2374,7 @@ mod tests {
 
     fn feed(ed: &mut BodyEditor, keys: &[KeyEvent]) {
         for ke in keys {
-            ed.handle_key(*ke);
+            ed.handle_key(*ke, 72);
         }
     }
 
@@ -1323,7 +2399,7 @@ mod tests {
         let mut ed = BodyEditor::new("foobar\nab\nhello");
         feed(&mut ed, &[k('$'), k('j')]);
         assert_eq!(ed.cursor(), (1, 1)); // EOL of "ab"
-        ed.handle_key(k('j'));
+        ed.handle_key(k('j'), 72);
         assert_eq!(ed.cursor(), (2, 4)); // EOL of "hello"
     }
 
@@ -1339,7 +2415,7 @@ mod tests {
     #[test]
     fn ctrl_v_enters_block_visual() {
         let mut ed = BodyEditor::new("abcd\nefgh");
-        ed.handle_key(ctrl('v'));
+        ed.handle_key(ctrl('v'), 72);
         assert_eq!(ed.mode, BodyMode::Visual(VisualKind::Block));
     }
 
@@ -1408,7 +2484,7 @@ mod tests {
         feed(&mut ed, &[k('i'), k('H'), k('i')]);
         assert_eq!(ed.mode, BodyMode::Insert);
         assert_eq!(ed.text(), "Hi");
-        ed.handle_key(esc());
+        ed.handle_key(esc(), 72);
         assert_eq!(ed.mode, BodyMode::Normal);
         // Vim Esc backs up one cell from the end of insertion.
         assert_eq!(ed.cursor(), (0, 1));
@@ -1500,11 +2576,11 @@ mod tests {
     #[test]
     fn colon_passes_through_only_from_normal_and_visual() {
         let mut ed = BodyEditor::new("hello");
-        let out = ed.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        let out = ed.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), 72);
         assert!(matches!(out, KeyOutcome::PassThrough));
         // Insert eats the colon as literal text.
-        ed.handle_key(k('i'));
-        let out = ed.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        ed.handle_key(k('i'), 72);
+        let out = ed.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), 72);
         assert!(matches!(out, KeyOutcome::Consumed));
         assert_eq!(ed.text(), ":hello");
     }
@@ -1539,9 +2615,9 @@ mod tests {
         let mut ed = BodyEditor::new("");
         feed(&mut ed, &[k('i')]);
         for c in "hello world".chars() {
-            ed.handle_key(k(c));
+            ed.handle_key(k(c), 72);
         }
-        ed.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        ed.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), 72);
         // The exact split tui-textarea picks is its own concern; what we
         // care about is that some leading prefix survives and "world"
         // doesn't.
@@ -1554,9 +2630,298 @@ mod tests {
         let mut ed = BodyEditor::new("");
         feed(&mut ed, &[k('i')]);
         for c in "hello world".chars() {
-            ed.handle_key(k(c));
+            ed.handle_key(k(c), 72);
         }
-        ed.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        ed.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), 72);
         assert_eq!(ed.text(), "");
+    }
+
+    // ---------- operator engine ----------
+
+    #[test]
+    fn dw_deletes_word_and_trailing_space() {
+        let mut ed = BodyEditor::new("foo bar baz");
+        feed(&mut ed, &[k('d'), k('w')]);
+        assert_eq!(ed.text(), "bar baz");
+    }
+
+    #[test]
+    fn dw_at_last_word_stops_at_eol() {
+        let mut ed = BodyEditor::new("foo bar\nbaz");
+        // cursor on 'b' of "bar" via word-forward, then dw: stays on line 0.
+        feed(&mut ed, &[k('w'), k('d'), k('w')]);
+        assert_eq!(ed.text(), "foo \nbaz");
+    }
+
+    #[test]
+    fn counts_multiply_d2w_and_2dw() {
+        let mut ed = BodyEditor::new("a b c d e");
+        feed(&mut ed, &[k('d'), k('2'), k('w')]);
+        assert_eq!(ed.text(), "c d e");
+        let mut ed = BodyEditor::new("a b c d e");
+        feed(&mut ed, &[k('2'), k('d'), k('w')]);
+        assert_eq!(ed.text(), "c d e");
+    }
+
+    #[test]
+    fn de_is_inclusive() {
+        let mut ed = BodyEditor::new("foo bar");
+        feed(&mut ed, &[k('d'), k('e')]);
+        assert_eq!(ed.text(), " bar");
+    }
+
+    #[test]
+    fn d_dollar_deletes_to_eol() {
+        let mut ed = BodyEditor::new("hello world");
+        feed(&mut ed, &[k('l'), k('l'), k('d'), k('$')]);
+        assert_eq!(ed.text(), "he");
+    }
+
+    #[test]
+    fn dd_and_2dd_are_linewise() {
+        let mut ed = BodyEditor::new("one\ntwo\nthree");
+        feed(&mut ed, &[k('2'), k('d'), k('d')]);
+        assert_eq!(ed.text(), "three");
+    }
+
+    #[test]
+    fn dgg_and_d_cap_g_linewise() {
+        let mut ed = BodyEditor::new("a\nb\nc\nd");
+        feed(&mut ed, &[k('j'), k('j'), k('d'), k('g'), k('g')]);
+        assert_eq!(ed.text(), "d");
+        let mut ed = BodyEditor::new("a\nb\nc\nd");
+        feed(&mut ed, &[k('j'), k('d'), k('G')]);
+        assert_eq!(ed.text(), "a");
+    }
+
+    #[test]
+    fn cw_acts_like_ce_and_enters_insert() {
+        let mut ed = BodyEditor::new("foo bar");
+        feed(&mut ed, &[k('c'), k('w')]);
+        assert_eq!(ed.text(), " bar"); // trailing space NOT eaten
+        assert_eq!(ed.mode, BodyMode::Insert);
+    }
+
+    #[test]
+    fn cc_clears_line_keeps_row_and_inserts() {
+        let mut ed = BodyEditor::new("alpha\nbeta");
+        feed(&mut ed, &[k('c'), k('c')]);
+        assert_eq!(ed.text(), "\nbeta");
+        assert_eq!(ed.mode, BodyMode::Insert);
+        assert_eq!(ed.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn text_object_diw_and_di_quote_and_dip() {
+        let mut ed = BodyEditor::new("foo bar baz");
+        feed(&mut ed, &[k('w'), k('d'), k('i'), k('w')]);
+        assert_eq!(ed.text(), "foo  baz");
+
+        let mut ed = BodyEditor::new("say \"hi\" now");
+        feed(&mut ed, &[k('w'), k('w'), k('d'), k('i'), k('"')]);
+        assert_eq!(ed.text(), "say \"\" now");
+
+        let mut ed = BodyEditor::new("a\nb\n\nc");
+        feed(&mut ed, &[k('d'), k('i'), k('p')]);
+        assert_eq!(ed.text(), "\nc");
+    }
+
+    #[test]
+    fn di_paren_inner() {
+        let mut ed = BodyEditor::new("f(abc)g");
+        feed(&mut ed, &[k('l'), k('l'), k('d'), k('i'), k('(')]);
+        assert_eq!(ed.text(), "f()g");
+    }
+
+    #[test]
+    fn yw_yanks_without_mutating_and_arms_highlight() {
+        let mut ed = BodyEditor::new("foo bar");
+        feed(&mut ed, &[k('y'), k('w')]);
+        assert_eq!(ed.text(), "foo bar");
+        assert_eq!(ed.yank.as_ref().unwrap().text, "foo ");
+        assert!(ed.yank_highlight.is_some());
+        feed(&mut ed, &[k('$'), k('p')]);
+        assert_eq!(ed.text(), "foo barfoo ");
+    }
+
+    #[test]
+    fn indent_and_dedent() {
+        let mut ed = BodyEditor::new("x\ny\nz");
+        feed(&mut ed, &[k('>'), k('>')]);
+        assert_eq!(ed.text(), "    x\ny\nz");
+        feed(&mut ed, &[k('<'), k('<')]);
+        assert_eq!(ed.text(), "x\ny\nz");
+        // >j indents two lines.
+        let mut ed = BodyEditor::new("x\ny\nz");
+        feed(&mut ed, &[k('>'), k('j')]);
+        assert_eq!(ed.text(), "    x\n    y\nz");
+    }
+
+    #[test]
+    fn case_operators() {
+        let mut ed = BodyEditor::new("Hello World");
+        feed(&mut ed, &[k('g'), k('u'), k('u')]);
+        assert_eq!(ed.text(), "hello world");
+        let mut ed = BodyEditor::new("Hello World");
+        feed(&mut ed, &[k('g'), k('U'), k('U')]);
+        assert_eq!(ed.text(), "HELLO WORLD");
+        let mut ed = BodyEditor::new("Hello");
+        feed(&mut ed, &[k('g'), k('~'), k('~')]);
+        assert_eq!(ed.text(), "hELLO");
+        // guw lowercases one word.
+        let mut ed = BodyEditor::new("FOO BAR");
+        feed(&mut ed, &[k('g'), k('u'), k('w')]);
+        assert_eq!(ed.text(), "foo BAR");
+    }
+
+    #[test]
+    fn tilde_toggles_and_advances_with_count() {
+        let mut ed = BodyEditor::new("abc");
+        feed(&mut ed, &[k('~')]);
+        assert_eq!(ed.text(), "Abc");
+        assert_eq!(ed.cursor(), (0, 1));
+        let mut ed = BodyEditor::new("abcd");
+        feed(&mut ed, &[k('3'), k('~')]);
+        assert_eq!(ed.text(), "ABCd");
+    }
+
+    #[test]
+    fn gqq_reflows_to_width() {
+        let mut ed = BodyEditor::new("one two three four five");
+        // width 8 → wrap.
+        ed.handle_key(k('g'), 8);
+        ed.handle_key(k('q'), 8);
+        ed.handle_key(k('q'), 8);
+        assert_eq!(ed.text(), "one two\nthree\nfour\nfive");
+    }
+
+    #[test]
+    fn gq_moves_to_end_gw_restores_cursor() {
+        let mut ed = BodyEditor::new("aa bb cc dd");
+        ed.handle_key(k('g'), 5);
+        ed.handle_key(k('q'), 5);
+        ed.handle_key(k('q'), 5);
+        // gq parks on the last reflowed line.
+        let (last, _) = ed.cursor();
+        assert_eq!(last as usize, ed.text().lines().count() - 1);
+
+        let mut ed = BodyEditor::new("aa bb cc dd");
+        feed(&mut ed, &[k('l'), k('l'), k('l')]); // cursor col 3
+        ed.handle_key(k('g'), 5);
+        ed.handle_key(k('w'), 5);
+        ed.handle_key(k('w'), 5);
+        // gw restores the original row.
+        assert_eq!(ed.cursor().0, 0);
+    }
+
+    #[test]
+    fn count_movement_3w() {
+        let mut ed = BodyEditor::new("a b c d e");
+        feed(&mut ed, &[k('3'), k('w')]);
+        assert_eq!(ed.cursor(), (0, 6)); // start of "d"
+    }
+
+    #[test]
+    fn visual_text_object_parity_viwd_equals_diw() {
+        let mut a = BodyEditor::new("foo bar baz");
+        feed(&mut a, &[k('w'), k('d'), k('i'), k('w')]);
+        let mut b = BodyEditor::new("foo bar baz");
+        feed(&mut b, &[k('w'), k('v'), k('i'), k('w'), k('d')]);
+        assert_eq!(a.text(), b.text());
+    }
+
+    #[test]
+    fn replace_char_and_replace_mode() {
+        let mut ed = BodyEditor::new("abc");
+        feed(&mut ed, &[k('r'), k('X')]);
+        assert_eq!(ed.text(), "Xbc");
+        // 2rX replaces two chars.
+        let mut ed = BodyEditor::new("abcd");
+        feed(&mut ed, &[k('2'), k('r'), k('z')]);
+        assert_eq!(ed.text(), "zzcd");
+        // R overtype.
+        let mut ed = BodyEditor::new("abcd");
+        feed(&mut ed, &[k('R'), k('X'), k('Y')]);
+        assert_eq!(ed.text(), "XYcd");
+        assert_eq!(ed.mode, BodyMode::Replace);
+        ed.handle_key(esc(), 72);
+        assert_eq!(ed.mode, BodyMode::Normal);
+    }
+
+    #[test]
+    fn join_lines_with_and_without_space() {
+        let mut ed = BodyEditor::new("foo\n  bar");
+        feed(&mut ed, &[k('J')]);
+        assert_eq!(ed.text(), "foo bar");
+        let mut ed = BodyEditor::new("foo\n  bar");
+        feed(&mut ed, &[k('g'), k('J')]);
+        assert_eq!(ed.text(), "foobar");
+        // 3J joins three lines.
+        let mut ed = BodyEditor::new("a\nb\nc\nd");
+        feed(&mut ed, &[k('3'), k('J')]);
+        assert_eq!(ed.text(), "a b c\nd");
+    }
+
+    #[test]
+    fn s_cap_s_cap_c_cap_d_shortcuts() {
+        let mut ed = BodyEditor::new("abc");
+        feed(&mut ed, &[k('s')]);
+        assert_eq!(ed.text(), "bc");
+        assert_eq!(ed.mode, BodyMode::Insert);
+
+        let mut ed = BodyEditor::new("hello world");
+        feed(&mut ed, &[k('l'), k('l'), k('D')]);
+        assert_eq!(ed.text(), "he");
+
+        let mut ed = BodyEditor::new("hello world");
+        feed(&mut ed, &[k('l'), k('l'), k('C')]);
+        assert_eq!(ed.text(), "he");
+        assert_eq!(ed.mode, BodyMode::Insert);
+
+        let mut ed = BodyEditor::new("alpha\nbeta");
+        feed(&mut ed, &[k('S')]);
+        assert_eq!(ed.text(), "\nbeta");
+        assert_eq!(ed.mode, BodyMode::Insert);
+    }
+
+    #[test]
+    fn find_char_motion_and_operator() {
+        // dt) deletes up to but not including ')'.
+        let mut ed = BodyEditor::new("foo(bar)baz");
+        feed(&mut ed, &[k('d'), k('t'), k(')')]);
+        assert_eq!(ed.text(), ")baz");
+        // df) deletes through ')'.
+        let mut ed = BodyEditor::new("foo(bar)baz");
+        feed(&mut ed, &[k('d'), k('f'), k(')')]);
+        assert_eq!(ed.text(), "baz");
+        // plain f) moves the cursor onto ')'.
+        let mut ed = BodyEditor::new("foo(bar)baz");
+        feed(&mut ed, &[k('f'), k(')')]);
+        assert_eq!(ed.cursor(), (0, 7));
+    }
+
+    #[test]
+    fn operator_cancel_redispatches_key() {
+        // `dz` is invalid: d cancels, z is a no-op, x then deletes a char.
+        let mut ed = BodyEditor::new("abc");
+        feed(&mut ed, &[k('d'), k('z'), k('x')]);
+        assert_eq!(ed.text(), "bc");
+    }
+
+    #[test]
+    fn dw_and_diw_are_single_undo() {
+        let mut ed = BodyEditor::new("foo bar");
+        feed(&mut ed, &[k('d'), k('w'), k('u')]);
+        assert_eq!(ed.text(), "foo bar");
+        let mut ed = BodyEditor::new("foo bar");
+        feed(&mut ed, &[k('d'), k('i'), k('w'), k('u')]);
+        assert_eq!(ed.text(), "foo bar");
+    }
+
+    #[test]
+    fn ge_moves_to_previous_word_end() {
+        let mut ed = BodyEditor::new("foo bar baz");
+        feed(&mut ed, &[k('$'), k('g'), k('e')]);
+        assert_eq!(ed.cursor(), (0, 6)); // end of "bar"
     }
 }

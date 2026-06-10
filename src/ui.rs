@@ -18,5 +18,6 @@ pub mod search;
 pub mod style;
 pub mod tabs;
 pub mod text_input;
+pub mod textobj;
 pub mod tty;
 pub mod words;

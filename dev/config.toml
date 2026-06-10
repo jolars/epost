@@ -55,6 +55,9 @@ mode = "native"
 # msmtp; `:cancel-send` aborts an in-flight send still inside the
 # window. `0` disables the delay (dispatch immediately). Default 10.
 # send_delay_secs = 10
+# Wrap width for the native editor's reflow operators (`gq` / `gw`).
+# Default 72 (the conventional plain-text mail body width).
+# text_width = 72
 
 # Address completion for To / Cc / Bcc. The native source (Sent-folder
 # harvest at startup) is always on; the external source is opt-in via

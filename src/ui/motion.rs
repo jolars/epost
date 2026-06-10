@@ -18,6 +18,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::ui::words::{self, WordMotion};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
     CharLeft,
@@ -30,12 +32,53 @@ pub enum Motion {
     WordForwardBig,
     WordBackBig,
     WordEndBig,
+    /// `ge` / `gE` — end of the previous word.
+    WordEndBack,
+    WordEndBackBig,
     LineStart,
+    /// `^` — first non-blank char on the line.
+    FirstNonBlank,
     LineEnd,
     FirstLine,
     LastLine,
     HalfPageDown,
     HalfPageUp,
+}
+
+/// How a resolved motion's `[start, end]` endpoints translate into an
+/// operated region (vim's "inclusive / exclusive / linewise" motion
+/// classes). Used by the operator-pending engine, not by plain cursor
+/// movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionKind {
+    /// `$ e f` — the cell under `end` is included.
+    CharInclusive,
+    /// `h l w b 0 ^` — the cell under `end` is the first *not* operated.
+    CharExclusive,
+    /// `j k G gg` — whole lines from `start.0` to `end.0`.
+    Linewise,
+}
+
+/// A motion resolved against a buffer: the cursor it started from, the
+/// target it reached, and the [`MotionKind`] that says how to turn the
+/// pair into an operated region. `start`/`end` are `(row, col)` char
+/// coords and may be in either order (the operator normalises them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionSpan {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub kind: MotionKind,
+}
+
+/// A normalised region an operator acts on: `start <= end` in `(row,
+/// col)` order. When `linewise`, `start.1`/`end.1` are 0 and the region
+/// covers whole rows `start.0..=end.0`; otherwise it's the half-open
+/// char range `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub linewise: bool,
 }
 
 /// Vim-flavoured motion sink. Implementers translate each motion into
@@ -58,6 +101,13 @@ pub trait MotionTarget {
     fn move_word_forward_big(&mut self) {}
     fn move_word_back_big(&mut self) {}
     fn move_word_end_big(&mut self) {}
+    fn move_word_end_back(&mut self) {}
+    fn move_word_end_back_big(&mut self) {}
+    /// `^`. Defaults to line-start for panes that don't track leading
+    /// whitespace (the reader); the composer overrides it.
+    fn move_first_non_blank(&mut self) {
+        self.move_line_start();
+    }
     fn move_half_page(&mut self, _down: bool) {}
 }
 
@@ -75,7 +125,10 @@ pub fn apply<T: MotionTarget>(t: &mut T, m: Motion) {
         Motion::WordForwardBig => t.move_word_forward_big(),
         Motion::WordBackBig => t.move_word_back_big(),
         Motion::WordEndBig => t.move_word_end_big(),
+        Motion::WordEndBack => t.move_word_end_back(),
+        Motion::WordEndBackBig => t.move_word_end_back_big(),
         Motion::LineStart => t.move_line_start(),
+        Motion::FirstNonBlank => t.move_first_non_blank(),
         Motion::LineEnd => t.move_line_end(),
         Motion::FirstLine => t.move_first_line(),
         Motion::LastLine => t.move_last_line(),
@@ -124,9 +177,142 @@ pub fn key_to_motion(k: KeyEvent) -> Option<Motion> {
         KeyCode::Char('E') => Some(Motion::WordEndBig),
         KeyCode::Char('0') | KeyCode::Home => Some(Motion::LineStart),
         KeyCode::Char('$') | KeyCode::End => Some(Motion::LineEnd),
-        KeyCode::Char('^') => Some(Motion::LineStart),
+        KeyCode::Char('^') => Some(Motion::FirstNonBlank),
         KeyCode::Char('G') => Some(Motion::LastLine),
         _ => None,
+    }
+}
+
+/// Half-page step for `Ctrl-d`/`Ctrl-u` resolved as operator targets.
+/// Matches the composer's plain-movement `half_page()` (fixed 8 — no
+/// per-render viewport tracking in the pure resolver).
+const HALF_PAGE: usize = 8;
+
+fn line_len(lines: &[String], row: usize) -> usize {
+    lines.get(row).map(|l| l.chars().count()).unwrap_or(0)
+}
+
+fn first_non_blank(lines: &[String], row: usize) -> usize {
+    let Some(line) = lines.get(row) else { return 0 };
+    line.chars()
+        .position(|c| !c.is_whitespace())
+        .unwrap_or_else(|| line.chars().count().saturating_sub(1))
+}
+
+/// Resolve a motion to a [`MotionSpan`] *without* moving any cursor —
+/// the operator-pending path needs the endpoints, not a side effect.
+/// Pure over `(lines, cursor)` so it unit-tests without a textarea, and
+/// shared by the composer (operators) and the reader (operator-yanks).
+///
+/// Operator-specific quirks are baked in here because this function is
+/// only ever called for an operator: `w`/`W` clamp to end-of-line when
+/// they would cross into the next line (vim's "last word on the line"
+/// rule), and `G`/`gg` ignore the count (the dispatch passes the doubled
+/// count, which would otherwise misread `dG` as a line number).
+pub fn resolve_motion_span(
+    lines: &[String],
+    cursor: (usize, usize),
+    motion: Motion,
+    count: usize,
+) -> Option<MotionSpan> {
+    use Motion::*;
+    use MotionKind::*;
+    let count = count.max(1);
+    let (row, col) = cursor;
+    let last_row = lines.len().saturating_sub(1);
+    let span = |end, kind| {
+        Some(MotionSpan {
+            start: cursor,
+            end,
+            kind,
+        })
+    };
+    let word = |m: WordMotion, big: bool| {
+        let mut pos = cursor;
+        for _ in 0..count {
+            pos = words::word_motion(lines, pos.0, pos.1, m, big);
+        }
+        pos
+    };
+    match motion {
+        CharLeft => span((row, col.saturating_sub(count)), CharExclusive),
+        CharRight => span(
+            (row, (col + count).min(line_len(lines, row))),
+            CharExclusive,
+        ),
+        CharDown => span(((row + count).min(last_row), col), Linewise),
+        CharUp => span((row.saturating_sub(count), col), Linewise),
+        HalfPageDown => span(((row + HALF_PAGE * count).min(last_row), col), Linewise),
+        HalfPageUp => span((row.saturating_sub(HALF_PAGE * count), col), Linewise),
+        LineStart => span((row, 0), CharExclusive),
+        FirstNonBlank => span((row, first_non_blank(lines, row)), CharExclusive),
+        LineEnd => {
+            let end_row = (row + count - 1).min(last_row);
+            span(
+                (end_row, line_len(lines, end_row).saturating_sub(1)),
+                CharInclusive,
+            )
+        }
+        FirstLine => span((0, 0), Linewise),
+        LastLine => span((last_row, 0), Linewise),
+        WordForward | WordForwardBig => {
+            let big = matches!(motion, WordForwardBig);
+            let pos = word(WordMotion::Forward, big);
+            // Vim: an operator + `w` that would step onto a new line
+            // stops at the end of the current line instead.
+            if pos.0 > row {
+                span((row, line_len(lines, row)), CharExclusive)
+            } else {
+                span(pos, CharExclusive)
+            }
+        }
+        WordBack | WordBackBig => span(
+            word(WordMotion::Back, matches!(motion, WordBackBig)),
+            CharExclusive,
+        ),
+        WordEnd | WordEndBig => span(
+            word(WordMotion::End, matches!(motion, WordEndBig)),
+            CharInclusive,
+        ),
+        WordEndBack | WordEndBackBig => span(
+            word(WordMotion::EndBack, matches!(motion, WordEndBackBig)),
+            CharInclusive,
+        ),
+    }
+}
+
+/// Normalise a [`MotionSpan`] into an ordered [`Region`]. Inclusive char
+/// motions get `+1` on the high column (clamped to the line length so
+/// `d$` / `de` stop before the trailing newline). Linewise spans collapse
+/// to whole-row coverage.
+pub fn span_to_region(lines: &[String], span: MotionSpan) -> Region {
+    let order = |a: (usize, usize), b: (usize, usize)| if a <= b { (a, b) } else { (b, a) };
+    match span.kind {
+        MotionKind::Linewise => {
+            let (top, bot) = (span.start.0.min(span.end.0), span.start.0.max(span.end.0));
+            Region {
+                start: (top, 0),
+                end: (bot, 0),
+                linewise: true,
+            }
+        }
+        MotionKind::CharExclusive => {
+            let (lo, hi) = order(span.start, span.end);
+            Region {
+                start: lo,
+                end: hi,
+                linewise: false,
+            }
+        }
+        MotionKind::CharInclusive => {
+            let (lo, mut hi) = order(span.start, span.end);
+            hi.1 = (hi.1 + 1).min(line_len(lines, hi.0));
+            Region {
+                start: lo,
+                end: hi,
+                linewise: false,
+            }
+        }
     }
 }
 
@@ -158,7 +344,7 @@ mod tests {
         assert_eq!(key_to_motion(key('E')), Some(Motion::WordEndBig));
         assert_eq!(key_to_motion(key('0')), Some(Motion::LineStart));
         assert_eq!(key_to_motion(key('$')), Some(Motion::LineEnd));
-        assert_eq!(key_to_motion(key('^')), Some(Motion::LineStart));
+        assert_eq!(key_to_motion(key('^')), Some(Motion::FirstNonBlank));
         assert_eq!(key_to_motion(key('G')), Some(Motion::LastLine));
         assert_eq!(key_to_motion(ctrl('d')), Some(Motion::HalfPageDown));
         assert_eq!(key_to_motion(ctrl('u')), Some(Motion::HalfPageUp));

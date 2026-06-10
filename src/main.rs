@@ -349,6 +349,7 @@ fn native_body_cursor_shape(app: &App) -> Option<u16> {
     }
     Some(match c.body.mode {
         BodyMode::Insert => 6,                       // steady bar
+        BodyMode::Replace => 4,                      // steady underline
         BodyMode::Normal | BodyMode::Visual(_) => 2, // steady block
     })
 }

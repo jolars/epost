@@ -6,8 +6,9 @@ use crate::config::Config;
 use crate::mail::text;
 use crate::ui::app::{App, Mode, Pane, Screen};
 use crate::ui::clipboard::{self, YankOutcome};
-use crate::ui::motion;
+use crate::ui::motion::{self, Motion, Region};
 use crate::ui::reader::{LaidOutBody, YankHighlight};
+use crate::ui::textobj::{self, TextObjKind};
 use crate::ui::{cmdline, compose};
 
 pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
@@ -138,6 +139,23 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                         }
                         return;
                     }
+                    // `ge` / `gE` — end of the previous word.
+                    KeyCode::Char('e') => {
+                        let n = app.pending_count.take().unwrap_or(1);
+                        for _ in 0..n {
+                            app.inbox_mut()
+                                .reader_word(crate::ui::words::WordMotion::EndBack, false);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('E') => {
+                        let n = app.pending_count.take().unwrap_or(1);
+                        for _ in 0..n {
+                            app.inbox_mut()
+                                .reader_word(crate::ui::words::WordMotion::EndBack, true);
+                        }
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -146,6 +164,51 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
         }
         if k.code == KeyCode::Char('/') && !k.modifiers.intersects(KeyModifiers::CONTROL) {
             app.enter_search_local();
+            return;
+        }
+        // `z`-prefix scroll positioning (`zz` / `zt` / `zb`), Reader focus.
+        if app.pending_z {
+            app.pending_z = false;
+            if app.inbox().focus == Pane::Reader {
+                use crate::ui::app::ViewportPos;
+                match k.code {
+                    KeyCode::Char('z') => {
+                        app.inbox_mut().reader_scroll_cursor(ViewportPos::Middle);
+                        return;
+                    }
+                    KeyCode::Char('t') => {
+                        app.inbox_mut().reader_scroll_cursor(ViewportPos::Top);
+                        return;
+                    }
+                    KeyCode::Char('b') => {
+                        app.inbox_mut().reader_scroll_cursor(ViewportPos::Bottom);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Count prefix: digits accumulate into `pending_count`, consumed by
+        // the next motion. `0` is the line-start motion unless a count is
+        // already in progress. Only meaningful when not modified.
+        if let KeyCode::Char(c) = k.code {
+            let counting = app.pending_count.is_some();
+            if !k
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && c.is_ascii_digit()
+                && (c != '0' || counting)
+            {
+                let d = c as usize - '0' as usize;
+                app.pending_count = Some(app.pending_count.unwrap_or(0) * 10 + d);
+                return;
+            }
+        }
+        if k.code == KeyCode::Char('z')
+            && !k.modifiers.intersects(KeyModifiers::CONTROL)
+            && app.inbox().focus == Pane::Reader
+        {
+            app.pending_z = true;
             return;
         }
         if k.code == KeyCode::Char('g') && !k.modifiers.intersects(KeyModifiers::CONTROL) {
@@ -407,9 +470,61 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                                 yank_body(app, cfg, true);
                                 return;
                             }
+                            // Operator-yanks: `yw`/`yb`/`ye` (+ WORD) yank
+                            // the motion's span; `y}`/`y{` yank to the
+                            // paragraph boundary.
+                            "w" => {
+                                app.pending_y = None;
+                                yank_motion(app, cfg, Motion::WordForward, 1);
+                                return;
+                            }
+                            "b" => {
+                                app.pending_y = None;
+                                yank_motion(app, cfg, Motion::WordBack, 1);
+                                return;
+                            }
+                            "e" => {
+                                app.pending_y = None;
+                                yank_motion(app, cfg, Motion::WordEnd, 1);
+                                return;
+                            }
+                            "W" => {
+                                app.pending_y = None;
+                                yank_motion(app, cfg, Motion::WordForwardBig, 1);
+                                return;
+                            }
+                            "B" => {
+                                app.pending_y = None;
+                                yank_motion(app, cfg, Motion::WordBackBig, 1);
+                                return;
+                            }
+                            "E" => {
+                                app.pending_y = None;
+                                yank_motion(app, cfg, Motion::WordEndBig, 1);
+                                return;
+                            }
+                            "}" => {
+                                app.pending_y = None;
+                                yank_to_paragraph(app, cfg, true);
+                                return;
+                            }
+                            "{" => {
+                                app.pending_y = None;
+                                yank_to_paragraph(app, cfg, false);
+                                return;
+                            }
                             // Still a valid prefix — keep collecting.
                             "i" | "a" => {
                                 app.pending_y = Some(seq);
+                                return;
+                            }
+                            // Two-char text object: `yiw`/`yaw`/`yi"`/`yi(`
+                            // … (the `ip`/`ap`/`ie`/`ae` cases matched
+                            // above).
+                            s if s.len() == 2 && (s.starts_with('i') || s.starts_with('a')) => {
+                                app.pending_y = None;
+                                let around = s.starts_with('a');
+                                yank_text_object(app, cfg, c, around);
                                 return;
                             }
                             // Dead end — drop the sequence and let the key
@@ -422,14 +537,30 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                     _ => app.pending_y = None,
                 }
             }
+            // Count prefix applies to the motions below; non-motion keys
+            // (yank, visual, reply) ignore it and it's dropped after.
+            let count = app.pending_count.take().unwrap_or(1);
+            let repeat_word = |app: &mut App, m: crate::ui::words::WordMotion, big: bool| {
+                for _ in 0..count {
+                    app.inbox_mut().reader_word(m, big);
+                }
+            };
             match k.code {
                 // Cursor motion: `j`/`k` walk the body-relative cursor and
                 // let `follow_cursor` drag the viewport along, same as
                 // visual mode. `gg` (top) lives in the `pending_g` block.
-                KeyCode::Char('j') | KeyCode::Down => app.inbox_mut().move_reader_cursor(1, 0),
-                KeyCode::Char('k') | KeyCode::Up => app.inbox_mut().move_reader_cursor(-1, 0),
-                KeyCode::Char('h') | KeyCode::Left => app.inbox_mut().move_reader_cursor(0, -1),
-                KeyCode::Char('l') | KeyCode::Right => app.inbox_mut().move_reader_cursor(0, 1),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.inbox_mut().move_reader_cursor(count as i32, 0);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.inbox_mut().move_reader_cursor(-(count as i32), 0);
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    app.inbox_mut().move_reader_cursor(0, -(count as i32));
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    app.inbox_mut().move_reader_cursor(0, count as i32);
+                }
                 KeyCode::Char('0') | KeyCode::Home => {
                     app.inbox_mut().move_reader_cursor_to_line_start();
                 }
@@ -437,30 +568,27 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                     app.inbox_mut().move_reader_cursor_to_line_end();
                 }
                 KeyCode::Char('G') => app.inbox_mut().move_reader_cursor_to_bottom(),
+                // `{` / `}` paragraph motions; `H` / `M` / `L` viewport
+                // positions.
+                KeyCode::Char('}') => app.inbox_mut().reader_paragraph(true),
+                KeyCode::Char('{') => app.inbox_mut().reader_paragraph(false),
+                KeyCode::Char('H') => app
+                    .inbox_mut()
+                    .reader_cursor_to_viewport(crate::ui::app::ViewportPos::Top),
+                KeyCode::Char('M') => app
+                    .inbox_mut()
+                    .reader_cursor_to_viewport(crate::ui::app::ViewportPos::Middle),
+                KeyCode::Char('L') => app
+                    .inbox_mut()
+                    .reader_cursor_to_viewport(crate::ui::app::ViewportPos::Bottom),
                 KeyCode::Char('w') => {
-                    app.inbox_mut()
-                        .reader_word(crate::ui::words::WordMotion::Forward, false);
+                    repeat_word(app, crate::ui::words::WordMotion::Forward, false)
                 }
-                KeyCode::Char('b') => {
-                    app.inbox_mut()
-                        .reader_word(crate::ui::words::WordMotion::Back, false);
-                }
-                KeyCode::Char('e') => {
-                    app.inbox_mut()
-                        .reader_word(crate::ui::words::WordMotion::End, false);
-                }
-                KeyCode::Char('W') => {
-                    app.inbox_mut()
-                        .reader_word(crate::ui::words::WordMotion::Forward, true);
-                }
-                KeyCode::Char('B') => {
-                    app.inbox_mut()
-                        .reader_word(crate::ui::words::WordMotion::Back, true);
-                }
-                KeyCode::Char('E') => {
-                    app.inbox_mut()
-                        .reader_word(crate::ui::words::WordMotion::End, true);
-                }
+                KeyCode::Char('b') => repeat_word(app, crate::ui::words::WordMotion::Back, false),
+                KeyCode::Char('e') => repeat_word(app, crate::ui::words::WordMotion::End, false),
+                KeyCode::Char('W') => repeat_word(app, crate::ui::words::WordMotion::Forward, true),
+                KeyCode::Char('B') => repeat_word(app, crate::ui::words::WordMotion::Back, true),
+                KeyCode::Char('E') => repeat_word(app, crate::ui::words::WordMotion::End, true),
                 KeyCode::Char('f') => {
                     app.link_pick_buf.clear();
                     app.mode = Mode::LinkPick;
@@ -863,6 +991,160 @@ fn yank_link(app: &mut App, cfg: &Config) {
     };
     set_yank_highlight(app, cfg, ranges);
     dispatch_yank(app, cfg, href, status);
+}
+
+/// Clamp the reader cursor to a real `(row, col)` over the laid-out body
+/// (the live column can sit past EOL or at the `u16::MAX` sentinel).
+fn reader_cursor_clamped(lines: &[String], line: u16, col: u16) -> (usize, usize) {
+    let row = (line as usize).min(lines.len().saturating_sub(1));
+    let len = lines.get(row).map(|l| l.chars().count()).unwrap_or(0);
+    let col = if len == 0 {
+        0
+    } else {
+        (col as usize).min(len - 1)
+    };
+    (row, col)
+}
+
+/// `y{motion}` in the reader: resolve the motion's span over the laid-out
+/// body and yank the covered text (read-only — no buffer mutation).
+fn yank_motion(app: &mut App, cfg: &Config, m: Motion, count: usize) {
+    let lines = app.inbox().last_reader_body_line_text.clone();
+    if lines.is_empty() {
+        app.status_error = Some("yank: empty body".into());
+        return;
+    }
+    let inbox = app.inbox();
+    let cursor = reader_cursor_clamped(&lines, inbox.reader_cursor_line, inbox.reader_cursor_col);
+    let Some(span) = motion::resolve_motion_span(&lines, cursor, m, count) else {
+        return;
+    };
+    let region = motion::span_to_region(&lines, span);
+    finish_reader_region_yank(app, cfg, &lines, &region);
+}
+
+/// `y{textobj}` in the reader (`yiw`, `yi"`, `yap` already handled
+/// separately, etc.).
+fn yank_text_object(app: &mut App, cfg: &Config, c: char, around: bool) {
+    let lines = app.inbox().last_reader_body_line_text.clone();
+    if lines.is_empty() {
+        return;
+    }
+    let Some(obj) = textobj::key_to_text_object(c) else {
+        return;
+    };
+    let inbox = app.inbox();
+    let cursor = reader_cursor_clamped(&lines, inbox.reader_cursor_line, inbox.reader_cursor_col);
+    let kind = if around {
+        TextObjKind::Around
+    } else {
+        TextObjKind::Inner
+    };
+    let Some(span) = textobj::resolve_text_object(&lines, cursor, obj, kind) else {
+        app.status_error = Some("yank: no text object at cursor".into());
+        return;
+    };
+    let region = motion::span_to_region(&lines, span);
+    finish_reader_region_yank(app, cfg, &lines, &region);
+}
+
+/// `y}` / `y{` — yank from the cursor to the next/previous paragraph
+/// boundary (linewise).
+fn yank_to_paragraph(app: &mut App, cfg: &Config, forward: bool) {
+    let lines = app.inbox().last_reader_body_line_text.clone();
+    if lines.is_empty() {
+        return;
+    }
+    let is_blank = |r: usize| lines.get(r).map(|l| l.trim().is_empty()).unwrap_or(true);
+    let cur = app.inbox().reader_cursor_line as usize;
+    let other = if forward {
+        let mut r = cur + 1;
+        while r < lines.len() && !is_blank(r) {
+            r += 1;
+        }
+        r.min(lines.len().saturating_sub(1))
+    } else if cur == 0 {
+        0
+    } else {
+        let mut r = cur - 1;
+        while r > 0 && !is_blank(r) {
+            r -= 1;
+        }
+        r
+    };
+    let region = Region {
+        start: (cur.min(other), 0),
+        end: (cur.max(other), 0),
+        linewise: true,
+    };
+    finish_reader_region_yank(app, cfg, &lines, &region);
+}
+
+fn finish_reader_region_yank(app: &mut App, cfg: &Config, lines: &[String], region: &Region) {
+    let (text, ranges) = reader_region_text(lines, region);
+    if text.is_empty() {
+        app.status_error = Some("yank: nothing at cursor".into());
+        return;
+    }
+    set_yank_highlight(app, cfg, ranges);
+    dispatch_yank(app, cfg, text, "yanked".to_string());
+}
+
+/// Extract a region's text from the laid-out body and the matching
+/// highlight ranges. Char columns double as cell columns here (close
+/// enough for the transient flash; exact for ASCII bodies).
+fn reader_region_text(lines: &[String], region: &Region) -> (String, Vec<(u16, u16, u16)>) {
+    if region.linewise {
+        let mut text = String::new();
+        let mut ranges = Vec::new();
+        for r in region.start.0..=region.end.0 {
+            if let Some(l) = lines.get(r) {
+                text.push_str(l);
+                text.push('\n');
+                let w = crate::ui::reader::cells(l);
+                if w > 0 {
+                    ranges.push((r as u16, 0, w));
+                }
+            }
+        }
+        (text, ranges)
+    } else {
+        let (sr, sc) = region.start;
+        let (er, ec) = region.end;
+        let text = reader_extract_charwise(lines, region.start, region.end);
+        let mut ranges = Vec::new();
+        for r in sr..=er {
+            if let Some(l) = lines.get(r) {
+                let w = l.chars().count() as u16;
+                let start = if r == sr { sc as u16 } else { 0 };
+                let end = (if r == er { ec as u16 } else { w }).min(w);
+                if end > start {
+                    ranges.push((r as u16, start, end));
+                }
+            }
+        }
+        (text, ranges)
+    }
+}
+
+fn reader_extract_charwise(lines: &[String], start: (usize, usize), end: (usize, usize)) -> String {
+    if start.0 == end.0 {
+        let chars: Vec<char> = lines[start.0].chars().collect();
+        let lo = start.1.min(chars.len());
+        let hi = end.1.min(chars.len());
+        return chars[lo..hi].iter().collect();
+    }
+    let mut out = String::new();
+    let first: Vec<char> = lines[start.0].chars().collect();
+    out.extend(first[start.1.min(first.len())..].iter());
+    out.push('\n');
+    for line in lines.iter().take(end.0).skip(start.0 + 1) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let last: Vec<char> = lines[end.0].chars().collect();
+    out.extend(last[..end.1.min(last.len())].iter());
+    out
 }
 
 /// Arm a transient yank highlight over `ranges` (body-relative cell

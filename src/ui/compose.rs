@@ -435,7 +435,7 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
     // also passes through the editor and we use it below to cycle out
     // of the body to other fields.
     if screen.focused == ComposeField::Body {
-        if let KeyOutcome::Consumed = screen.body.handle_key(k) {
+        if let KeyOutcome::Consumed = screen.body.handle_key(k, cfg.compose.text_width) {
             return KeyOutcome::Consumed;
         }
         // Tab / BackTab: cycle fields. Other passthroughs (`:` etc.)
@@ -587,6 +587,7 @@ fn body_block_title(screen: &ComposeScreen, editing: bool, focused: bool) -> Str
     let mode = match screen.body.mode {
         BodyMode::Normal => "NORMAL",
         BodyMode::Insert => "INSERT",
+        BodyMode::Replace => "REPLACE",
         BodyMode::Visual(VisualKind::Char) => "VISUAL",
         BodyMode::Visual(VisualKind::Line) => "V-LINE",
         BodyMode::Visual(VisualKind::Block) => "V-BLOCK",
@@ -597,8 +598,9 @@ fn body_block_title(screen: &ComposeScreen, editing: bool, focused: bool) -> Str
 fn native_body_hint(body: &BodyEditor) -> &'static str {
     match body.mode {
         BodyMode::Insert => " -- INSERT --  Esc to leave  :send  :close ",
+        BodyMode::Replace => " -- REPLACE --  Esc to leave ",
         BodyMode::Visual(_) => " -- VISUAL --  y yank  d delete  c change  Esc cancel ",
-        BodyMode::Normal => " i insert  v/V visual  yy/dd/p yank/del/paste  :edit  :send  :close ",
+        BodyMode::Normal => " i insert  v/V visual  cw/diw/gqap/p edit  :edit  :send  :close ",
     }
 }
 

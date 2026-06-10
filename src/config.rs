@@ -253,6 +253,10 @@ pub struct Compose {
     /// external first, then native, deduped by lowercase email.
     #[serde(default)]
     pub address_book: AddressBook,
+    /// Wrap width for the native editor's reflow operators (`gq` / `gw`).
+    /// Default 72 — the conventional plain-text mail body width.
+    #[serde(default = "default_text_width")]
+    pub text_width: u16,
 }
 
 impl Default for Compose {
@@ -262,12 +266,17 @@ impl Default for Compose {
             editor: None,
             send_delay_secs: default_send_delay_secs(),
             address_book: AddressBook::default(),
+            text_width: default_text_width(),
         }
     }
 }
 
 fn default_send_delay_secs() -> u64 {
     10
+}
+
+fn default_text_width() -> u16 {
+    72
 }
 
 /// Address-completion knobs for the compose tab's To / Cc / Bcc fields.

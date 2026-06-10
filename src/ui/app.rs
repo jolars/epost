@@ -264,6 +264,13 @@ pub struct App {
     /// `ya` are kept as live prefixes; anything else clears the buffer and
     /// falls through to the rest of the Reader keymap.
     pub pending_y: Option<String>,
+    /// Pending numeric count in Normal mode (`3j`, `5w`). `None` when
+    /// idle; digits accumulate here and the next motion multiplies by it.
+    /// `0` is a motion (line-start) unless a count is already building.
+    pub pending_count: Option<usize>,
+    /// Pending `z` prefix for scroll-positioning chords (`zz` / `zt` /
+    /// `zb`). Mirrors `pending_g`.
+    pub pending_z: bool,
     /// Transient status / error displayed in the cmdline row. Cleared
     /// when the user enters a new command or moves selection.
     pub status_error: Option<String>,
@@ -629,6 +636,8 @@ impl App {
             attachment_pick_buf: String::new(),
             pending_g: false,
             pending_y: None,
+            pending_count: None,
+            pending_z: false,
             status_error: watcher_warning,
             quit: false,
             screens: vec![Screen::Inbox(inbox)],
@@ -1899,6 +1908,80 @@ impl InboxScreen {
         self.follow_cursor();
     }
 
+    /// Vim `}` / `{` — move the cursor to the next / previous blank line
+    /// (paragraph boundary) over the laid-out body, clamping at the ends.
+    pub fn reader_paragraph(&mut self, forward: bool) {
+        let lines = &self.last_reader_body_line_text;
+        if lines.is_empty() {
+            return;
+        }
+        let is_blank = |r: usize| lines.get(r).map(|l| l.trim().is_empty()).unwrap_or(true);
+        let cur = self.reader_cursor_line as usize;
+        let target = if forward {
+            let mut r = cur + 1;
+            while r < lines.len() && !is_blank(r) {
+                r += 1;
+            }
+            r.min(lines.len().saturating_sub(1))
+        } else if cur == 0 {
+            0
+        } else {
+            let mut r = cur - 1;
+            while r > 0 && !is_blank(r) {
+                r -= 1;
+            }
+            r
+        };
+        self.reader_cursor_line = target as u16;
+        self.reader_cursor_col = 0;
+        self.reader_goal_col = 0;
+        self.follow_cursor();
+    }
+
+    /// Vim `H` / `M` / `L` — park the cursor at the top / middle / bottom
+    /// of the visible body viewport.
+    pub fn reader_cursor_to_viewport(&mut self, pos: ViewportPos) {
+        let inner_h = self.last_reader_inner_height;
+        let body_lines = self.last_reader_body_only_lines;
+        if inner_h == 0 || body_lines == 0 {
+            return;
+        }
+        let header = self.last_reader_header_offset;
+        let top_body = self.reader_scroll.saturating_sub(header);
+        let bot_body = (top_body + inner_h.saturating_sub(1)).min(body_lines.saturating_sub(1));
+        let target = match pos {
+            ViewportPos::Top => top_body,
+            ViewportPos::Middle => (top_body + bot_body) / 2,
+            ViewportPos::Bottom => bot_body,
+        };
+        self.reader_cursor_line = target.min(body_lines.saturating_sub(1));
+        self.reader_cursor_col = 0;
+        self.reader_goal_col = 0;
+        self.follow_cursor();
+    }
+
+    /// Vim `zt` / `zz` / `zb` — scroll so the cursor sits at the top /
+    /// centre / bottom of the viewport, without moving the cursor.
+    pub fn reader_scroll_cursor(&mut self, pos: ViewportPos) {
+        let inner_h = self.last_reader_inner_height;
+        if inner_h == 0 {
+            return;
+        }
+        let abs = self
+            .last_reader_header_offset
+            .saturating_add(self.reader_cursor_line);
+        let want = match pos {
+            ViewportPos::Top => abs,
+            ViewportPos::Middle => abs.saturating_sub(inner_h / 2),
+            ViewportPos::Bottom => abs.saturating_sub(inner_h.saturating_sub(1)),
+        };
+        let total = self
+            .last_reader_header_offset
+            .saturating_add(self.last_reader_body_only_lines);
+        let max_scroll = total.saturating_sub(inner_h);
+        self.reader_scroll = want.min(max_scroll);
+    }
+
     /// Attachment count for the open message (0 when no body parsed).
     pub fn attachment_count(&self) -> usize {
         self.parsed.as_deref().map_or(0, |p| p.attachments.len())
@@ -1979,9 +2062,24 @@ impl MotionTarget for InboxScreen {
     fn move_word_end_big(&mut self) {
         self.reader_word(crate::ui::words::WordMotion::End, true);
     }
+    fn move_word_end_back(&mut self) {
+        self.reader_word(crate::ui::words::WordMotion::EndBack, false);
+    }
+    fn move_word_end_back_big(&mut self) {
+        self.reader_word(crate::ui::words::WordMotion::EndBack, true);
+    }
 
     // Re-open the inherent impl block so the rest of InboxScreen's
     // methods stay attached. Rust allows multiple `impl T` blocks.
+}
+
+/// Where a viewport-relative motion (`H`/`M`/`L`) or scroll-positioning
+/// chord (`zt`/`zz`/`zb`) anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportPos {
+    Top,
+    Middle,
+    Bottom,
 }
 
 impl InboxScreen {
@@ -3519,6 +3617,71 @@ mod focus_nav_tests {
         assert_eq!(inbox.reader_goal_col, 4);
         inbox.move_reader_cursor(1, 0);
         assert_eq!(inbox.reader_cursor_col, 4);
+    }
+
+    #[test]
+    fn reader_paragraph_jumps_to_blank_lines() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_line_text = vec![
+            "a".into(),
+            "b".into(),
+            String::new(),
+            "c".into(),
+            "d".into(),
+        ];
+        inbox.last_reader_body_only_lines = 5;
+        // `}` from line 0 lands on the blank line (2).
+        inbox.reader_paragraph(true);
+        assert_eq!(inbox.reader_cursor_line, 2);
+        // `}` again clamps to the last line.
+        inbox.reader_paragraph(true);
+        assert_eq!(inbox.reader_cursor_line, 4);
+        // `{` walks back to the blank line.
+        inbox.reader_paragraph(false);
+        assert_eq!(inbox.reader_cursor_line, 2);
+    }
+
+    #[test]
+    fn reader_viewport_positions_top_middle_bottom() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_line_text = (0..20).map(|i| format!("line{i}")).collect();
+        inbox.last_reader_body_only_lines = 20;
+        inbox.last_reader_inner_height = 10;
+        inbox.last_reader_header_offset = 0;
+        inbox.reader_scroll = 0;
+        inbox.reader_cursor_to_viewport(ViewportPos::Top);
+        assert_eq!(inbox.reader_cursor_line, 0);
+        inbox.reader_cursor_to_viewport(ViewportPos::Bottom);
+        assert_eq!(inbox.reader_cursor_line, 9);
+        inbox.reader_cursor_to_viewport(ViewportPos::Middle);
+        assert!(matches!(inbox.reader_cursor_line, 4 | 5));
+    }
+
+    #[test]
+    fn reader_scroll_cursor_centers_and_tops() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_line_text = (0..40).map(|i| format!("line{i}")).collect();
+        inbox.last_reader_body_only_lines = 40;
+        inbox.last_reader_inner_height = 10;
+        inbox.last_reader_header_offset = 0;
+        inbox.reader_cursor_line = 20;
+        // zt: cursor row becomes the scroll top.
+        inbox.reader_scroll_cursor(ViewportPos::Top);
+        assert_eq!(inbox.reader_scroll, 20);
+        // zz: centred — scroll = cursor - height/2.
+        inbox.reader_scroll_cursor(ViewportPos::Middle);
+        assert_eq!(inbox.reader_scroll, 15);
+    }
+
+    #[test]
+    fn reader_ge_lands_on_previous_word_end() {
+        let mut inbox = inbox_with_panes(true, true, true);
+        inbox.last_reader_body_line_text = vec!["foo bar baz".into()];
+        inbox.last_reader_body_only_lines = 1;
+        inbox.reader_cursor_line = 0;
+        inbox.reader_cursor_col = 10; // on the last 'z'
+        inbox.reader_word(crate::ui::words::WordMotion::EndBack, false);
+        assert_eq!(inbox.reader_cursor_col, 6); // end of "bar"
     }
 
     #[test]
