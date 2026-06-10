@@ -4,10 +4,8 @@
 //!
 //! * **OSC 52** (default): emits `ESC ] 52 ; c ; <base64> ESC \` to
 //!   stdout. The terminal interprets it as a clipboard-set control
-//!   sequence — no cells painted, no display side-effect. Distinct from
-//!   the OSC 8 trick in `reader::emit_osc8_hyperlinks`: that one has to
-//!   land in specific cells because it annotates display; this one only
-//!   needs to reach the tty stream.
+//!   sequence — no cells painted, no display side-effect; it only needs
+//!   to reach the tty stream.
 //!
 //! * **Shell-out fallback**: when the user sets `[reader].clipboard =
 //!   ["wl-copy"]` (or similar), the text is piped to that command's

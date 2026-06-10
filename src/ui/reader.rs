@@ -37,8 +37,8 @@ pub struct YankHighlight {
 /// space (U+200B), combining marks, and variation selectors as 0, and a
 /// wide / emoji-presentation grapheme as 2. `chars().count()` is *not*
 /// this width (it miscounts every such codepoint by ±1), and using it as
-/// a column proxy is what drove misaligned wraps, cursors, and OSC 8
-/// anchors on mail that carries those characters.
+/// a column proxy is what drove misaligned wraps and cursors on mail that
+/// carries those characters.
 pub(crate) fn cells(s: &str) -> u16 {
     UnicodeWidthStr::width(s).min(u16::MAX as usize) as u16
 }
@@ -408,9 +408,9 @@ impl LaidOutBody {
         out
     }
 
-    /// Cell ranges for each segment of a single `LinkSlot`. Mirrors the
-    /// in-buffer ranges OSC 8 already uses so the yank-highlight flash
-    /// lines up exactly with the link text.
+    /// Cell ranges for each segment of a single `LinkSlot`, so the
+    /// yank-highlight flash (after `yl`) lines up exactly with the link
+    /// text.
     pub fn link_segment_ranges(slot: &LinkSlot) -> Vec<(u16, u16, u16)> {
         slot.segments
             .iter()
@@ -432,8 +432,8 @@ pub struct LinkSlot {
     /// Cell ranges the link's text occupies in the laid-out buffer. A
     /// single link wraps onto multiple lines as separate segments; words
     /// on the same line that belong to the same link (and the single
-    /// space between them) are merged into one segment. Driven by the
-    /// OSC 8 hyperlink wrapper in `draw`.
+    /// space between them) are merged into one segment. Used by the
+    /// `yl` yank-highlight flash.
     pub segments: Vec<LinkSegment>,
 }
 
@@ -675,33 +675,9 @@ pub fn draw(
     pane_scrollbar(f, area, inbox.reader_scroll as usize, total_lines, focused);
     if let Some(laid) = laid {
         let scroll = inbox.reader_scroll as i32;
-        // Suppress OSC 8 on whatever body lines the cursor / selection
-        // occupies so the active line stays plain text (a folded link cell
-        // makes the cursor invert the whole link or vanish on its 2nd
-        // char). Normal: just the cursor line. Visual: the whole selection.
-        let suppress_lines = if let Some(sel) = inbox.visual.as_ref() {
-            let a = sel.anchor_line;
-            let c = inbox.reader_cursor_line;
-            Some((a.min(c), a.max(c)))
-        } else if focused && mode == Mode::Normal {
-            Some((inbox.reader_cursor_line, inbox.reader_cursor_line))
-        } else {
-            None
-        };
-        emit_osc8_hyperlinks(
-            f.buffer_mut(),
-            inner,
-            &laid.links,
-            inbox.last_reader_header_offset,
-            scroll,
-            suppress_lines,
-        );
         // Visual-mode selection paint goes on top of the rendered text
-        // (REVERSED modifier on covered cells). Done before the OSC 8
-        // emit would have stripped escapes, but after Paragraph laid
-        // the cells down. Painting cells doesn't disturb the existing
-        // OSC 8 byte injections — those modify symbol strings, this
-        // flips the cell style.
+        // (REVERSED modifier on covered cells), after Paragraph laid the
+        // cells down.
         if let Some(sel) = inbox.visual.as_ref() {
             paint_selection(
                 f.buffer_mut(),
@@ -930,110 +906,6 @@ fn paint_yank_highlight(
             if let Some(cell) = buf.cell_mut((x, row)) {
                 let style = cell.style().bg(Color::Yellow).fg(Color::Black);
                 cell.set_style(style);
-            }
-        }
-    }
-}
-
-/// Wrap each visible link segment with an OSC 8 hyperlink anchor by
-/// patching the rendered buffer cells. The whole anchor — open
-/// `ESC ] 8 ; ; URL ESC \`, the segment's visible text, and the close
-/// `ESC ] 8 ; ; ESC \` — is folded into the segment's *first* cell, while
-/// the interior cells keep their original glyphs.
-///
-/// Why not the obvious "prepend open to first cell, append close to last
-/// cell"? ratatui measures a cell's display width as `symbol().width()`,
-/// and the embedded URL bytes (`]8;;`, the URL, `\`) all count as visible
-/// width even though the terminal renders them as zero-width escapes. Its
-/// diff then does `to_skip = symbol().width() - 1`, which — because
-/// `to_skip` is *reassigned every iteration*, not decremented — drops
-/// exactly the one cell after the inflated cell from the update list,
-/// leaving it stale. With the anchor split across the first and last cell
-/// that dropped the second character of the link and the first character
-/// after it.
-///
-/// Folding the *entire* anchor (including the visible text) into the first
-/// cell fixes this: the terminal prints that one cell's full symbol across
-/// all of the segment's columns, so even the one cell ratatui skips after
-/// it is already painted by the overflow — nothing is dropped. Crucially
-/// we do **not** mark the interior cells `skip`: they keep their real
-/// glyphs so the cursor / selection / yank painters (which flip styles on
-/// individual cells *after* this runs) still render on them.
-///
-/// The fold still costs the *active* line two cursor glitches, though:
-/// folding the whole link into its first cell means a cursor parked on the
-/// link's first char inverts the entire link (that one cell's symbol *is*
-/// the link), and ratatui's wide-symbol skip hides a cursor on the link's
-/// second char. Both made horizontal movement across links feel broken. So
-/// `suppress_lines` (an inclusive body-line range — the cursor line in
-/// Normal mode, the whole selection in Visual mode) tells us to leave those
-/// lines as plain underlined text: the line you're actually moving along
-/// renders clean with a normal one-cell cursor, while every other visible
-/// line keeps its clickable hyperlink. As the cursor moves off a line it
-/// regains its anchor on the next frame.
-///
-/// `header_offset` is the number of header rows (From / Subject / …) the
-/// body is rendered below; segment lines are body-relative, so it must be
-/// added to land the anchor on the right row (mirroring `paint_selection`
-/// et al.). Without it the anchors scattered onto the header-offset rows
-/// above each link, corrupting unrelated text.
-///
-/// Capable terminals (kitty, wezterm, foot, iTerm2, recent gnome-terminal)
-/// render this as a clickable / copyable hyperlink; others ignore the
-/// OSC 8 anchor harmlessly and the underlined link text remains.
-fn emit_osc8_hyperlinks(
-    buf: &mut ratatui::buffer::Buffer,
-    inner: Rect,
-    links: &[LinkSlot],
-    header_offset: u16,
-    scroll: i32,
-    suppress_lines: Option<(u16, u16)>,
-) {
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    const CLOSE: &str = "\x1b]8;;\x1b\\";
-    let inner_right = inner.x.saturating_add(inner.width);
-    let inner_bottom = inner.y.saturating_add(inner.height);
-    for slot in links {
-        if slot.href.is_empty() {
-            continue;
-        }
-        let open = format!("\x1b]8;;{}\x1b\\", slot.href);
-        for seg in &slot.segments {
-            // Leave the cursor's / selection's own lines as plain text so
-            // the active cursor never lands on a folded link cell.
-            if let Some((lo, hi)) = suppress_lines
-                && (lo..=hi).contains(&(seg.line as u16))
-            {
-                continue;
-            }
-            let row_signed = inner.y as i32 + header_offset as i32 + seg.line as i32 - scroll;
-            if row_signed < inner.y as i32 || row_signed >= inner_bottom as i32 {
-                continue;
-            }
-            let row = row_signed as u16;
-            let abs_start = inner.x.saturating_add(seg.col_start).min(inner_right);
-            let abs_end = inner.x.saturating_add(seg.col_end).min(inner_right);
-            // A single-cell segment has no interior cell to absorb the
-            // width-inflation skip (see above): the first cell's overflow
-            // covers only its own column, so the skipped cell is the one
-            // *after* the link and a real character drops. Leave it
-            // styled-but-not-anchored rather than corrupt that character.
-            if abs_end.saturating_sub(abs_start) < 2 {
-                continue;
-            }
-            // Reconstruct the segment's visible text from the cells the
-            // Paragraph already laid down, then fold the full anchor into
-            // the first cell. The interior cells are left as-is.
-            let mut text = String::new();
-            for x in abs_start..abs_end {
-                if let Some(cell) = buf.cell((x, row)) {
-                    text.push_str(cell.symbol());
-                }
-            }
-            if let Some(cell) = buf.cell_mut((abs_start, row)) {
-                cell.set_symbol(&format!("{open}{text}{CLOSE}"));
             }
         }
     }
@@ -1379,8 +1251,8 @@ impl<'a> LayoutCtx<'a> {
                     // The `> ` insertion below adds two cells at column
                     // zero of each affected line. Link segments recorded
                     // by `push_word` use pre-prefix columns, so shift any
-                    // segment that landed on a quoted line by 2 to keep
-                    // OSC 8 anchors aligned with their rendered cells.
+                    // segment that landed on a quoted line by 2 to keep the
+                    // `yl` yank-highlight aligned with the rendered cells.
                     for slot in &mut self.links {
                         for seg in &mut slot.segments {
                             if seg.line >= before && seg.line < after {
@@ -2180,187 +2052,6 @@ mod tests {
         lines.sort();
         lines.dedup();
         assert_eq!(lines.len(), slot.segments.len(), "{:?}", slot.segments);
-    }
-
-    #[test]
-    fn osc8_wraps_link_cells_in_buffer() {
-        use ratatui::buffer::Buffer;
-        // Lay out a paragraph with one link, render it into a Buffer the
-        // same way `draw` would, then run the OSC 8 patch and check that
-        // the first / last link cells carry the expected escape bytes.
-        let html_src = r#"<p>see <a href="https://x.example/p">click</a> done</p>"#;
-        let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 40, &[], None, None);
-        let inner = Rect {
-            x: 0,
-            y: 0,
-            width: 40,
-            height: 4,
-        };
-        let mut buf = Buffer::empty(inner);
-        // Paint the layout into the buffer cell by cell so the test
-        // doesn't depend on Paragraph's wrap behavior — segment columns
-        // are inner-relative, which is the contract we care about.
-        for (row, line) in laid.lines.iter().enumerate() {
-            if row >= inner.height as usize {
-                break;
-            }
-            let mut col: u16 = 0;
-            for span in &line.spans {
-                for ch in span.content.chars() {
-                    if col >= inner.width {
-                        break;
-                    }
-                    if let Some(cell) = buf.cell_mut((col, row as u16)) {
-                        cell.set_symbol(&ch.to_string());
-                    }
-                    col += 1;
-                }
-            }
-        }
-        super::emit_osc8_hyperlinks(&mut buf, inner, &laid.links, 0, 0, None);
-        // The whole anchor folds into the segment's first cell: "click"
-        // starts at column 4 (after "see "), so cell (4,0) holds
-        // open + "click" + close — the terminal's overflow then paints the
-        // glyphs across cols 4..9.
-        let first_cell = buf.cell((4, 0)).expect("first link cell");
-        let first_sym = first_cell.symbol();
-        assert_eq!(
-            first_sym, "\x1b]8;;https://x.example/p\x1b\\click\x1b]8;;\x1b\\",
-            "first link cell symbol was {first_sym:?}"
-        );
-        // Interior link cells ("lick", cols 5..9) keep their real glyph and
-        // are NOT skipped, so the cursor / selection painters still render
-        // on them (flagging them skip made the cursor vanish over links).
-        for (x, ch) in (5..9).zip("lick".chars()) {
-            let cell = buf.cell((x, 0)).expect("interior link cell");
-            assert!(!cell.skip, "interior cell {x} should not be skipped");
-            assert_eq!(cell.symbol(), ch.to_string(), "interior cell {x} glyph");
-        }
-        // The cell right after the link ("done"'s leading space at col 9)
-        // is untouched — no escapes — so nothing is dropped.
-        let after = buf.cell((9, 0)).expect("post-link cell");
-        assert!(!after.symbol().contains('\x1b'), "{:?}", after.symbol());
-        // Non-link cells must not carry any OSC 8 bytes.
-        let outside = buf.cell((0, 0)).expect("first cell");
-        assert!(!outside.symbol().contains('\x1b'), "{:?}", outside.symbol());
-    }
-
-    #[test]
-    fn osc8_skips_scrolled_off_segments() {
-        use ratatui::buffer::Buffer;
-        let inner = Rect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 2,
-        };
-        let mut buf = Buffer::empty(inner);
-        let links = vec![LinkSlot {
-            id: 1,
-            href: "https://x".to_string(),
-            segments: vec![LinkSegment {
-                line: 0,
-                col_start: 0,
-                col_end: 3,
-            }],
-        }];
-        // scroll past the segment's line — patch must be a no-op.
-        super::emit_osc8_hyperlinks(&mut buf, inner, &links, 0, 5, None);
-        for x in 0..inner.width {
-            for y in 0..inner.height {
-                let sym = buf.cell((x, y)).unwrap().symbol();
-                assert!(!sym.contains('\x1b'), "leaked OSC 8 at ({x},{y}): {sym:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn osc8_anchor_honors_header_offset() {
-        use ratatui::buffer::Buffer;
-        // Segment lines are body-relative; the anchor must land
-        // `header_offset` rows lower than the segment's body line. A bug
-        // that omitted the offset scattered anchors (and their one-cell
-        // skips) onto the header rows above each link, corrupting text
-        // that wasn't a link at all.
-        let inner = Rect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 8,
-        };
-        let mut buf = Buffer::empty(inner);
-        // Paint "abcd" at row 4 (body line 0 + header_offset 4).
-        for (i, ch) in "abcd".chars().enumerate() {
-            buf.cell_mut((i as u16, 4))
-                .unwrap()
-                .set_symbol(&ch.to_string());
-        }
-        let links = vec![LinkSlot {
-            id: 1,
-            href: "https://x".to_string(),
-            segments: vec![LinkSegment {
-                line: 0,
-                col_start: 0,
-                col_end: 4,
-            }],
-        }];
-        super::emit_osc8_hyperlinks(&mut buf, inner, &links, 4, 0, None);
-        // Body row 0 lands at absolute row 4: the anchor is there...
-        assert!(
-            buf.cell((0, 4)).unwrap().symbol().contains('\x1b'),
-            "anchor missing at the offset row"
-        );
-        // ...and row 0 (a header row) is left clean.
-        for x in 0..inner.width {
-            assert!(
-                !buf.cell((x, 0)).unwrap().symbol().contains('\x1b'),
-                "OSC 8 leaked onto header row at col {x}"
-            );
-        }
-    }
-
-    #[test]
-    fn osc8_suppresses_anchor_on_cursor_lines() {
-        use ratatui::buffer::Buffer;
-        // A link on body line 2 must be left plain when line 2 is within
-        // the suppressed (cursor / selection) range, so the active cursor
-        // never lands on a folded link cell.
-        let inner = Rect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 6,
-        };
-        let mut buf = Buffer::empty(inner);
-        for (i, ch) in "click".chars().enumerate() {
-            buf.cell_mut((i as u16, 2))
-                .unwrap()
-                .set_symbol(&ch.to_string());
-        }
-        let links = vec![LinkSlot {
-            id: 1,
-            href: "https://x".to_string(),
-            segments: vec![LinkSegment {
-                line: 2,
-                col_start: 0,
-                col_end: 5,
-            }],
-        }];
-        // Suppress lines 1..=3 → the line-2 anchor is skipped entirely.
-        super::emit_osc8_hyperlinks(&mut buf, inner, &links, 0, 0, Some((1, 3)));
-        for x in 0..inner.width {
-            assert!(
-                !buf.cell((x, 2)).unwrap().symbol().contains('\x1b'),
-                "anchor wrongly emitted on a suppressed line at col {x}"
-            );
-        }
-        // Outside the suppressed range it emits normally.
-        super::emit_osc8_hyperlinks(&mut buf, inner, &links, 0, 0, Some((4, 5)));
-        assert!(
-            buf.cell((0, 2)).unwrap().symbol().contains('\x1b'),
-            "anchor missing when its line is not suppressed"
-        );
     }
 
     #[test]
