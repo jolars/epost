@@ -863,30 +863,38 @@ fn paint_yank_highlight(
 /// Wrap each visible link segment with an OSC 8 hyperlink anchor by
 /// patching the rendered buffer cells. The whole anchor — open
 /// `ESC ] 8 ; ; URL ESC \`, the segment's visible text, and the close
-/// `ESC ] 8 ; ; ESC \` — is collapsed into the segment's *first* cell
-/// and every remaining cell of the segment is marked `skip`.
+/// `ESC ] 8 ; ; ESC \` — is folded into the segment's *first* cell, while
+/// the interior cells keep their original glyphs.
 ///
 /// Why not the obvious "prepend open to first cell, append close to last
 /// cell"? ratatui measures a cell's display width as `symbol().width()`,
 /// and the embedded URL bytes (`]8;;`, the URL, `\`) all count as visible
 /// width even though the terminal renders them as zero-width escapes. Its
 /// diff then does `to_skip = symbol().width() - 1`, which — because
-/// `to_skip` is *reassigned every iteration*, not decremented — skips
-/// exactly the one cell after the inflated cell, leaving it stale. With
-/// the anchor split across the first and last cell that dropped the second
-/// character of the link and the first character after it. Collapsing the
-/// anchor into one cell means only that cell is "wide"; the single skipped
-/// cell is an *interior* link cell (also `skip`-flagged here), so the
-/// terminal — which prints the first cell's full symbol across the
-/// segment's columns and absolutely-positions every later cell — drops
-/// nothing visible. This is the standard ratatui idiom for holding
-/// multi-cell content in one cell.
+/// `to_skip` is *reassigned every iteration*, not decremented — drops
+/// exactly the one cell after the inflated cell from the update list,
+/// leaving it stale. With the anchor split across the first and last cell
+/// that dropped the second character of the link and the first character
+/// after it.
+///
+/// Folding the *entire* anchor (including the visible text) into the first
+/// cell fixes this: the terminal prints that one cell's full symbol across
+/// all of the segment's columns, so even the one cell ratatui skips after
+/// it is already painted by the overflow — nothing is dropped. Crucially
+/// we do **not** mark the interior cells `skip`: they keep their real
+/// glyphs so the cursor / selection / yank painters (which flip styles on
+/// individual cells *after* this runs) still render on them. A skipped
+/// cell is never drawn, so flagging them made the Normal-mode cursor
+/// vanish as it crossed a link. The lone exception is the cell immediately
+/// after the first (the link's 2nd column): ratatui's wide-symbol skip
+/// drops *its* update, so a cursor parked exactly there won't show — a
+/// one-cell cosmetic blind spot, not a dropped character.
 ///
 /// `header_offset` is the number of header rows (From / Subject / …) the
 /// body is rendered below; segment lines are body-relative, so it must be
 /// added to land the anchor on the right row (mirroring `paint_selection`
-/// et al.). Without it the anchors — and their one-cell skips — scattered
-/// onto the header-offset rows above each link, corrupting unrelated text.
+/// et al.). Without it the anchors scattered onto the header-offset rows
+/// above each link, corrupting unrelated text.
 ///
 /// Capable terminals (kitty, wezterm, foot, iTerm2, recent gnome-terminal)
 /// render this as a clickable / copyable hyperlink; others ignore the
@@ -918,15 +926,16 @@ fn emit_osc8_hyperlinks(
             let abs_start = inner.x.saturating_add(seg.col_start).min(inner_right);
             let abs_end = inner.x.saturating_add(seg.col_end).min(inner_right);
             // A single-cell segment has no interior cell to absorb the
-            // width-inflation skip (see above), so the dropped cell would
-            // be the one *after* the link. Leave it styled-but-not-anchored
-            // rather than corrupt the following character.
+            // width-inflation skip (see above): the first cell's overflow
+            // covers only its own column, so the skipped cell is the one
+            // *after* the link and a real character drops. Leave it
+            // styled-but-not-anchored rather than corrupt that character.
             if abs_end.saturating_sub(abs_start) < 2 {
                 continue;
             }
             // Reconstruct the segment's visible text from the cells the
             // Paragraph already laid down, then fold the full anchor into
-            // the first cell and skip the rest of the segment.
+            // the first cell. The interior cells are left as-is.
             let mut text = String::new();
             for x in abs_start..abs_end {
                 if let Some(cell) = buf.cell((x, row)) {
@@ -935,11 +944,6 @@ fn emit_osc8_hyperlinks(
             }
             if let Some(cell) = buf.cell_mut((abs_start, row)) {
                 cell.set_symbol(&format!("{open}{text}{CLOSE}"));
-            }
-            for x in (abs_start + 1)..abs_end {
-                if let Some(cell) = buf.cell_mut((x, row)) {
-                    cell.set_skip(true);
-                }
             }
         }
     }
@@ -2089,30 +2093,27 @@ mod tests {
             }
         }
         super::emit_osc8_hyperlinks(&mut buf, inner, &laid.links, 0, 0);
-        // The whole anchor collapses into the segment's first cell:
-        // "click" starts at column 4 (after "see "), so cell (4,0) holds
-        // open + "click" + close, and the interior cells are `skip`.
+        // The whole anchor folds into the segment's first cell: "click"
+        // starts at column 4 (after "see "), so cell (4,0) holds
+        // open + "click" + close — the terminal's overflow then paints the
+        // glyphs across cols 4..9.
         let first_cell = buf.cell((4, 0)).expect("first link cell");
         let first_sym = first_cell.symbol();
         assert_eq!(
             first_sym, "\x1b]8;;https://x.example/p\x1b\\click\x1b]8;;\x1b\\",
             "first link cell symbol was {first_sym:?}"
         );
-        // Interior link cells ("lick", cols 5..9) keep their glyph but are
-        // skipped so ratatui's wide-symbol diff can't drop a real cell.
-        for x in 5..9 {
+        // Interior link cells ("lick", cols 5..9) keep their real glyph and
+        // are NOT skipped, so the cursor / selection painters still render
+        // on them (flagging them skip made the cursor vanish over links).
+        for (x, ch) in (5..9).zip("lick".chars()) {
             let cell = buf.cell((x, 0)).expect("interior link cell");
-            assert!(cell.skip, "cell {x} should be skipped: {:?}", cell.symbol());
-            assert!(
-                !cell.symbol().contains('\x1b'),
-                "interior cell {x} leaked OSC 8: {:?}",
-                cell.symbol()
-            );
+            assert!(!cell.skip, "interior cell {x} should not be skipped");
+            assert_eq!(cell.symbol(), ch.to_string(), "interior cell {x} glyph");
         }
         // The cell right after the link ("done"'s leading space at col 9)
-        // is untouched — not skipped, no escapes — so nothing is dropped.
+        // is untouched — no escapes — so nothing is dropped.
         let after = buf.cell((9, 0)).expect("post-link cell");
-        assert!(!after.skip, "post-link cell wrongly skipped");
         assert!(!after.symbol().contains('\x1b'), "{:?}", after.symbol());
         // Non-link cells must not carry any OSC 8 bytes.
         let outside = buf.cell((0, 0)).expect("first cell");
