@@ -598,6 +598,20 @@ pub struct InboxScreen {
     /// `apply_rescan` knows whether the current list view was
     /// re-walked and needs its rows replaced.
     rescan_in_flight: HashSet<(String, String)>,
+    /// Bumped on every optimistic in-memory mutation a racing rescan
+    /// could clobber — a row dropped by a cross-folder move
+    /// (`drop_row_after_move`) or a flag patched in place
+    /// (`apply_flag_change`). A rescan worker walks the disk
+    /// asynchronously, so one kicked *before* such a mutation can carry
+    /// pre-mutation state (e.g. a just-trashed message still present in
+    /// its old folder). `apply_rescan` discards any result whose
+    /// `rescan_kick_epoch` no longer matches and re-queues the folders,
+    /// so the stale walk can't resurrect a removed row or revert a flag.
+    optimistic_epoch: u64,
+    /// `optimistic_epoch` captured when the in-flight `rescan_rx` was
+    /// kicked. Compared on result to detect a mutation that raced the
+    /// walk.
+    rescan_kick_epoch: u64,
     /// One-shot warning surfaced to the cmdline status row when the
     /// watcher failed to start (commonly `fs.inotify.max_user_watches`
     /// exhausted). `None` once consumed by `App::new`.
@@ -1800,6 +1814,8 @@ impl InboxScreen {
             pending_dirty: HashSet::new(),
             rescan_rx: None,
             rescan_in_flight: HashSet::new(),
+            optimistic_epoch: 0,
+            rescan_kick_epoch: 0,
             watcher_warning,
             search: None,
         }
@@ -2381,6 +2397,10 @@ impl InboxScreen {
         let Some(snapshot_base) = self.find_row(source).cloned() else {
             return;
         };
+        // A rescan walking the disk concurrently may still see this
+        // message in its old folder; bump the epoch so its result is
+        // discarded rather than resurrecting the row we're about to drop.
+        self.optimistic_epoch = self.optimistic_epoch.wrapping_add(1);
         let src_folder = snapshot_base.folder.clone();
         let account = snapshot_base.account.clone();
         let was_unread = !snapshot_base.flags.contains('S');
@@ -2575,6 +2595,10 @@ impl InboxScreen {
         let Some(pre) = self.find_row(target).cloned() else {
             return;
         };
+        // Same race as a move: a rescan kicked before this flip can carry
+        // the pre-flip flags and revert the in-memory patch below. Bump
+        // the epoch so `apply_rescan` discards a stale walk.
+        self.optimistic_epoch = self.optimistic_epoch.wrapping_add(1);
         let was_unread = !pre.flags.contains('S');
         let now_unread = !new_flags.contains('S');
         let unread_delta: i64 = match (was_unread, now_unread) {
@@ -3007,8 +3031,23 @@ impl InboxScreen {
             match rx.try_recv() {
                 Ok(Ok(data)) => {
                     let covered = std::mem::take(&mut self.rescan_in_flight);
-                    self.apply_rescan(data, &covered);
                     self.rescan_rx = None;
+                    if self.optimistic_epoch != self.rescan_kick_epoch {
+                        // A move/flag mutation landed after this walk was
+                        // kicked: the payload may carry pre-mutation disk
+                        // state (a trashed row still in its old folder, a
+                        // reverted flag). Drop it and re-queue the folders
+                        // so step 3 kicks a fresh, post-mutation walk.
+                        log::debug!(
+                            "poll_watch: discarding stale rescan (epoch {} != {}); re-queuing {:?}",
+                            self.rescan_kick_epoch,
+                            self.optimistic_epoch,
+                            covered
+                        );
+                        self.pending_dirty.extend(covered);
+                    } else {
+                        self.apply_rescan(data, &covered);
+                    }
                 }
                 Ok(Err(msg)) => {
                     *status_error = Some(format!("rescan: {msg}"));
@@ -3039,6 +3078,7 @@ impl InboxScreen {
                 .map(|(n, a)| (n.clone(), AccountSpec::from_account(n, a)))
                 .collect();
             self.rescan_in_flight = dirty.clone();
+            self.rescan_kick_epoch = self.optimistic_epoch;
             self.rescan_rx = Some(scan::rescan_folders(
                 cache_path.to_path_buf(),
                 accounts,
@@ -5022,6 +5062,86 @@ Date: Thu, 28 May 2026 12:00:00 +0000\r\n\
         assert_eq!(app.inbox().threaded().len(), 1);
         assert_eq!(app.inbox().selected, 0);
         assert_eq!(app.inbox().selected_msgid().as_deref(), Some("b@x"));
+    }
+
+    #[test]
+    fn poll_watch_discards_rescan_racing_a_local_delete() {
+        // Reproduces the "deleted row lingers while the cursor moves on"
+        // bug: a rescan kicked before a local trash walks the disk while
+        // the message is still present, so its payload would resurrect the
+        // just-removed row (selection stays pinned by msgid to the next
+        // message — exactly the reported symptom). The optimistic_epoch
+        // guard must discard the stale payload instead of applying it.
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("index.sqlite");
+        let inbox = tmp.path().join("Mail").join("personal");
+        fs::create_dir_all(inbox.join("cur")).unwrap();
+        fs::create_dir_all(inbox.join("new")).unwrap();
+        let m1 = inbox.join("cur").join("1.M0.h:2,S");
+        let m2 = inbox.join("cur").join("2.M0.h:2,S");
+        fs::write(
+            &m1,
+            b"Message-ID: <a@x>\r\nDate: Thu, 1 Jan 1970 00:00:00 +0000\r\n\r\n",
+        )
+        .unwrap();
+        fs::write(
+            &m2,
+            b"Message-ID: <b@x>\r\nDate: Fri, 2 Jan 1970 00:00:00 +0000\r\n\r\n",
+        )
+        .unwrap();
+
+        let cfg = one_account_config(&tmp);
+        let mut app = App::new(&cfg, cache.clone(), None, None);
+        drain_scan(&mut app, &cfg);
+        assert_eq!(app.inbox().threaded().len(), 2);
+
+        // 1. A rescan is kicked while both messages are still on disk, so
+        //    its disk walk will report both rows.
+        app.inbox_mut()
+            .pending_dirty
+            .insert(("personal".into(), "INBOX".into()));
+        app.poll_watch(&cfg);
+        assert!(
+            app.inbox().rescan_rx.is_some(),
+            "rescan should be in flight"
+        );
+        // Let the worker finish its walk so the (stale, two-row) result is
+        // buffered in the channel, undrained.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // 2. The user trashes <b>: it leaves the in-memory list + disk and
+        //    the optimistic epoch advances — what drop_row_after_move does.
+        {
+            let ib = app.inbox_mut();
+            if let ScanState::Ready(rows) = &mut ib.scan {
+                rows.remove(0); // <b> is row 0 (newest by date)
+            }
+            ib.optimistic_epoch = ib.optimistic_epoch.wrapping_add(1);
+        }
+        fs::remove_file(&m2).unwrap();
+        assert_eq!(app.inbox().threaded().len(), 1);
+
+        // 3. Draining the stale rescan must NOT bring <b> back.
+        app.poll_watch(&cfg);
+        assert_eq!(
+            app.inbox().threaded().len(),
+            1,
+            "stale rescan resurrected the deleted row"
+        );
+        assert_eq!(app.inbox().selected_msgid().as_deref(), Some("a@x"));
+
+        // 4. The folders were re-queued; a fresh, post-delete rescan
+        //    settles on the correct single-row view.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.poll_watch(&cfg);
+            if app.inbox().rescan_rx.is_none() && app.inbox().pending_dirty.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.inbox().threaded().len(), 1);
+        assert_eq!(app.inbox().selected_msgid().as_deref(), Some("a@x"));
     }
 
     /// Spin only the eager INBOX scan (waits for `scan_rx`); deliberately

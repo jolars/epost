@@ -46,7 +46,7 @@ impl SelfWrites {
     /// suppresses both the delete and the create event.
     pub fn record(&self, path: impl Into<PathBuf>) {
         let mut g = self.0.lock().expect("SelfWrites poisoned");
-        g.insert(path.into());
+        g.insert(normalize(&path.into()));
     }
 
     /// Returns true iff `path` was registered by us, removing it so a
@@ -56,7 +56,7 @@ impl SelfWrites {
     /// failed rename.
     pub fn consume(&self, path: &Path) -> bool {
         let mut g = self.0.lock().expect("SelfWrites poisoned");
-        g.remove(path)
+        g.remove(&normalize(path))
     }
 
     #[cfg(test)]
@@ -140,6 +140,25 @@ struct DirtyState {
 /// transient permission issue) so we degrade rather than panic.
 fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Normalise a maildir file path to the same form the watcher compares
+/// against: the canonicalised parent directory joined with the original
+/// filename. `SelfWrites` records and consumes through this so a
+/// self-write recorded with a non-canonical path (relative `dev/maildir`
+/// roots, a symlinked maildir) still matches the event `notify` reports
+/// under the canonical watch dir. Mirrors the parent-canonicalisation
+/// `handle_event` already does on the lookup side — without it, our own
+/// renames leak through as "external" dirt and trigger a clobbering
+/// rescan. We canonicalise only the parent (always present for both the
+/// source `cur/` and the pre-created destination `cur/`); canonicalising
+/// the full path would fail for the destination, which doesn't exist
+/// yet at record time.
+fn normalize(p: &Path) -> PathBuf {
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => canonical(parent).join(name),
+        _ => p.to_path_buf(),
+    }
 }
 
 type LookupMap = HashMap<PathBuf, FolderKey>;
@@ -621,6 +640,44 @@ mod tests {
         // Second consume returns false — the watcher won't accidentally
         // swallow a later genuine event on the same path.
         assert!(!sw.consume(&p));
+    }
+
+    #[test]
+    fn self_writes_normalize_matches_non_canonical_record() {
+        // Regression for the "deleted row lingers" bug: a self-write
+        // recorded with a non-canonical path (relative / `.`-laden, as the
+        // move code passes it) must still be consumed when the watcher
+        // presents the canonical event path notify reports under the
+        // canonical watch dir. Without parent-canonicalisation here, our
+        // own delete leaks through as external dirt and triggers a rescan
+        // that resurrects the row we just dropped.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let cur = tmp.path().join("Inbox").join("cur");
+        fs::create_dir_all(&cur).unwrap();
+
+        let sw = SelfWrites::new();
+        // Record with a noisy `/./Inbox/./cur/` parent.
+        let noisy = tmp
+            .path()
+            .join(".")
+            .join("Inbox")
+            .join(".")
+            .join("cur")
+            .join("1.M0.h:2,S");
+        sw.record(&noisy);
+        assert_eq!(sw.len(), 1);
+
+        // Consume with the canonical path — the form the watcher derives
+        // from a real inotify event.
+        let canonical_event = cur.join("1.M0.h:2,S");
+        assert!(
+            sw.consume(&canonical_event),
+            "normalised self-write must match the canonical event path"
+        );
+        assert_eq!(sw.len(), 0);
     }
 
     #[test]
