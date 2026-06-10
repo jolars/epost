@@ -544,9 +544,12 @@ pub fn draw(
                 if body.lines.len() == prefix_len
                     && let Some(plain) = parsed.plain_fallback.as_deref()
                 {
-                    body.lines
-                        .push(dim_line("(no HTML body, showing text/plain)"));
-                    body.line_text.push(String::new());
+                    const FALLBACK_NOTE: &str = "(no HTML body, showing text/plain)";
+                    body.lines.push(dim_line(FALLBACK_NOTE));
+                    // line_text must match the rendered glyphs, not be
+                    // empty — an empty entry pins the reader cursor to
+                    // col 0 on this row (its clamp uses the line's length).
+                    body.line_text.push(FALLBACK_NOTE.to_string());
                     body.line_block_idx.push(None);
                     // Pre-wrap to the pane width so each row stays a single
                     // terminal line — `Paragraph`'s own `Wrap` would
@@ -864,9 +867,17 @@ fn paint_cursor_cell(
     for dx in 0..cell_w {
         let x = x0.saturating_add(dx).min(x_max);
         if let Some(cell) = buf.cell_mut((x, row)) {
-            let mut style = cell.style();
-            style = style.add_modifier(Modifier::REVERSED);
-            cell.set_style(style);
+            // Reset the cell's colours/modifiers *before* reversing, rather
+            // than layering REVERSED on top of whatever the text already
+            // had. On a plain cell either way gives a clean default-swap
+            // block, but on a coloured cell — a link (blue) or heading
+            // (yellow) — `existing.add_modifier(REVERSED)` produces a
+            // *coloured* reverse block (e.g. blue-on-default) that is
+            // low-contrast or invisible on many terminals/colourschemes.
+            // That was the "cursor only shows on paragraphs, not on links
+            // or headings" report. A reset-then-reverse is the terminal
+            // block-cursor convention and is high-contrast everywhere.
+            cell.set_style(Style::reset().add_modifier(Modifier::REVERSED));
         }
     }
 }
@@ -3013,6 +3024,49 @@ mod tests {
                 assert!(!rev, "col {col} REVERSED but should be clean");
             }
         }
+    }
+
+    #[test]
+    fn cursor_cell_is_clean_reverse_over_a_coloured_link() {
+        // On a link cell (blue fg + underline) the cursor must reset the
+        // colours before reversing, otherwise it renders a *coloured*
+        // reverse block that's invisible on many terminals — the "cursor
+        // only shows on plain paragraphs" bug.
+        use ratatui::buffer::Buffer;
+        let blocks = html::parse(r#"<p>see <a href="https://x">link</a></p>"#);
+        let laid = layout(&blocks, 80, &[], None, None);
+        let li = laid
+            .line_text
+            .iter()
+            .position(|s| s.contains("link"))
+            .expect("link line") as u16;
+        // Column of the first char of "link" (after "see ").
+        let col = laid.line_text[li as usize].find("link").unwrap() as u16;
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(inner);
+        super::paint_cursor_cell(&mut buf, inner, &laid, li, col, 0, 0);
+        let cell = buf
+            .cell((inner.x + col, inner.y + li))
+            .expect("cursor cell");
+        let style = cell.style();
+        assert!(
+            style.add_modifier.contains(Modifier::REVERSED),
+            "cursor must be reversed"
+        );
+        assert!(
+            !style.add_modifier.contains(Modifier::UNDERLINED),
+            "cursor must not inherit the link's underline: {style:?}"
+        );
+        assert_eq!(
+            style.fg,
+            Some(Color::Reset),
+            "cursor must reset fg, not keep the link's blue: {style:?}"
+        );
     }
 
     #[test]
