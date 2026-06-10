@@ -43,6 +43,61 @@ pub(crate) fn cells(s: &str) -> u16 {
     UnicodeWidthStr::width(s).min(u16::MAX as usize) as u16
 }
 
+/// Soft-wrap a single text/plain line to `width` cells at word
+/// boundaries, returning one piece per terminal row it should occupy.
+///
+/// The reader's cursor, visual selection, scroll, and `follow_cursor`
+/// math all assume **one body line renders as exactly one terminal row**.
+/// The HTML walker upholds that by wrapping every line to the pane width
+/// itself; the text/plain fallback does not, so a long quoted-reply line
+/// reached `Paragraph`'s `Wrap` unwrapped and was split into several rows
+/// while the cursor still counted one row per body line — the cursor
+/// drifted onto the wrong row and clamped to the pane edge past the wrap
+/// point (visible on the leading `> `, then gone). Pre-wrapping here keeps
+/// each emitted piece ≤ `width`, so `Paragraph` never re-wraps it and the
+/// 1:1 invariant holds.
+///
+/// Words longer than `width` are hard-split. A blank line yields a single
+/// empty piece so paragraph breaks survive. Leading whitespace (indent,
+/// `> ` markers) rides on the first piece; continuations start at column
+/// 0, matching how a soft wrap reads.
+pub(crate) fn wrap_plain_line(line: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    if UnicodeWidthStr::width(line) <= width {
+        return vec![line.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    // Byte offset within `cur` just after the last space seen — the point
+    // we break at when the next char would overflow.
+    let mut last_space: Option<usize> = None;
+    for ch in line.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + cw > width && !cur.is_empty() {
+            match last_space {
+                Some(sp) => {
+                    let rest = cur[sp..].to_string();
+                    cur.truncate(sp.saturating_sub(1)); // drop the break space
+                    out.push(std::mem::replace(&mut cur, rest));
+                }
+                None => out.push(std::mem::take(&mut cur)),
+            }
+            cur_w = UnicodeWidthStr::width(cur.as_str());
+            last_space = None;
+        }
+        cur.push(ch);
+        cur_w += cw;
+        if ch == ' ' {
+            last_space = Some(cur.len());
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Display column (0-based cell offset) of the char at index `char_idx`
 /// within `line` — i.e. the cell width of the prefix preceding it.
 /// Measured as a *string* prefix rather than a per-char width sum so that
@@ -493,10 +548,16 @@ pub fn draw(
                         .push(dim_line("(no HTML body, showing text/plain)"));
                     body.line_text.push(String::new());
                     body.line_block_idx.push(None);
+                    // Pre-wrap to the pane width so each row stays a single
+                    // terminal line — `Paragraph`'s own `Wrap` would
+                    // otherwise re-split long lines and desync the reader
+                    // cursor (see `wrap_plain_line`).
                     for ln in plain.lines() {
-                        body.lines.push(Line::raw(ln.to_string()));
-                        body.line_text.push(ln.to_string());
-                        body.line_block_idx.push(None);
+                        for piece in wrap_plain_line(ln, inner_width) {
+                            body.lines.push(Line::raw(piece.clone()));
+                            body.line_text.push(piece);
+                            body.line_block_idx.push(None);
+                        }
                     }
                 }
                 // Translate per-body image-slot indices into absolute
@@ -1797,6 +1858,42 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn wrap_plain_line_keeps_pieces_within_width() {
+        // Short lines pass through untouched (one piece).
+        assert_eq!(wrap_plain_line("> short reply", 40), vec!["> short reply"]);
+        // Empty line survives as one empty piece (paragraph break).
+        assert_eq!(wrap_plain_line("", 40), vec![""]);
+        // A long line wraps at word boundaries; every piece fits the width
+        // and the leading quote marker rides the first piece.
+        let long = "> this is a long quoted reply line that exceeds the pane width and wraps";
+        let pieces = wrap_plain_line(long, 40);
+        assert!(pieces.len() >= 2, "expected a wrap: {pieces:?}");
+        assert!(pieces[0].starts_with("> "), "{:?}", pieces[0]);
+        for p in &pieces {
+            assert!(cells(p) <= 40, "piece over width: {p:?}");
+        }
+        // No characters are lost (only break-spaces collapse).
+        let rejoined: String = pieces.join(" ");
+        assert_eq!(
+            rejoined.split_whitespace().collect::<Vec<_>>(),
+            long.split_whitespace().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wrap_plain_line_hard_splits_overlong_word() {
+        // A single word longer than the width must still be cut so the
+        // row never overflows (and the cursor invariant holds).
+        let word = "a".repeat(50);
+        let pieces = wrap_plain_line(&word, 20);
+        assert!(pieces.len() >= 3, "{pieces:?}");
+        for p in &pieces {
+            assert!(cells(p) <= 20, "piece over width: {p:?}");
+        }
+        assert_eq!(pieces.concat(), word, "no chars lost on hard split");
     }
 
     #[test]
