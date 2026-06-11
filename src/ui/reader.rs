@@ -1981,27 +1981,54 @@ fn flatten_inlines(
                     // the eye lands on the candidate set.
                     s = s.fg(Color::DarkGray).remove_modifier(Modifier::UNDERLINED);
                 }
-                let mut buf = String::new();
-                for ch in content.chars() {
-                    if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
-                        if !buf.is_empty() {
+                if in_link.is_some() {
+                    // Already inside an explicit `<a>`: emit the visible text
+                    // as-is. (Don't autolink here — the link is the anchor's
+                    // href, not whatever URL the text happens to spell.)
+                    tokenize_words(content, s, in_link, out);
+                } else {
+                    // Autolink bare URLs sitting in plain HTML text so they
+                    // render as one contiguous blue/underlined link (and feed
+                    // the picker / `gx` / OSC 8), matching an explicit `<a>`
+                    // — instead of leaving the terminal's native URL
+                    // detection to underline them with gaps.
+                    let mut pos = 0usize;
+                    for (us, ue) in detect_urls(content) {
+                        if pos < us {
+                            tokenize_words(&content[pos..us], s, None, out);
+                        }
+                        let id = *next_id;
+                        *next_id += 1;
+                        links.push(LinkSlot {
+                            id,
+                            href: content[us..ue].to_string(),
+                            segments: Vec::new(),
+                        });
+                        if let Some(prefix) = pick {
+                            let tag = link_pick_tag(id, prefix);
                             out.push(Token::Word {
-                                text: std::mem::take(&mut buf),
-                                style: s,
-                                link_id: in_link,
+                                text: tag.content.into_owned(),
+                                style: tag.style,
+                                link_id: None,
                             });
                         }
-                        out.push(Token::Space);
-                    } else {
-                        buf.push(ch);
+                        let dim =
+                            pick.is_some_and(|p| !p.is_empty() && !id.to_string().starts_with(p));
+                        let url_style = if dim {
+                            s.fg(Color::DarkGray).remove_modifier(Modifier::UNDERLINED)
+                        } else {
+                            s.fg(Color::Blue).add_modifier(Modifier::UNDERLINED)
+                        };
+                        out.push(Token::Word {
+                            text: content[us..ue].to_string(),
+                            style: url_style,
+                            link_id: Some(id),
+                        });
+                        pos = ue;
                     }
-                }
-                if !buf.is_empty() {
-                    out.push(Token::Word {
-                        text: buf,
-                        style: s,
-                        link_id: in_link,
-                    });
+                    if pos < content.len() {
+                        tokenize_words(&content[pos..], s, None, out);
+                    }
                 }
             }
             Inline::Link { href, runs } => {
@@ -2036,6 +2063,34 @@ fn flatten_inlines(
     }
 }
 
+/// Split `text` into `Word` / `Space` tokens at ASCII whitespace, tagging
+/// every word with `style` and `link_id`. Shared by the plain-text run of a
+/// node and the spans flanking an autolinked bare URL within it.
+fn tokenize_words(text: &str, style: Style, link_id: Option<u32>, out: &mut Vec<Token>) {
+    let mut buf = String::new();
+    for ch in text.chars() {
+        if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+            if !buf.is_empty() {
+                out.push(Token::Word {
+                    text: std::mem::take(&mut buf),
+                    style,
+                    link_id,
+                });
+            }
+            out.push(Token::Space);
+        } else {
+            buf.push(ch);
+        }
+    }
+    if !buf.is_empty() {
+        out.push(Token::Word {
+            text: buf,
+            style,
+            link_id,
+        });
+    }
+}
+
 fn combine_style(base: Style, extra: InlineStyle) -> Style {
     let mut s = base;
     if extra.bold {
@@ -2059,6 +2114,11 @@ struct LineBuilder {
     line_spans: Vec<Span<'static>>,
     line_width: usize,
     pending_space: bool,
+    /// Link id of the most recently pushed word, so a space *between* two
+    /// words of the same link can be styled with the link's underline
+    /// instead of breaking it. `None` after a wrap (the boundary space is
+    /// dropped) or after a non-link word.
+    last_link_id: Option<u32>,
 }
 
 impl LineBuilder {
@@ -2082,6 +2142,7 @@ impl LineBuilder {
             line_spans: spans,
             line_width: width,
             pending_space: false,
+            last_link_id: None,
         }
     }
 
@@ -2107,7 +2168,16 @@ impl LineBuilder {
             self.flush_line(out_lines);
         }
         if self.pending_space {
-            self.line_spans.push(Span::raw(" "));
+            // A space joining two words of the *same* link rides the link's
+            // style so the underline runs continuously across it (matching a
+            // browser); every other space is plain. The segment-merge below
+            // already treats this one-cell gap as part of the link.
+            let space_style = if link_id.is_some() && link_id == self.last_link_id {
+                style
+            } else {
+                Style::default()
+            };
+            self.line_spans.push(Span::styled(" ", space_style));
             self.line_width += 1;
             self.pending_space = false;
         }
@@ -2115,6 +2185,7 @@ impl LineBuilder {
         self.line_spans.push(Span::styled(text.to_string(), style));
         self.line_width += word_w;
         let col_end = self.line_width as u16;
+        self.last_link_id = link_id;
         if let Some(id) = link_id {
             let current_line = out_lines.len();
             if let Some(slot) = links.iter_mut().find(|s| s.id == id) {
@@ -2151,6 +2222,9 @@ impl LineBuilder {
         self.line_width = self.indent as usize + cells(&self.lead) as usize;
         self.line_spans = spans;
         self.pending_space = false;
+        // A link wrapping to the next line drops its boundary space, so the
+        // continuation starts a fresh segment with no carried link id.
+        self.last_link_id = None;
     }
 }
 
@@ -2447,6 +2521,94 @@ mod tests {
         let url_at = text.find("https://").unwrap();
         assert_eq!(tag_at + tag.len(), url_at, "tag must abut url: {text:?}");
         assert_eq!(seg.col_start as usize, cells(&text[..url_at]) as usize);
+    }
+
+    #[test]
+    fn html_text_bare_url_is_autolinked() {
+        // A bare URL in HTML text (not an `<a>`) becomes a real link: one
+        // slot, contiguous blue + underline, so the app draws the underline
+        // rather than leaning on the terminal's gappy native detection.
+        let blocks = html::parse("<p>Visit https://example.com/a/b here</p>");
+        let laid = layout(&blocks, 80, &[], None, None, None);
+        assert_eq!(laid.links.len(), 1, "bare URL → one link: {:?}", laid.links);
+        assert_eq!(laid.links[0].href, "https://example.com/a/b");
+        let seg = &laid.links[0].segments[0];
+        let line = &laid.lines[seg.line];
+        // Every cell of the URL is one styled span: blue + underlined, and
+        // there's exactly one such span (no gaps splitting it).
+        let url_spans: Vec<&Span> = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .collect();
+        assert_eq!(url_spans.len(), 1, "url must be one contiguous span");
+        assert_eq!(url_spans[0].content.as_ref(), "https://example.com/a/b");
+        assert_eq!(url_spans[0].style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn html_explicit_anchor_text_is_not_re_autolinked() {
+        // Text inside an `<a>` keeps the anchor's href; a URL spelled in the
+        // visible text must not spawn a second link.
+        let blocks =
+            html::parse(r#"<p><a href="https://real.test/x">https://decoy.test/y</a></p>"#);
+        let laid = layout(&blocks, 80, &[], None, None, None);
+        assert_eq!(laid.links.len(), 1, "one anchor → one link");
+        assert_eq!(laid.links[0].href, "https://real.test/x");
+    }
+
+    #[test]
+    fn multiword_link_underlines_the_spaces_between_words() {
+        // A multi-word `<a>` link's interior spaces must carry the link's
+        // underline so it reads as one continuous link, not underlined words
+        // with bare gaps. The space spans between the words are styled, blue,
+        // and underlined just like the words.
+        let blocks = html::parse(r#"<p><a href="https://x.test">click me now</a></p>"#);
+        let laid = layout(&blocks, 80, &[], None, None, None);
+        let seg = &laid.links[0].segments[0];
+        let line = &laid.lines[seg.line];
+        // Reassemble the link's cells from the spans covering its columns;
+        // every cell in [col_start, col_end) — words and the spaces between
+        // — must be underlined.
+        let mut col = 0u16;
+        let mut underlined_run = String::new();
+        for span in &line.spans {
+            let w = cells(span.content.as_ref());
+            let span_start = col;
+            let span_end = col + w;
+            if span_start >= seg.col_start
+                && span_end <= seg.col_end
+                && span.style.add_modifier.contains(Modifier::UNDERLINED)
+            {
+                underlined_run.push_str(span.content.as_ref());
+            }
+            col = span_end;
+        }
+        assert_eq!(
+            underlined_run, "click me now",
+            "interior spaces must be underlined, not gaps"
+        );
+    }
+
+    #[test]
+    fn space_between_two_distinct_links_is_not_underlined() {
+        // The space *between* two separate links stays plain — only spaces
+        // inside a single link get the link style.
+        let blocks =
+            html::parse(r#"<p><a href="https://a.test">A</a> <a href="https://b.test">B</a></p>"#);
+        let laid = layout(&blocks, 80, &[], None, None, None);
+        assert_eq!(laid.links.len(), 2);
+        let line = &laid.lines[laid.links[0].segments[0].line];
+        // Find the single-space span sitting between the two link words.
+        let gap = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == " ")
+            .expect("a separating space span");
+        assert!(
+            !gap.style.add_modifier.contains(Modifier::UNDERLINED),
+            "space between distinct links must stay plain"
+        );
     }
 
     #[test]
