@@ -734,7 +734,14 @@ pub(crate) fn yank_visual(app: &mut App, cfg: &Config) {
     let width = inbox.last_reader_inner_width.max(8);
     let (text, ranges) = match app.inbox_parsed() {
         Some(p) => {
-            let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
+            let laid = crate::ui::reader::layout(
+                &p.blocks,
+                width,
+                &p.attachments,
+                p.plain_fallback.as_deref(),
+                None,
+                None,
+            );
             let text = laid.extract_selection(
                 sel.anchor_line,
                 sel.anchor_col,
@@ -930,7 +937,14 @@ fn yank_paragraph(app: &mut App, cfg: &Config, a_paragraph: bool) {
     let cursor = inbox.reader_cursor_line;
     let (mut text, ranges) = match app.inbox_parsed() {
         Some(p) if !p.blocks.is_empty() => {
-            let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
+            let laid = crate::ui::reader::layout(
+                &p.blocks,
+                width,
+                &p.attachments,
+                p.plain_fallback.as_deref(),
+                None,
+                None,
+            );
             match laid.block_at(cursor) {
                 Some(idx) => (text::extract_block(&p.blocks[idx]), laid.block_ranges(idx)),
                 None => (String::new(), Vec::new()),
@@ -969,7 +983,14 @@ fn yank_link(app: &mut App, cfg: &Config) {
     let viewport_h = inbox.last_reader_inner_height;
     let (href, visible, ranges) = match app.inbox_parsed() {
         Some(p) => {
-            let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
+            let laid = crate::ui::reader::layout(
+                &p.blocks,
+                width,
+                &p.attachments,
+                p.plain_fallback.as_deref(),
+                None,
+                None,
+            );
             let visible = laid.visible_link_count(scroll_body, viewport_h);
             match laid.first_link_at_or_after(cursor) {
                 Some(slot) => (
@@ -1197,7 +1218,14 @@ fn open_link_under_cursor(app: &mut App, cfg: &Config) -> bool {
     let Some(p) = app.inbox_parsed() else {
         return false;
     };
-    let laid = crate::ui::reader::layout(&p.blocks, width, &p.attachments, None, None);
+    let laid = crate::ui::reader::layout(
+        &p.blocks,
+        width,
+        &p.attachments,
+        p.plain_fallback.as_deref(),
+        None,
+        None,
+    );
     let Some(href) = laid.link_at(line, col).map(|s| s.href.clone()) else {
         return false;
     };
@@ -1222,7 +1250,14 @@ fn follow_link(app: &mut App, cfg: &Config, buf: &str) {
     // the keymap doesn't know that width, rebuild the link table at a sensible
     // default to find the href. Width influences wrapping but not link
     // identity / count, so any reasonable width works.
-    let laid = crate::ui::reader::layout(&parsed.blocks, 80, &[], None, None);
+    let laid = crate::ui::reader::layout(
+        &parsed.blocks,
+        80,
+        &[],
+        parsed.plain_fallback.as_deref(),
+        None,
+        None,
+    );
     let Some(slot) = laid.links.iter().find(|s| s.id == id) else {
         app.status_error = Some(format!("link: no such id: {id}"));
         return;

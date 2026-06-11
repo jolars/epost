@@ -61,30 +61,56 @@ pub(crate) fn cells(s: &str) -> u16 {
 /// empty piece so paragraph breaks survive. Leading whitespace (indent,
 /// `> ` markers) rides on the first piece; continuations start at column
 /// 0, matching how a soft wrap reads.
+#[cfg(test)]
 pub(crate) fn wrap_plain_line(line: &str, width: u16) -> Vec<String> {
+    wrap_with_offsets(line, width)
+        .into_iter()
+        .map(|(piece, _)| piece)
+        .collect()
+}
+
+/// Like [`wrap_plain_line`], but pairs each piece with the byte offset at
+/// which it begins in `line`. The offset lets a caller map per-character
+/// metadata computed on the original line (autolinked URL byte ranges, in
+/// particular) onto the wrapped pieces, since the break space dropped
+/// between two pieces means a piece's content no longer starts at a simple
+/// running sum of the prior pieces' lengths. Each returned piece is an
+/// exact substring `line[offset..offset + piece.len()]` (the only chars the
+/// wrap ever discards are the single break spaces *between* pieces), so
+/// byte ranges within the original line translate to piece-local ranges by
+/// subtracting the offset.
+fn wrap_with_offsets(line: &str, width: u16) -> Vec<(String, usize)> {
     let width = width.max(1) as usize;
     if UnicodeWidthStr::width(line) <= width {
-        return vec![line.to_string()];
+        return vec![(line.to_string(), 0)];
     }
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, usize)> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
+    // Byte offset in `line` where `cur` begins. `cur` is always a
+    // contiguous slice of `line`, so the original offset of `cur[i]` is
+    // `cur_start + i`.
+    let mut cur_start = 0usize;
     // Byte offset within `cur` just after the last space seen — the point
     // we break at when the next char would overflow.
     let mut last_space: Option<usize> = None;
-    for ch in line.chars() {
+    for (orig_b, ch) in line.char_indices() {
         let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w + cw > width && !cur.is_empty() {
             match last_space {
                 Some(sp) => {
                     let rest = cur[sp..].to_string();
                     cur.truncate(sp.saturating_sub(1)); // drop the break space
-                    out.push(std::mem::replace(&mut cur, rest));
+                    out.push((std::mem::replace(&mut cur, rest), cur_start));
+                    cur_start += sp; // `rest` begins `sp` bytes into the old `cur`
                 }
-                None => out.push(std::mem::take(&mut cur)),
+                None => out.push((std::mem::take(&mut cur), cur_start)),
             }
             cur_w = UnicodeWidthStr::width(cur.as_str());
             last_space = None;
+        }
+        if cur.is_empty() {
+            cur_start = orig_b;
         }
         cur.push(ch);
         cur_w += cw;
@@ -93,9 +119,206 @@ pub(crate) fn wrap_plain_line(line: &str, width: u16) -> Vec<String> {
         }
     }
     if !cur.is_empty() || out.is_empty() {
-        out.push(cur);
+        out.push((cur, cur_start));
     }
     out
+}
+
+/// Detect bare `http`/`https` URLs in a plain-text line, returning their
+/// byte ranges (`line[start..end]`) in left-to-right order. Plain text
+/// carries no markup, so the text/plain reader autolinks these into real
+/// reader links — matching how an HTML `<a>` renders (blue + underlined,
+/// in the `f` picker, `gx`/OSC 8/yank-aware).
+///
+/// Conservative by design: a URL starts at a `http://` / `https://` scheme
+/// and runs until whitespace or a delimiter terminal terminals also stop
+/// on (`<` `>` `"` backtick). Trailing sentence punctuation (`.,;:!?` and
+/// quotes) is trimmed, as are unbalanced closing brackets (`)` `]` `}`),
+/// so `see https://example.com/x.` and `(https://example.com)` capture
+/// just the URL.
+fn detect_urls(line: &str) -> Vec<(usize, usize)> {
+    fn is_url_byte(c: char) -> bool {
+        !c.is_whitespace() && !c.is_control() && !matches!(c, '<' | '>' | '"' | '`')
+    }
+    let bytes = line.as_bytes();
+    let lower = line.to_ascii_lowercase();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find("http") {
+        let start = search_from + rel;
+        let rest = &lower[start..];
+        let scheme_len = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            // "http" not followed by a scheme separator — skip past it.
+            search_from = start + 4;
+            continue;
+        };
+        // Consume URL chars to the first delimiter.
+        let mut end = start + scheme_len;
+        while end < bytes.len() {
+            let ch = line[end..].chars().next().unwrap();
+            if is_url_byte(ch) {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        // Trim trailing punctuation that's almost never part of the URL.
+        end = trim_url_end(line, start, end);
+        if end > start + scheme_len {
+            out.push((start, end));
+        }
+        search_from = end.max(start + scheme_len);
+    }
+    out
+}
+
+/// Strip trailing sentence punctuation and unbalanced closing brackets from
+/// a detected URL spanning `line[start..end]`. Repeats until stable.
+fn trim_url_end(line: &str, start: usize, mut end: usize) -> usize {
+    while let Some(last) = line[start..end].chars().next_back() {
+        let trim = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => true,
+            ')' | ']' | '}' => {
+                let (open, close) = match last {
+                    ')' => ('(', ')'),
+                    ']' => ('[', ']'),
+                    _ => ('{', '}'),
+                };
+                let seg = &line[start..end];
+                seg.matches(close).count() > seg.matches(open).count()
+            }
+            _ => false,
+        };
+        if !trim {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    end
+}
+
+/// Style a detected plain-text URL: blue + underlined to mirror an HTML
+/// `<a>` link, or dimmed (no underline) when a link-pick prefix is active
+/// and this link's id doesn't match — matching `flatten_inlines`.
+fn plain_url_style(id: u32, pick: Option<&str>) -> Style {
+    let dimmed = pick.is_some_and(|p| !p.is_empty() && !id.to_string().starts_with(p));
+    if dimmed {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+}
+
+/// The Vimium-style `[id]` tag emitted before a link in `Mode::LinkPick`,
+/// highlighted yellow-on-black for ids matching the typed prefix and dimmed
+/// otherwise. Mirrors the tag grammar `flatten_inlines` uses for HTML links.
+fn link_pick_tag(id: u32, prefix: &str) -> Span<'static> {
+    let dim = !prefix.is_empty() && !id.to_string().starts_with(prefix);
+    let style = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    };
+    Span::styled(format!("[{id}]"), style)
+}
+
+/// Render a text/plain body into the laid-out body, autolinking bare URLs
+/// into real reader links. Appends styled `Line`s to `lines` (one per
+/// terminal row, upholding the reader's 1:1 line invariant via
+/// [`wrap_with_offsets`]), tags every row with `None` in `block_idx` (no
+/// originating HTML block), and registers a [`LinkSlot`] per detected URL
+/// in `links` with cell-accurate segments so the picker, `gx`, OSC 8, and
+/// yanks all resolve the same links the HTML path produces.
+///
+/// `link_ids` are drawn from `next_link_id`, continuing whatever the (here
+/// empty) block walk allocated, so ids stay unique and `f`-pickable.
+fn emit_plain_fallback(
+    plain: &str,
+    width: u16,
+    link_pick: Option<&str>,
+    next_link_id: &mut u32,
+    lines: &mut Vec<Line<'static>>,
+    block_idx: &mut Vec<Option<usize>>,
+    links: &mut Vec<LinkSlot>,
+) {
+    const FALLBACK_NOTE: &str = "(no HTML body, showing text/plain)";
+    lines.push(dim_line(FALLBACK_NOTE));
+    block_idx.push(None);
+    for logical in plain.lines() {
+        // Detect URLs once on the logical line so a URL hard-split across
+        // wrapped pieces keeps its full href, then allocate one slot each.
+        let urls = detect_urls(logical);
+        let mut url_ids: Vec<u32> = Vec::with_capacity(urls.len());
+        for &(s, e) in &urls {
+            let id = *next_link_id;
+            *next_link_id += 1;
+            url_ids.push(id);
+            links.push(LinkSlot {
+                id,
+                href: logical[s..e].to_string(),
+                segments: Vec::new(),
+            });
+        }
+        for (piece, piece_start) in wrap_with_offsets(logical, width) {
+            let piece_end = piece_start + piece.len();
+            let this_line = lines.len();
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut col = 0u16; // running cell column within the piece
+            let mut pos = 0usize; // running byte offset within the piece
+            for (&(us, ue), &id) in urls.iter().zip(&url_ids) {
+                // Overlap of this URL with the current piece.
+                let os = us.max(piece_start);
+                let oe = ue.min(piece_end);
+                if os >= oe {
+                    continue;
+                }
+                let (ls, le) = (os - piece_start, oe - piece_start);
+                if pos < ls {
+                    let text = &piece[pos..ls];
+                    col += cells(text);
+                    spans.push(Span::raw(text.to_string()));
+                }
+                // The `[id]` picker tag rides on the piece where the URL
+                // begins (not on a continuation piece of a hard-split URL).
+                if let Some(prefix) = link_pick
+                    && us >= piece_start
+                {
+                    let tag = link_pick_tag(id, prefix);
+                    col += cells(&tag.content);
+                    spans.push(tag);
+                }
+                let url_text = &piece[ls..le];
+                let col_start = col;
+                col += cells(url_text);
+                spans.push(Span::styled(
+                    url_text.to_string(),
+                    plain_url_style(id, link_pick),
+                ));
+                if let Some(slot) = links.iter_mut().find(|s| s.id == id) {
+                    slot.segments.push(LinkSegment {
+                        line: this_line,
+                        col_start,
+                        col_end: col,
+                    });
+                }
+                pos = le;
+            }
+            if pos < piece.len() {
+                spans.push(Span::raw(piece[pos..].to_string()));
+            }
+            lines.push(Line::from(spans));
+            block_idx.push(None);
+        }
+    }
 }
 
 /// Hard-wrap a single laid-out `Line` to `width` cells, splitting spans at
@@ -585,46 +808,19 @@ pub fn draw(
                 } else {
                     None
                 };
+                // The text/plain fallback is rendered inside `layout` now
+                // (so the autolinked URLs reach the picker / `gx` / OSC 8 /
+                // yanks), gated on the HTML walk producing no body content.
                 let mut body = layout_with_images(
                     &parsed.blocks,
                     inner_width,
                     &parsed.attachments,
+                    parsed.plain_fallback.as_deref(),
                     pick,
                     attach_pick,
                     |k| inbox.resolved_image(k),
                 );
-                // Attachment chip rows (+ blank separator) occupy the
-                // first `prefix_len` body lines; the plain-text fallback
-                // fires only when the HTML walk produced nothing beyond
-                // them.
-                let prefix_len = if body.attachments.is_empty() {
-                    0
-                } else {
-                    body.attachments.len() + 1
-                };
                 attachment_lines_this_frame = body.attachments.iter().map(|s| s.line).collect();
-                if body.lines.len() == prefix_len
-                    && let Some(plain) = parsed.plain_fallback.as_deref()
-                {
-                    const FALLBACK_NOTE: &str = "(no HTML body, showing text/plain)";
-                    body.lines.push(dim_line(FALLBACK_NOTE));
-                    // line_text must match the rendered glyphs, not be
-                    // empty — an empty entry pins the reader cursor to
-                    // col 0 on this row (its clamp uses the line's length).
-                    body.line_text.push(FALLBACK_NOTE.to_string());
-                    body.line_block_idx.push(None);
-                    // Pre-wrap to the pane width so each row stays a single
-                    // terminal line — `Paragraph`'s own `Wrap` would
-                    // otherwise re-split long lines and desync the reader
-                    // cursor (see `wrap_plain_line`).
-                    for ln in plain.lines() {
-                        for piece in wrap_plain_line(ln, inner_width) {
-                            body.lines.push(Line::raw(piece.clone()));
-                            body.line_text.push(piece);
-                            body.line_block_idx.push(None);
-                        }
-                    }
-                }
                 // Translate per-body image-slot indices into absolute
                 // line indices by offsetting by the header rows.
                 let offset = out.len();
@@ -1154,10 +1350,19 @@ pub fn layout(
     blocks: &[Block],
     width: u16,
     attachments: &[crate::mail::parse::Attachment],
+    plain: Option<&str>,
     link_pick: Option<&str>,
     attach_pick: Option<&str>,
 ) -> LaidOutBody {
-    layout_with_images(blocks, width, attachments, link_pick, attach_pick, |_| None)
+    layout_with_images(
+        blocks,
+        width,
+        attachments,
+        plain,
+        link_pick,
+        attach_pick,
+        |_| None,
+    )
 }
 
 /// Like `layout`, but consults `resolve` for every `Block::Image` and,
@@ -1169,6 +1374,7 @@ pub fn layout_with_images<'r, R>(
     blocks: &[Block],
     width: u16,
     attachments: &[crate::mail::parse::Attachment],
+    plain: Option<&str>,
     link_pick: Option<&str>,
     attach_pick: Option<&str>,
     mut resolve: R,
@@ -1207,6 +1413,39 @@ where
         while ctx.line_block_idx.len() < ctx.lines.len() {
             ctx.line_block_idx.push(Some(idx));
         }
+    }
+    // Plain-text fallback: when the HTML walk produced no body content
+    // (only the attachment prefix, if any), render the text/plain part
+    // instead. Done here — inside `layout`, not at the draw call site — so
+    // the link picker, `gx`, OSC 8, and yanks (which all re-run `layout`)
+    // see the autolinked URLs the same way they see HTML `<a>` links. The
+    // emitted pieces are already ≤ width, so the hard-wrap pass below is a
+    // no-op for them and their link segments survive the line remap intact.
+    let prefix_len = if attachments.is_empty() {
+        0
+    } else {
+        attachments.len() + 1
+    };
+    if ctx.lines.len() == prefix_len
+        && let Some(plain) = plain
+    {
+        let LayoutCtx {
+            width: w,
+            lines,
+            line_block_idx,
+            links,
+            next_link_id,
+            ..
+        } = &mut ctx;
+        emit_plain_fallback(
+            plain,
+            *w,
+            link_pick,
+            next_link_id,
+            lines,
+            line_block_idx,
+            links,
+        );
     }
     // Pass 2: expand sentinel marker lines into reserved blanks and
     // record absolute image slots. Doing the expansion here (rather than
@@ -1992,7 +2231,7 @@ mod tests {
 
     fn layout_first_para(html_src: &str, w: u16) -> Vec<String> {
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, w, &[], None, None);
+        let laid = layout(&blocks, w, &[], None, None, None);
         laid.lines
             .iter()
             .map(|l| {
@@ -2072,6 +2311,145 @@ mod tests {
     }
 
     #[test]
+    fn wrap_with_offsets_tracks_original_byte_starts() {
+        // Each piece must start at the byte offset the wrap reports, even
+        // after break spaces are dropped — that's what lets the autolinker
+        // map URL ranges (computed on the logical line) onto pieces.
+        let line = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let pieces = wrap_with_offsets(line, 20);
+        assert!(pieces.len() >= 2, "{pieces:?}");
+        for (piece, start) in &pieces {
+            assert_eq!(
+                &line[*start..*start + piece.len()],
+                piece,
+                "offset mismatch"
+            );
+        }
+        // A within-width line is a single piece at offset 0.
+        assert_eq!(
+            wrap_with_offsets("short", 20),
+            vec![("short".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn detect_urls_finds_schemes_and_trims_punctuation() {
+        let one = "see https://example.com/path here";
+        assert_eq!(
+            detect_urls(one)
+                .iter()
+                .map(|&(s, e)| &one[s..e])
+                .collect::<Vec<_>>(),
+            vec!["https://example.com/path"]
+        );
+        // Trailing sentence punctuation is not part of the URL.
+        let dotted = "go to http://a.test/x.";
+        assert_eq!(
+            detect_urls(dotted)
+                .iter()
+                .map(|&(s, e)| &dotted[s..e])
+                .collect::<Vec<_>>(),
+            vec!["http://a.test/x"]
+        );
+        // A parenthesized URL drops the unbalanced closer.
+        let paren = "(https://a.test/y)";
+        assert_eq!(
+            detect_urls(paren)
+                .iter()
+                .map(|&(s, e)| &paren[s..e])
+                .collect::<Vec<_>>(),
+            vec!["https://a.test/y"]
+        );
+        // A balanced paren inside the URL is kept.
+        let bal = "https://en.wikipedia.org/wiki/Foo_(bar)";
+        assert_eq!(detect_urls(bal), vec![(0, bal.len())]);
+        // Two URLs, the bare word "http" alone, and no scheme: only real
+        // URLs match.
+        let multi = "http nope https://a.test and https://b.test, done";
+        assert_eq!(
+            detect_urls(multi)
+                .iter()
+                .map(|&(s, e)| &multi[s..e])
+                .collect::<Vec<_>>(),
+            vec!["https://a.test", "https://b.test"]
+        );
+    }
+
+    #[test]
+    fn plain_fallback_autolinks_urls_like_html() {
+        // A text/plain body (no HTML blocks) renders through `layout` with
+        // bare URLs promoted to real links: blue + underlined spans, a
+        // populated link table, and a segment whose cols line up with the
+        // URL's cells — exactly what the picker / gx / OSC 8 consume.
+        let plain = "Re-run: https://ci.test/jobs/42/restart now";
+        let laid = layout(&[], 80, &[], Some(plain), None, None);
+        assert_eq!(laid.links.len(), 1, "one URL → one link");
+        let slot = &laid.links[0];
+        assert_eq!(slot.href, "https://ci.test/jobs/42/restart");
+        assert_eq!(slot.segments.len(), 1);
+        let seg = &slot.segments[0];
+        // The note line + the body line: the URL sits on the body line.
+        let body_line = &laid.lines[seg.line];
+        // The styled URL span carries blue + underline.
+        let url_span = body_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("https://"))
+            .expect("url span");
+        assert_eq!(url_span.style.fg, Some(Color::Blue));
+        assert!(url_span.style.add_modifier.contains(Modifier::UNDERLINED));
+        // Segment cols match the URL's column range within the line.
+        let text: String = body_line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let url_start = text.find("https://").unwrap();
+        assert_eq!(seg.col_start as usize, cells(&text[..url_start]) as usize);
+        assert_eq!(
+            seg.col_end as usize,
+            cells(&text[..url_start + slot.href.len()]) as usize
+        );
+        // First row is the fallback note, dimmed.
+        let note: String = laid.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(note.contains("text/plain"), "note: {note:?}");
+    }
+
+    #[test]
+    fn plain_fallback_no_link_for_plain_prose() {
+        // No URL → no links, and the prose still renders (one line per
+        // logical line) without any underline styling.
+        let laid = layout(&[], 80, &[], Some("just some words here"), None, None);
+        assert!(laid.links.is_empty());
+        let has_underline = laid.lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+        });
+        assert!(!has_underline, "plain prose must not be underlined");
+    }
+
+    #[test]
+    fn plain_fallback_pick_tag_precedes_url() {
+        // In LinkPick mode the `[id]` tag is emitted before the URL, and
+        // the segment cols account for the tag's width so OSC 8 / gx land
+        // on the URL, not the tag.
+        let plain = "x https://a.test/p y";
+        let laid = layout(&[], 80, &[], Some(plain), Some(""), None);
+        let slot = &laid.links[0];
+        let seg = &slot.segments[0];
+        let line = &laid.lines[seg.line];
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains(&format!("[{}]", slot.id)), "tag in {text:?}");
+        // Tag sits immediately before the URL text.
+        let tag = format!("[{}]", slot.id);
+        let tag_at = text.find(&tag).unwrap();
+        let url_at = text.find("https://").unwrap();
+        assert_eq!(tag_at + tag.len(), url_at, "tag must abut url: {text:?}");
+        assert_eq!(seg.col_start as usize, cells(&text[..url_at]) as usize);
+    }
+
+    #[test]
     fn cells_ignores_zero_width_and_counts_wide() {
         // Zero-width space contributes 0 cells; emoji + VS16 is one wide
         // grapheme (2 cells). These are exactly the chars that broke the
@@ -2101,7 +2479,7 @@ mod tests {
         // visible width, so the rendered line never exceeds the pane.
         let z = "\u{200b}";
         let html = format!("<p>aa{z} bb{z} cc{z} dd{z} ee{z} ff{z}</p>");
-        let laid = layout(&html::parse(&html), 8, &[], None, None);
+        let laid = layout(&html::parse(&html), 8, &[], None, None, None);
         for line in &laid.lines {
             let t: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(cells(&t) <= 8, "line exceeds 8 display cells: {t:?}");
@@ -2208,7 +2586,7 @@ mod tests {
         // Two paragraphs → two top-level blocks. block_ranges(1) should
         // return ranges only for lines whose line_block_idx is Some(1).
         let blocks = html::parse("<p>one</p><p>two three</p>");
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let r0 = laid.block_ranges(0);
         let r1 = laid.block_ranges(1);
         assert!(!r0.is_empty(), "block 0 should have ranges");
@@ -2229,7 +2607,7 @@ mod tests {
     #[test]
     fn block_ranges_widths_match_line_text_char_counts() {
         let blocks = html::parse("<p>hello</p>");
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let ranges = laid.block_ranges(0);
         for (line, _, width) in &ranges {
             let actual = laid.line_text[*line as usize].chars().count() as u16;
@@ -2241,7 +2619,7 @@ mod tests {
     fn link_segment_ranges_maps_to_segments() {
         // Link spans one row; ranges should mirror the LinkSegment.
         let blocks = html::parse(r#"<p>see <a href="https://x">this</a></p>"#);
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let slot = laid.links.first().expect("link slot");
         let ranges = LaidOutBody::link_segment_ranges(slot);
         assert_eq!(ranges.len(), 1);
@@ -2278,7 +2656,7 @@ mod tests {
     #[test]
     fn link_text_is_collected() {
         let blocks = html::parse(r#"<p>see <a href="https://x">this</a> please</p>"#);
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         assert!(!laid.links.is_empty(), "expected at least one link");
         assert_eq!(laid.links[0].href, "https://x");
     }
@@ -2287,7 +2665,7 @@ mod tests {
     fn link_segment_tracks_columns_on_single_line() {
         // "see this please" — link "this" occupies cells 4..8.
         let blocks = html::parse(r#"<p>see <a href="https://x">this</a> please</p>"#);
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let slot = laid.links.first().expect("link slot");
         assert_eq!(slot.segments.len(), 1, "{:?}", slot.segments);
         let seg = &slot.segments[0];
@@ -2301,7 +2679,7 @@ mod tests {
         // Link spans two words on the same line; segments should merge
         // across the connecting space cell.
         let blocks = html::parse(r#"<p><a href="https://x">foo bar</a></p>"#);
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let slot = laid.links.first().expect("link slot");
         assert_eq!(slot.segments.len(), 1, "{:?}", slot.segments);
         let seg = &slot.segments[0];
@@ -2314,7 +2692,7 @@ mod tests {
     fn link_segment_splits_across_wrapped_lines() {
         // Force the link to wrap by giving it a narrow inner width.
         let blocks = html::parse(r#"<p><a href="https://x">foo bar baz</a></p>"#);
-        let laid = layout(&blocks, 4, &[], None, None);
+        let laid = layout(&blocks, 4, &[], None, None, None);
         let slot = laid.links.first().expect("link slot");
         assert!(
             slot.segments.len() >= 2,
@@ -2336,7 +2714,7 @@ mod tests {
         // the first / last link cells carry the expected escape bytes.
         let html_src = r#"<p>see <a href="https://x.example/p">click</a> done</p>"#;
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         let inner = Rect {
             x: 0,
             y: 0,
@@ -2441,7 +2819,7 @@ mod tests {
         // be bumped so they line up with the rendered cells.
         let blocks =
             html::parse(r#"<blockquote><p><a href="https://x">click</a></p></blockquote>"#);
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let slot = laid.links.first().expect("link slot");
         let seg = slot.segments.first().expect("segment");
         // Without quote shift this would be 0; with the `> ` prefix the
@@ -2495,7 +2873,7 @@ mod tests {
         let blocks = html::parse(r#"<img src="cid:logo" alt="epost">"#);
         let resolved = fake_resolved(8, 5);
         let key = ImageKey::Cid("logo".to_string());
-        let laid = layout_with_images(&blocks, 40, &[], None, None, |k| {
+        let laid = layout_with_images(&blocks, 40, &[], None, None, None, |k| {
             if *k == key { Some(&resolved) } else { None }
         });
         assert_eq!(laid.images.len(), 1, "expected one image slot");
@@ -2523,7 +2901,7 @@ mod tests {
         let blocks = html::parse(r#"<blockquote><img src="cid:x" alt="L"></blockquote>"#);
         let resolved = fake_resolved(6, 3);
         let key = ImageKey::Cid("x".to_string());
-        let laid = layout_with_images(&blocks, 40, &[], None, None, |k| {
+        let laid = layout_with_images(&blocks, 40, &[], None, None, None, |k| {
             if *k == key { Some(&resolved) } else { None }
         });
         let slot = laid.images.first().expect("image slot recorded");
@@ -2542,7 +2920,7 @@ mod tests {
         let blocks = html::parse(r#"<ul><li><img src="cid:x" alt="L"></li></ul>"#);
         let resolved = fake_resolved(6, 3);
         let key = ImageKey::Cid("x".to_string());
-        let laid = layout_with_images(&blocks, 40, &[], None, None, |k| {
+        let laid = layout_with_images(&blocks, 40, &[], None, None, None, |k| {
             if *k == key { Some(&resolved) } else { None }
         });
         let slot = laid.images.first().expect("image slot recorded");
@@ -2558,7 +2936,7 @@ mod tests {
     #[test]
     fn missing_cache_entry_falls_back_to_placeholder() {
         let blocks = html::parse(r#"<img src="cid:x" alt="L">"#);
-        let laid = layout_with_images(&blocks, 40, &[], None, None, |_| None);
+        let laid = layout_with_images(&blocks, 40, &[], None, None, None, |_| None);
         assert!(laid.images.is_empty());
         let joined = laid
             .lines
@@ -2578,7 +2956,7 @@ mod tests {
     fn remote_image_records_no_slot_even_with_stale_resolver() {
         let blocks = html::parse(r#"<img src="https://x.example/p" alt="pixel">"#);
         let resolved = fake_resolved(4, 2);
-        let laid = layout_with_images(&blocks, 40, &[], None, None, |_| Some(&resolved));
+        let laid = layout_with_images(&blocks, 40, &[], None, None, None, |_| Some(&resolved));
         assert!(
             laid.images.is_empty(),
             "remote images must never get a slot"
@@ -2595,7 +2973,7 @@ mod tests {
     #[test]
     fn line_block_idx_aligns_with_lines() {
         let blocks = html::parse("<p>one</p><p>two</p><h2>three</h2>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         assert_eq!(
             laid.line_block_idx.len(),
             laid.lines.len(),
@@ -2631,7 +3009,7 @@ mod tests {
     #[test]
     fn block_at_resolves_cursor_to_top_level_block() {
         let blocks = html::parse("<p>one</p><blockquote><p>quoted</p></blockquote><p>tail</p>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         let quoted_line = laid
             .lines
             .iter()
@@ -2650,7 +3028,7 @@ mod tests {
             <p><a href="https://b">B</a></p>
             <p><a href="https://c">C</a></p>"#;
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         // Cursor above the first link: first match is link A.
         let first = laid.first_link_at_or_after(0).expect("any link");
         assert_eq!(first.href, "https://a");
@@ -2663,7 +3041,7 @@ mod tests {
     #[test]
     fn first_link_at_or_after_falls_back_when_cursor_past_last() {
         let blocks = html::parse(r#"<p><a href="https://only">only</a></p>"#);
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         // Cursor below the only link: still yanks it (the fallback that
         // makes `yl` "just work" when the user is scrolled past the
         // single link in the body).
@@ -2675,7 +3053,7 @@ mod tests {
     fn link_at_matches_only_under_cursor() {
         // "go LINK back" — only the cells over the anchor resolve.
         let blocks = html::parse(r#"<p>go <a href="https://x">LINK</a> back</p>"#);
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         let seg = laid.links[0].segments.first().expect("segment").clone();
         // A cell inside the anchor span hits.
         let hit = laid
@@ -2695,7 +3073,7 @@ mod tests {
         let html_src = r#"<p><a href="https://a">A</a></p>
             <p><a href="https://b">B</a></p>"#;
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         let a_line = laid.links[0].segments[0].line as u16;
         let b_line = laid.links[1].segments[0].line as u16;
         // Viewport tight enough to include only A.
@@ -2711,7 +3089,7 @@ mod tests {
         let blocks = html::parse(r#"<p>before</p><img src="cid:x" alt="L"><p>after</p>"#);
         let resolved = fake_resolved(4, 3);
         let key = ImageKey::Cid("x".to_string());
-        let laid = layout_with_images(&blocks, 40, &[], None, None, |k| {
+        let laid = layout_with_images(&blocks, 40, &[], None, None, None, |k| {
             if *k == key { Some(&resolved) } else { None }
         });
         assert_eq!(laid.line_block_idx.len(), laid.lines.len());
@@ -2732,7 +3110,7 @@ mod tests {
     fn link_pick_renders_overlay_tags() {
         let html_src = r#"<p>see <a href="https://x/a">A</a> and <a href="https://x/b">B</a></p>"#;
         let blocks = html::parse(html_src);
-        let laid = layout(&blocks, 80, &[], Some(""), None);
+        let laid = layout(&blocks, 80, &[], None, Some(""), None);
         let joined: String = laid
             .lines
             .iter()
@@ -2742,7 +3120,7 @@ mod tests {
         assert!(joined.contains("[1]"), "{joined:?}");
         assert!(joined.contains("[2]"), "{joined:?}");
         // Without pick mode, tags should NOT appear.
-        let laid2 = layout(&blocks, 80, &[], None, None);
+        let laid2 = layout(&blocks, 80, &[], None, None, None);
         let joined2: String = laid2
             .lines
             .iter()
@@ -2765,7 +3143,7 @@ mod tests {
             },
         ];
         let blocks = html::parse("<p>hello</p>");
-        let laid = layout(&blocks, 80, &att, None, None);
+        let laid = layout(&blocks, 80, &att, None, None, None);
         // Two slots, in order, on the first two body lines.
         assert_eq!(laid.attachments.len(), 2);
         assert_eq!(laid.attachments[0].line, 0);
@@ -2813,7 +3191,7 @@ mod tests {
         let blocks = html::parse("<p>x</p>");
         // Tag always shows the index; pick mode just restyles it. Confirm
         // the chip row exists with the `[1]` tag and a byte size.
-        let laid = layout(&blocks, 80, &att, None, Some(""));
+        let laid = layout(&blocks, 80, &att, None, None, Some(""));
         assert!(laid.line_text[0].contains("[1]"));
         assert!(laid.line_text[0].contains("3 B"), "{:?}", laid.line_text[0]);
     }
@@ -2821,7 +3199,7 @@ mod tests {
     #[test]
     fn line_text_aligns_with_lines() {
         let blocks = html::parse("<p>one</p><p>two</p>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         assert_eq!(
             laid.line_text.len(),
             laid.lines.len(),
@@ -2839,7 +3217,7 @@ mod tests {
         // Blockquote `> ` is inserted post-emit; line_text must include
         // it so visual selection yields the rendered form.
         let blocks = html::parse("<blockquote><p>hi</p></blockquote>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         assert!(
             laid.line_text.iter().any(|s| s.contains("> hi")),
             "line_text didn't capture quote prefix: {:?}",
@@ -2850,7 +3228,7 @@ mod tests {
     #[test]
     fn extract_selection_line_wise_joins_with_newline() {
         let blocks = html::parse("<p>alpha</p><p>beta</p><p>gamma</p>");
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         // Pick the lines containing each word, line-wise from alpha → gamma.
         let a = laid
             .line_text
@@ -2918,7 +3296,7 @@ mod tests {
     #[test]
     fn extract_selection_char_wise_single_line() {
         let blocks = html::parse("<p>hello world</p>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         // Find the line, grab "world" by char index.
         let li = laid
             .line_text
@@ -2936,7 +3314,7 @@ mod tests {
     fn extract_selection_char_wise_multi_line() {
         // Span two paragraphs: from middle of "hello" to middle of "world".
         let blocks = html::parse("<p>hello</p><p>world</p>");
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let l1 = laid
             .line_text
             .iter()
@@ -2957,7 +3335,7 @@ mod tests {
     #[test]
     fn extract_selection_normalizes_reversed_endpoints() {
         let blocks = html::parse("<p>hello</p>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -2974,7 +3352,7 @@ mod tests {
     fn extract_selection_clamps_col_overshoot() {
         // `$` sets cursor_col = u16::MAX; extraction must clamp.
         let blocks = html::parse("<p>hi</p>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -2987,7 +3365,7 @@ mod tests {
     #[test]
     fn selection_cell_ranges_line_wise_covers_full_line() {
         let blocks = html::parse("<p>hello</p>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -3010,7 +3388,7 @@ mod tests {
     #[test]
     fn selection_cell_ranges_char_wise_clamps_to_cursor() {
         let blocks = html::parse("<p>abcdef</p>");
-        let laid = layout(&blocks, 40, &[], None, None);
+        let laid = layout(&blocks, 40, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -3039,7 +3417,7 @@ mod tests {
         // the painter should never light up cells beyond the IR's view of
         // the line.
         let blocks = html::parse("<p>hi</p>");
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -3073,7 +3451,7 @@ mod tests {
         use ratatui::buffer::Buffer;
         let blocks = html::parse("<p>hello</p>");
         let inner_width: u16 = 40;
-        let laid = layout(&blocks, inner_width, &[], None, None);
+        let laid = layout(&blocks, inner_width, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -3140,7 +3518,7 @@ mod tests {
         use ratatui::buffer::Buffer;
         let blocks = html::parse("<p>hello</p>");
         let inner_width: u16 = 40;
-        let laid = layout(&blocks, inner_width, &[], None, None);
+        let laid = layout(&blocks, inner_width, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -3206,7 +3584,7 @@ mod tests {
             "<blockquote><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p></blockquote>",
         );
         let inner_width: u16 = 80;
-        let laid = layout(&blocks, inner_width, &[], None, None);
+        let laid = layout(&blocks, inner_width, &[], None, None, None);
         for (i, t) in laid.line_text.iter().enumerate() {
             let n = t.chars().count();
             assert!(
@@ -3247,7 +3625,7 @@ mod tests {
         let mut bad: Vec<(String, usize, usize, String)> = Vec::new();
         for (name, html) in cases {
             let blocks = html::parse(html);
-            let laid = layout(&blocks, inner_width, &[], None, None);
+            let laid = layout(&blocks, inner_width, &[], None, None, None);
             for (i, t) in laid.line_text.iter().enumerate() {
                 let n = t.chars().count();
                 if n > inner_width as usize {
@@ -3278,7 +3656,7 @@ mod tests {
             "<p>If you can read this in the reader pane, the Block-IR walker is rendering into ratatui cells correctly.</p>",
         );
         let inner_width: u16 = 80;
-        let laid = layout(&blocks, inner_width, &[], None, None);
+        let laid = layout(&blocks, inner_width, &[], None, None, None);
         // Pick the first wrapped line and find its actual char count.
         let li_idx = laid
             .line_text
@@ -3346,7 +3724,7 @@ mod tests {
         // when the Reader pane is focused and mode is Normal.
         use ratatui::buffer::Buffer;
         let blocks = html::parse("<p>hello world</p>");
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -3384,7 +3762,7 @@ mod tests {
         // mode cursor cell already enforces.
         use ratatui::buffer::Buffer;
         let blocks = html::parse("<p>hi</p>");
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -3423,7 +3801,7 @@ mod tests {
         // only shows on plain paragraphs" bug.
         use ratatui::buffer::Buffer;
         let blocks = html::parse(r#"<p>see <a href="https://x">link</a></p>"#);
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
@@ -3464,7 +3842,7 @@ mod tests {
         // `move_reader_cursor_to_line_end`); the painter must clamp the
         // highlight to the line's char count, not the pane's inner width.
         let blocks = html::parse("<p>hello world</p>");
-        let laid = layout(&blocks, 80, &[], None, None);
+        let laid = layout(&blocks, 80, &[], None, None, None);
         let li = laid
             .line_text
             .iter()
