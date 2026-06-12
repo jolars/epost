@@ -215,20 +215,21 @@ fn plain_url_style(id: u32, pick: Option<&str>) -> Style {
     }
 }
 
-/// The Vimium-style `[id]` tag emitted before a link in `Mode::LinkPick`,
-/// highlighted yellow-on-black for ids matching the typed prefix and dimmed
-/// otherwise. Mirrors the tag grammar `flatten_inlines` uses for HTML links.
-fn link_pick_tag(id: u32, prefix: &str) -> Span<'static> {
+/// Style for the Vimium-style `[id]` link-pick tag: highlighted
+/// yellow-on-black for ids matching the typed prefix, dimmed otherwise.
+/// The tag is painted as a draw-time overlay (see [`paint_link_pick_tags`])
+/// rather than inserted into the layout, so entering pick mode never shifts
+/// or re-wraps the body text.
+fn link_pick_tag_style(id: u32, prefix: &str) -> Style {
     let dim = !prefix.is_empty() && !id.to_string().starts_with(prefix);
-    let style = if dim {
+    if dim {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default()
             .bg(Color::Yellow)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD)
-    };
-    Span::styled(format!("[{id}]"), style)
+    }
 }
 
 /// Render a text/plain body into the laid-out body, autolinking bare URLs
@@ -287,15 +288,9 @@ fn emit_plain_fallback(
                     col += cells(text);
                     spans.push(Span::raw(text.to_string()));
                 }
-                // The `[id]` picker tag rides on the piece where the URL
-                // begins (not on a continuation piece of a hard-split URL).
-                if let Some(prefix) = link_pick
-                    && us >= piece_start
-                {
-                    let tag = link_pick_tag(id, prefix);
-                    col += cells(&tag.content);
-                    spans.push(tag);
-                }
+                // The `[id]` picker tag is painted as a draw-time overlay
+                // (`paint_link_pick_tags`), not inserted here, so pick mode
+                // doesn't shift the URL or re-wrap the line.
                 let url_text = &piece[ls..le];
                 let col_start = col;
                 col += cells(url_text);
@@ -961,6 +956,18 @@ pub fn draw(
                 suppress_lines,
             );
         }
+        // Link-pick `[id]` tags: drawn as an overlay over each link's
+        // first cells so toggling pick mode never reflows the body.
+        if mode == Mode::LinkPick {
+            paint_link_pick_tags(
+                f.buffer_mut(),
+                inner,
+                &laid.links,
+                link_pick_buf,
+                inbox.last_reader_header_offset,
+                inbox.reader_scroll,
+            );
+        }
         // Visual-mode selection paint goes on top of the rendered text
         // (REVERSED modifier on covered cells), after Paragraph laid the
         // cells down.
@@ -1199,6 +1206,58 @@ fn paint_yank_highlight(
         for x in x_start..x_end {
             if let Some(cell) = buf.cell_mut((x, row)) {
                 let style = cell.style().bg(Color::Yellow).fg(Color::Black);
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// Paint Vimium-style `[id]` link tags as a draw-time overlay on top of the
+/// rendered body. Each tag is written over the *first cells* of its link's
+/// first segment, overwriting the link's leading glyphs — the conventional
+/// link-hint look. Crucially the tag is **not** inserted into the layout,
+/// so entering `Mode::LinkPick` never shifts text or re-wraps a line (the
+/// old inline-`[id]` approach did, sometimes bumping links onto new rows).
+///
+/// Matching ids highlight yellow-on-black; a typed prefix dims the rest
+/// (`link_pick_tag_style`). Same coordinate convention as
+/// [`emit_osc8_hyperlinks`]: segment lines are body-relative, translated to
+/// absolute rows via `header_offset` + `scroll`.
+fn paint_link_pick_tags(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    links: &[LinkSlot],
+    prefix: &str,
+    header_offset: u16,
+    scroll: u16,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let scroll = scroll as i32;
+    let inner_right = inner.x.saturating_add(inner.width);
+    let inner_bottom = inner.y.saturating_add(inner.height);
+    for slot in links {
+        // The first segment is the link's earliest occurrence in reading
+        // order (layout pushes segments top-to-bottom, left-to-right).
+        let Some(seg) = slot.segments.first() else {
+            continue;
+        };
+        let row_signed = inner.y as i32 + header_offset as i32 + seg.line as i32 - scroll;
+        if row_signed < inner.y as i32 || row_signed >= inner_bottom as i32 {
+            continue;
+        }
+        let row = row_signed as u16;
+        let style = link_pick_tag_style(slot.id, prefix);
+        let tag = format!("[{}]", slot.id);
+        let x0 = inner.x.saturating_add(seg.col_start);
+        for (i, ch) in tag.chars().enumerate() {
+            let x = x0.saturating_add(i as u16);
+            if x >= inner_right {
+                break;
+            }
+            if let Some(cell) = buf.cell_mut((x, row)) {
+                cell.set_symbol(ch.encode_utf8(&mut [0u8; 4]));
                 cell.set_style(style);
             }
         }
@@ -2004,14 +2063,9 @@ fn flatten_inlines(
                             href: content[us..ue].to_string(),
                             segments: Vec::new(),
                         });
-                        if let Some(prefix) = pick {
-                            let tag = link_pick_tag(id, prefix);
-                            out.push(Token::Word {
-                                text: tag.content.into_owned(),
-                                style: tag.style,
-                                link_id: None,
-                            });
-                        }
+                        // The `[id]` picker tag is a draw-time overlay
+                        // (`paint_link_pick_tags`), not inserted into the
+                        // token stream, so pick mode never shifts the layout.
                         let dim =
                             pick.is_some_and(|p| !p.is_empty() && !id.to_string().starts_with(p));
                         let url_style = if dim {
@@ -2039,22 +2093,9 @@ fn flatten_inlines(
                     href: href.clone(),
                     segments: Vec::new(),
                 });
-                if let Some(prefix) = pick {
-                    let dim = !prefix.is_empty() && !id.to_string().starts_with(prefix);
-                    let tag_style = if dim {
-                        Style::default().fg(Color::DarkGray)
-                    } else {
-                        Style::default()
-                            .bg(Color::Yellow)
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD)
-                    };
-                    out.push(Token::Word {
-                        text: format!("[{id}]"),
-                        style: tag_style,
-                        link_id: None,
-                    });
-                }
+                // The `[id]` picker tag is a draw-time overlay
+                // (`paint_link_pick_tags`), not inserted here, so entering
+                // pick mode never reflows the surrounding text.
                 let inner_style = base.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
                 flatten_inlines(runs, inner_style, Some(id), out, links, next_id, pick);
             }
@@ -2504,22 +2545,23 @@ mod tests {
     }
 
     #[test]
-    fn plain_fallback_pick_tag_precedes_url() {
-        // In LinkPick mode the `[id]` tag is emitted before the URL, and
-        // the segment cols account for the tag's width so OSC 8 / gx land
-        // on the URL, not the tag.
+    fn plain_fallback_pick_does_not_shift_url() {
+        // In LinkPick mode the `[id]` tag is a draw-time overlay, not an
+        // inserted span: the laid-out text is unchanged, and the link
+        // segment lands exactly on the URL (no tag-width offset) so OSC 8 /
+        // gx still target the URL.
         let plain = "x https://a.test/p y";
         let laid = layout(&[], 80, &[], Some(plain), Some(""), None);
         let slot = &laid.links[0];
         let seg = &slot.segments[0];
         let line = &laid.lines[seg.line];
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains(&format!("[{}]", slot.id)), "tag in {text:?}");
-        // Tag sits immediately before the URL text.
-        let tag = format!("[{}]", slot.id);
-        let tag_at = text.find(&tag).unwrap();
+        assert!(
+            !text.contains(&format!("[{}]", slot.id)),
+            "tag must not be inserted into layout: {text:?}"
+        );
+        // Segment starts exactly at the URL's column in the plain text.
         let url_at = text.find("https://").unwrap();
-        assert_eq!(tag_at + tag.len(), url_at, "tag must abut url: {text:?}");
         assert_eq!(seg.col_start as usize, cells(&text[..url_at]) as usize);
     }
 
@@ -3269,27 +3311,51 @@ mod tests {
     }
 
     #[test]
-    fn link_pick_renders_overlay_tags() {
+    fn link_pick_does_not_shift_layout() {
+        // Entering pick mode must NOT insert `[id]` tags into the laid-out
+        // text — the tags are a draw-time overlay now. The body layout
+        // (and thus wrapping) must be byte-identical with and without pick.
         let html_src = r#"<p>see <a href="https://x/a">A</a> and <a href="https://x/b">B</a></p>"#;
         let blocks = html::parse(html_src);
+        let with_pick = layout(&blocks, 80, &[], None, Some(""), None);
+        let without_pick = layout(&blocks, 80, &[], None, None, None);
+        assert_eq!(
+            with_pick.line_text, without_pick.line_text,
+            "pick mode must not change the laid-out text"
+        );
+        let joined: String = with_pick.line_text.join("\n");
+        assert!(!joined.contains("[1]"), "{joined:?}");
+        assert!(!joined.contains("[2]"), "{joined:?}");
+    }
+
+    #[test]
+    fn link_pick_tags_painted_over_link_cells() {
+        // The `[id]` tag overlay overwrites the link's leading glyphs.
+        let html_src = r#"<p>see <a href="https://x/a">alpha</a></p>"#;
+        let blocks = html::parse(html_src);
         let laid = layout(&blocks, 80, &[], None, Some(""), None);
-        let joined: String = laid
-            .lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(joined.contains("[1]"), "{joined:?}");
-        assert!(joined.contains("[2]"), "{joined:?}");
-        // Without pick mode, tags should NOT appear.
-        let laid2 = layout(&blocks, 80, &[], None, None, None);
-        let joined2: String = laid2
-            .lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(!joined2.contains("[1]"), "{joined2:?}");
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(inner);
+        // Render the body first so the link glyphs are present, then overlay.
+        for (i, line) in laid.lines.iter().enumerate() {
+            buf.set_line(0, i as u16, line, inner.width);
+        }
+        paint_link_pick_tags(&mut buf, inner, &laid.links, "", 0, 0);
+        let seg = laid.links[0].segments.first().expect("a segment");
+        let mut got = String::new();
+        for dx in 0..3 {
+            got.push_str(
+                buf.cell((seg.col_start + dx, seg.line as u16))
+                    .unwrap()
+                    .symbol(),
+            );
+        }
+        assert_eq!(got, "[1]", "tag should overwrite the link's first cells");
     }
 
     #[test]
