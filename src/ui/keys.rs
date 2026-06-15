@@ -93,14 +93,16 @@ fn global(app: &mut App, k: KeyEvent) -> bool {
 }
 
 fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
-    // `/` and `g/` enter Search mode (local / global). Handled before
+    // `/` and `g/` enter Search mode (global / local). Handled before
     // the `q` / `:` early-returns so the pending-`g` state can settle
-    // on the next key. Only applies to the inbox screen.
+    // on the next key. Only applies to the inbox screen. `/` is the broad
+    // default (spans `[search].global_folders`, i.e. inbox + archive out of
+    // the box); `g/` narrows to the current folder.
     if matches!(app.screens.get(app.active), Some(Screen::Inbox(_))) {
         if app.pending_g {
             app.pending_g = false;
             if k.code == KeyCode::Char('/') {
-                app.enter_search_global(cfg);
+                app.enter_search_local();
                 return;
             }
             if k.code == KeyCode::Char('g') {
@@ -168,7 +170,7 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             // (so e.g. `g` then `j` still moves selection).
         }
         if k.code == KeyCode::Char('/') && !k.modifiers.intersects(KeyModifiers::CONTROL) {
-            app.enter_search_local();
+            app.enter_search_global(cfg);
             return;
         }
         // `z`-prefix scroll positioning (`zz` / `zt` / `zb`), Reader focus.

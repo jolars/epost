@@ -1507,7 +1507,7 @@ impl App {
         self.inbox_mut().cycle_focus(forward);
     }
 
-    /// Enter `/` (local) search: snapshot the current scope's rows from
+    /// Enter `g/` (local) search: snapshot the current scope's rows from
     /// the index, install a fresh `SearchState`, switch focus to List,
     /// flip `Mode::Search`. Failure to open the index surfaces in the
     /// cmdline status row and leaves search inactive.
@@ -1527,9 +1527,10 @@ impl App {
         }
     }
 
-    /// Enter `g/` (global) search using `[search].global_folders`
+    /// Enter `/` (global) search using `[search].global_folders`
     /// (or every folder when the list is empty/unset), filtered to the
-    /// currently-selected account scope.
+    /// currently-selected account scope. This is the default broad search;
+    /// `g/` narrows to the current folder.
     pub fn enter_search_global(&mut self, cfg: &Config) {
         let Self {
             screens,

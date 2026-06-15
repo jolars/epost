@@ -82,7 +82,8 @@ fn search_chip(app: &App) -> Line<'static> {
     let Some(s) = inbox.search.as_ref() else {
         return Line::from(Span::raw(""));
     };
-    let prefix = if s.kind.is_global() { "g/" } else { "/" };
+    // `/` is the global default; `g/` narrows to the current folder.
+    let prefix = if s.kind.is_global() { "/" } else { "g/" };
     // Budget: " {prefix}{query} ({n}) ", where the query is truncated to
     // whatever fits in SEARCH_CHIP_WIDTH after the fixed parts.
     let q = s.query.as_str();

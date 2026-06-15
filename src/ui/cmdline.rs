@@ -93,8 +93,8 @@ fn mode_label(mode: Mode) -> &'static str {
     }
 }
 
-/// `:`-style strip for the active search: `/needle_  (12)` (local) or
-/// `g/needle_  (12)` (global). Result count is the live match count
+/// `:`-style strip for the active search: `/needle_  (12)` (global) or
+/// `g/needle_  (12)` (local). Result count is the live match count
 /// after the matcher ran on the last keystroke.
 fn search_line(app: &App) -> Line<'static> {
     let Some(Screen::Inbox(inbox)) = app.screens.first() else {
@@ -103,7 +103,8 @@ fn search_line(app: &App) -> Line<'static> {
     let Some(s) = inbox.search.as_ref() else {
         return Line::from(Span::raw(""));
     };
-    let prefix = if s.kind.is_global() { "g/" } else { "/" };
+    // `/` is the global default; `g/` narrows to the current folder.
+    let prefix = if s.kind.is_global() { "/" } else { "g/" };
     let buf = s.query.as_str();
     let (before, after) = buf.split_at(s.query.cursor());
     let count = format!("  ({})", s.results.len());

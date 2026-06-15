@@ -1,4 +1,4 @@
-//! `/` (local) and `g/` (global) fuzzy search. While `InboxScreen.search`
+//! `/` (global) and `g/` (local) fuzzy search. While `InboxScreen.search`
 //! is `Some`, the list pane renders `SearchState.results` in place of the
 //! scan threads. The haystack is cached once at mode entry; each keystroke
 //! re-scores in memory via `nucleo-matcher` (fast enough at typical mailbox
