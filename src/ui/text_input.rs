@@ -85,6 +85,52 @@ impl TextInput {
         self.cursor = 0;
     }
 
+    /// Char index of the cursor (number of chars before it). The byte
+    /// `cursor` is the readline-facing offset; this is what the vim word
+    /// scanner ([`crate::ui::words`]) and motions want.
+    pub fn cursor_char(&self) -> usize {
+        self.buf[..self.cursor].chars().count()
+    }
+
+    /// Move the cursor to char index `ci`, clamped to end-of-buffer. The
+    /// resulting byte offset always lands on a UTF-8 boundary.
+    pub fn set_cursor_char(&mut self, ci: usize) {
+        self.cursor = self
+            .buf
+            .char_indices()
+            .nth(ci)
+            .map(|(b, _)| b)
+            .unwrap_or(self.buf.len());
+    }
+
+    /// The char the cursor currently sits on, or `None` at end-of-buffer.
+    pub fn char_under_cursor(&self) -> Option<char> {
+        self.buf[self.cursor..].chars().next()
+    }
+
+    /// vim Normal-mode clamp: the cursor sits *on* a char, never one past
+    /// the last (an empty buffer keeps the cursor at 0). Insert mode skips
+    /// this so appending at end-of-line still works.
+    pub fn clamp_normal(&mut self) {
+        if self.buf.is_empty() {
+            self.cursor = 0;
+        } else if self.cursor >= self.buf.len() {
+            self.cursor = prev_boundary(&self.buf, self.buf.len());
+        }
+    }
+
+    /// Replace the char under the cursor with `c`, leaving the cursor on
+    /// it (vim `r`). No-op at end-of-buffer.
+    pub fn replace_char_under_cursor(&mut self, c: char) {
+        if self.cursor >= self.buf.len() {
+            return;
+        }
+        let next = next_boundary(&self.buf, self.cursor);
+        let mut s = String::with_capacity(c.len_utf8());
+        s.push(c);
+        self.buf.replace_range(self.cursor..next, &s);
+    }
+
     /// Readline `unix-word-rubout`: skip any trailing whitespace, then
     /// delete back through the run of non-whitespace under / before the
     /// cursor. Whitespace is the only delimiter — punctuation stays

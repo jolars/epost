@@ -1,7 +1,9 @@
 //! Compose screen: aerc-style form for one in-flight draft. Lives in
 //! its own tab so the user can `Ctrl-PgDn` away to other work and come
-//! back. Header fields (From / To / Cc / Bcc / Subject) edit in-place
-//! via `TextInput`; the body is owned by a vim-style native editor
+//! back. Header fields (From / To / Cc / Bcc / Subject) store their text
+//! in `TextInput`s but edit modally (Normal / Insert) via
+//! [`crate::ui::compose_header`], symmetric with the body's vim editor;
+//! the body is owned by the native vim editor
 //! ([`crate::ui::compose_body::BodyEditor`]). `:edit` materialises the
 //! body to a tempfile and hands it to `$EDITOR` under a pty for users
 //! who want their heavy editor config.
@@ -23,6 +25,7 @@ use crate::mail::compose::Draft;
 use crate::ui::address_complete::{self, AddressCompleteState};
 pub use crate::ui::compose_body::KeyOutcome;
 use crate::ui::compose_body::{BodyEditor, BodyMode, VisualKind};
+use crate::ui::compose_header::{self, HeaderMode};
 use crate::ui::embed::EditorSession;
 use crate::ui::style::{pane_block, pane_scrollbar};
 use crate::ui::text_input::TextInput;
@@ -76,6 +79,17 @@ pub struct ComposeScreen {
     /// `set_focus`, `focus_next`, `focus_prev`, and the From picker
     /// commit path; never set to `Body` itself.
     pub last_header_focused: ComposeField,
+    /// Modal state shared by all header fields (From / To / Cc / Bcc /
+    /// Subject). Only one header field is focused at a time, so a single
+    /// mode suffices; it persists across field switches (you navigate in
+    /// Normal, stay in Insert while Tab-ing) and reuses the body editor's
+    /// Normal-default convention. See [`crate::ui::compose_header`].
+    pub header_mode: HeaderMode,
+    /// Pending two-key / capture latch for header Normal mode: `Some('d')`
+    /// after `d` (awaiting the second `d`), `Some('c')` after `c`,
+    /// `Some('r')` after `r` (awaiting the replacement char). Cleared on
+    /// any focus change via [`ComposeScreen::set_focus`].
+    pub header_pending: Option<char>,
     /// Vim-style body editor. Always present; holds the canonical body
     /// text. When the user invokes `:edit`, the contents are flushed to
     /// `body_tempfile` and `$EDITOR` runs against that path; on exit we
@@ -195,6 +209,10 @@ impl ComposeScreen {
             // changed via the picker (Enter), not by typing.
             focused: ComposeField::To,
             last_header_focused: ComposeField::To,
+            // Header fields open in Normal mode, mirroring the body editor
+            // so the whole form is one consistent vim surface.
+            header_mode: HeaderMode::Normal,
+            header_pending: None,
             body,
             editor_pending: false,
             editor: None,
@@ -285,6 +303,9 @@ impl ComposeScreen {
         if field != ComposeField::Body {
             self.last_header_focused = field;
         }
+        // Any focus change cancels a half-typed header operator (a pending
+        // `d`/`c`/`r`) so it can't fire against the field we land on.
+        self.header_pending = None;
         self.focused = field;
     }
 
@@ -312,7 +333,7 @@ impl ComposeScreen {
         });
     }
 
-    fn focused_input_mut(&mut self) -> Option<&mut TextInput> {
+    pub(crate) fn focused_input_mut(&mut self) -> Option<&mut TextInput> {
         Some(match self.focused {
             ComposeField::From => &mut self.from,
             ComposeField::To => &mut self.to,
@@ -482,10 +503,9 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
         open_from_picker(screen, cfg);
         return KeyOutcome::Consumed;
     }
-    if let Some(input) = screen.focused_input_mut() {
-        input.handle(k);
-    }
-    KeyOutcome::Consumed
+    // Everything else routes through the field's modal (Normal / Insert)
+    // editor, symmetric with the body.
+    compose_header::handle_field_key(screen, k)
 }
 
 /// Attach-row key dispatch. Splits into list mode (j/k/Enter/a/d/x +
@@ -733,7 +753,25 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     let body_area = outer[1];
     let hint_area = outer[2];
 
-    let header_block = pane_block("Compose", true);
+    // Surface the modal state in the pane title while a header text field
+    // is focused, mirroring the body's `Body — NORMAL` title.
+    let header_field_focused = matches!(
+        screen.focused,
+        ComposeField::From
+            | ComposeField::To
+            | ComposeField::Cc
+            | ComposeField::Bcc
+            | ComposeField::Subject
+    );
+    let header_title = if header_field_focused {
+        format!(
+            "Compose — {}",
+            compose_header::mode_label(screen.header_mode)
+        )
+    } else {
+        "Compose".to_string()
+    };
+    let header_block = pane_block(&header_title, true);
     let header_inner = header_block.inner(header_area);
     f.render_widget(header_block, header_area);
 
@@ -749,6 +787,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         "From:    ",
         &screen.from,
         screen.focused == ComposeField::From,
+        screen.header_mode,
     );
     render_field(
         f,
@@ -756,6 +795,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         "To:      ",
         &screen.to,
         screen.focused == ComposeField::To,
+        screen.header_mode,
     );
     render_field(
         f,
@@ -763,6 +803,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         "Cc:      ",
         &screen.cc,
         screen.focused == ComposeField::Cc,
+        screen.header_mode,
     );
     render_field(
         f,
@@ -770,6 +811,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         "Bcc:     ",
         &screen.bcc,
         screen.focused == ComposeField::Bcc,
+        screen.header_mode,
     );
     // Stash the focused-recipient row so the address-completion
     // popup can hang off it. Refreshed every frame; cleared whenever
@@ -786,6 +828,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         "Subject: ",
         &screen.subject,
         screen.focused == ComposeField::Subject,
+        screen.header_mode,
     );
     if attach_focused {
         render_attach_expanded(f, &rows[5..], &screen.attachments, &screen.attach);
@@ -874,14 +917,11 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
             " j/k navigate  Enter/a add  d/x remove  Tab next  Ctrl-J body "
         };
         Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
-    } else if screen.focused == ComposeField::From {
-        Line::from(Span::styled(
-            " Enter/Alt-f pick account  Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
-            Style::default().fg(Color::DarkGray),
-        ))
     } else {
+        // A header text field (From / To / Cc / Bcc / Subject) is focused:
+        // show the modal (Normal / Insert) hint.
         Line::from(Span::styled(
-            " Alt-f pick account  Tab/Shift-Tab fields  Alt-e edit body  :send  :close ",
+            compose_header::hint(screen.header_mode),
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -1095,7 +1135,14 @@ fn paint_body_block_selection(buf: &mut ratatui::buffer::Buffer, inner: Rect, bo
     }
 }
 
-fn render_field(f: &mut Frame, area: Rect, label: &str, input: &TextInput, focused: bool) {
+fn render_field(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    input: &TextInput,
+    focused: bool,
+    mode: HeaderMode,
+) {
     let label_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
@@ -1103,17 +1150,37 @@ fn render_field(f: &mut Frame, area: Rect, label: &str, input: &TextInput, focus
     let cursor = input.cursor();
     let (before, after) = buf.split_at(cursor);
     let mut spans = vec![Span::styled(label.to_string(), label_style)];
-    if focused {
-        spans.push(Span::raw(before.to_string()));
-        spans.push(Span::styled(
-            "_",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::SLOW_BLINK),
-        ));
-        spans.push(Span::raw(after.to_string()));
-    } else {
+    if !focused {
         spans.push(Span::raw(buf.to_string()));
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+    match mode {
+        // Insert: a thin yellow bar sits *between* chars, like a vim
+        // insert caret.
+        HeaderMode::Insert => {
+            spans.push(Span::raw(before.to_string()));
+            spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
+            spans.push(Span::raw(after.to_string()));
+        }
+        // Normal: a solid block sits *on* the char under the cursor
+        // (reverse-video), matching the body editor's block cursor.
+        HeaderMode::Normal => {
+            spans.push(Span::raw(before.to_string()));
+            let block = Style::default().add_modifier(Modifier::REVERSED);
+            match input.char_under_cursor() {
+                Some(c) => {
+                    let mut s = String::new();
+                    s.push(c);
+                    spans.push(Span::styled(s, block));
+                    // Skip the now-covered char in the trailing run.
+                    let rest = &after[c.len_utf8()..];
+                    spans.push(Span::raw(rest.to_string()));
+                }
+                // End of an (empty or fully-traversed) line: block a space.
+                None => spans.push(Span::styled(" ", block)),
+            }
+        }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

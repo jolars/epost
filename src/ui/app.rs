@@ -906,6 +906,13 @@ impl App {
             c.address_complete = None;
             return;
         }
+        // The popup is an Insert-mode affordance: in header Normal mode the
+        // keys are motions/edits, not text the user is composing, so there's
+        // nothing to complete.
+        if c.header_mode != crate::ui::compose_header::HeaderMode::Insert {
+            c.address_complete = None;
+            return;
+        }
         let field = c.focused;
         let input = match field {
             ComposeField::To => &c.to,
