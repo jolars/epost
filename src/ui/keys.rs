@@ -379,8 +379,9 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
     }
 
     // Focus-routed keys: `j`/`k` are the obvious case — list nav when List
-    // has focus, reader scroll when Reader does. `f` only makes sense in
-    // the reader (link picker over the rendered body). The flag toggles
+    // has focus, reader scroll when Reader does. `f` forwards the selected
+    // message when List has focus (alongside `F`), but is the link picker
+    // over the rendered body when Reader does. The flag toggles
     // (`m`/`*`/`x`) only apply to a selected row, so they're List-only.
     let focus = app.inbox().focus;
     match focus {
@@ -402,7 +403,9 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             KeyCode::Char('c') => cmdline::open_blank_compose_external(app, cfg),
             KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
             KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
-            KeyCode::Char('F') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Forward),
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                cmdline::open_reply(app, cfg, cmdline::ReplyKind::Forward)
+            }
             KeyCode::Char('l') if app.inbox().reader_visible => {
                 app.inbox_mut().focus = Pane::Reader;
             }
