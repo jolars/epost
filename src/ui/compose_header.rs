@@ -84,6 +84,15 @@ fn handle_normal(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutcome {
     if k.modifiers.contains(KeyModifiers::CONTROL) || k.modifiers.contains(KeyModifiers::ALT) {
         return KeyOutcome::Consumed;
     }
+    // `:` / `/` / `?` pass through to the host cmdline so `:send` and
+    // friends work from a header field's Normal mode, exactly as they do
+    // from the body editor's Normal mode (compose_body's passthrough arm).
+    if matches!(
+        k.code,
+        KeyCode::Char(':') | KeyCode::Char('/') | KeyCode::Char('?')
+    ) {
+        return KeyOutcome::PassThrough;
+    }
     match k.code {
         // Field navigation: j/k walk the header rows like vim lines.
         KeyCode::Char('j') | KeyCode::Down => field_down(screen),
@@ -445,6 +454,17 @@ mod tests {
         // The next `j` moves normally.
         handle_field_key(&mut s, key('j'));
         assert_eq!(s.focused, ComposeField::Cc);
+    }
+
+    #[test]
+    fn colon_passes_through_to_host_cmdline() {
+        // `:` in a header field's Normal mode must reach the app-level
+        // cmdline (so `:send` works from To/From/etc.), not be swallowed.
+        let mut s = screen_with_to("alice");
+        let out = handle_field_key(&mut s, key(':'));
+        assert!(matches!(out, KeyOutcome::PassThrough));
+        // The field text is untouched.
+        assert_eq!(s.to.as_str(), "alice");
     }
 
     #[test]
