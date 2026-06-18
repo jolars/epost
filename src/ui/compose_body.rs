@@ -168,6 +168,20 @@ impl OpState {
     fn eff_count(&self) -> usize {
         self.count1.unwrap_or(1) * self.count2.unwrap_or(1)
     }
+
+    /// True when a multi-key chord (operator, count, `g`-prefix, text
+    /// object, find, or `r` replace) is mid-parse and awaiting its next
+    /// key. The compose-level `q` quick-close consults this so a pending
+    /// `gq` reflow (or `rq`, `fq`, …) completes instead of closing the tab.
+    fn pending(&self) -> bool {
+        self.op.is_some()
+            || self.await_g
+            || self.await_obj.is_some()
+            || self.await_find.is_some()
+            || self.await_replace.is_some()
+            || self.count1.is_some()
+            || self.count2.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +294,14 @@ impl BodyEditor {
 
     pub fn text(&self) -> String {
         self.textarea.lines().join("\n")
+    }
+
+    /// True when the editor is mid-chord in Normal mode (a count,
+    /// operator, `g`-prefix, text object, find, or `r` replace is
+    /// awaiting its next key). The compose `q` quick-close defers to
+    /// this so `gq` and friends complete instead of closing the tab.
+    pub fn pending_chord(&self) -> bool {
+        self.ops.pending()
     }
 
     pub fn set_text(&mut self, s: &str) {

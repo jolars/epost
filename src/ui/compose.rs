@@ -278,6 +278,22 @@ impl ComposeScreen {
             || self.body_is_dirty()
     }
 
+    /// True when the focused field is in a non-text-capturing "normal"
+    /// state: body Normal, a header field's Normal mode, or the Attach
+    /// list (not its inline path input). Gates the `q` quick-close so a
+    /// literal `q` typed mid-edit doesn't drop the draft.
+    fn in_normal_mode(&self) -> bool {
+        match self.focused {
+            // Defer to a mid-chord body (`gq`, `rq`, `fq`, …) so the
+            // editor completes the sequence rather than `q` closing.
+            ComposeField::Body => self.body.mode == BodyMode::Normal && !self.body.pending_chord(),
+            ComposeField::Attach => self.attach.adding.is_none(),
+            // From / To / Cc / Bcc / Subject share the header modal; a
+            // pending `d`/`c`/`r` latch (e.g. `rq`) must consume `q`.
+            _ => self.header_mode == HeaderMode::Normal && self.header_pending.is_none(),
+        }
+    }
+
     /// Build a Draft from the current field contents + native editor.
     pub fn collect_draft(&self) -> std::io::Result<Draft> {
         Ok(Draft {
@@ -450,6 +466,20 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
         }
     }
 
+    // `q` from any Normal-mode field closes the tab, mirroring `:close`:
+    // a dirty draft raises the Save / Discard / Cancel prompt, a clean one
+    // drops straight back to the message pane. `in_normal_mode` keeps `q`
+    // a literal while typing (Insert / Replace / Visual body, header Insert,
+    // or the Attach row's inline path input). `confirm_close` is already
+    // `None` here (guarded at the top of the handler).
+    if k.code == KeyCode::Char('q') && k.modifiers.is_empty() && screen.in_normal_mode() {
+        if screen.is_dirty() {
+            screen.confirm_close = Some(CloseConfirm);
+            return KeyOutcome::Consumed;
+        }
+        return KeyOutcome::CloseTab;
+    }
+
     // Body: let the native vim editor have first crack. If it returns
     // PassThrough (only happens from Normal/Visual, for `:` `/` `?`),
     // the caller will route the key to the app dispatch. Tab/BackTab
@@ -620,7 +650,7 @@ fn native_body_hint(body: &BodyEditor) -> &'static str {
         BodyMode::Insert => " -- INSERT --  Esc to leave  :send  :close ",
         BodyMode::Replace => " -- REPLACE --  Esc to leave ",
         BodyMode::Visual(_) => " -- VISUAL --  y yank  d delete  c change  Esc cancel ",
-        BodyMode::Normal => " i insert  v/V visual  cw/diw/gqap/p edit  :edit  :send  :close ",
+        BodyMode::Normal => " i insert  v/V visual  cw/diw/gqap/p edit  :edit  :send  q close ",
     }
 }
 
@@ -1387,6 +1417,95 @@ mod tests {
         let out = handle_key(&mut s, key(KeyCode::Enter, KeyModifiers::NONE), &cfg);
         assert!(matches!(out, KeyOutcome::Consumed));
         assert!(s.attach.adding.is_some(), "Enter on sentinel opens input");
+    }
+
+    #[test]
+    fn q_in_header_normal_closes_clean_tab() {
+        let mut s = blank();
+        // Fresh blank compose: focus on To, header Normal, nothing dirty.
+        assert_eq!(s.focused, ComposeField::To);
+        let cfg = Config::default();
+        let out = handle_key(&mut s, key(KeyCode::Char('q'), KeyModifiers::NONE), &cfg);
+        assert!(
+            matches!(out, KeyOutcome::CloseTab),
+            "clean tab closes outright"
+        );
+        assert!(s.confirm_close.is_none(), "no prompt for a clean draft");
+    }
+
+    #[test]
+    fn q_in_body_normal_closes_clean_tab() {
+        let mut s = blank();
+        s.set_focus(ComposeField::Body);
+        let cfg = Config::default();
+        let out = handle_key(&mut s, key(KeyCode::Char('q'), KeyModifiers::NONE), &cfg);
+        assert!(matches!(out, KeyOutcome::CloseTab));
+    }
+
+    #[test]
+    fn q_on_dirty_draft_raises_close_prompt() {
+        let mut s = blank();
+        // Type a subject so the draft reads as dirty.
+        s.set_focus(ComposeField::Subject);
+        let cfg = Config::default();
+        handle_key(&mut s, key(KeyCode::Char('i'), KeyModifiers::NONE), &cfg);
+        handle_key(&mut s, key(KeyCode::Char('x'), KeyModifiers::NONE), &cfg);
+        handle_key(&mut s, key(KeyCode::Esc, KeyModifiers::NONE), &cfg);
+        assert!(s.is_dirty());
+        let out = handle_key(&mut s, key(KeyCode::Char('q'), KeyModifiers::NONE), &cfg);
+        assert!(
+            matches!(out, KeyOutcome::Consumed),
+            "dirty draft opens the prompt, not a close"
+        );
+        assert!(
+            s.confirm_close.is_some(),
+            "Save/Discard/Cancel prompt is up"
+        );
+    }
+
+    #[test]
+    fn q_in_header_insert_is_a_literal() {
+        let mut s = blank();
+        // To field, Insert mode: `q` must type, not close.
+        let cfg = Config::default();
+        handle_key(&mut s, key(KeyCode::Char('i'), KeyModifiers::NONE), &cfg);
+        let out = handle_key(&mut s, key(KeyCode::Char('q'), KeyModifiers::NONE), &cfg);
+        assert!(matches!(out, KeyOutcome::Consumed));
+        assert!(s.confirm_close.is_none());
+        assert_eq!(s.to.as_str(), "q", "q typed into the field");
+    }
+
+    #[test]
+    fn gq_in_body_completes_chord_instead_of_closing() {
+        let mut s = blank();
+        s.set_focus(ComposeField::Body);
+        let cfg = Config::default();
+        // `g` arms the chord; the following `q` must reach the body editor
+        // (gq reflow), not trip the quick-close.
+        handle_key(&mut s, key(KeyCode::Char('g'), KeyModifiers::NONE), &cfg);
+        let out = handle_key(&mut s, key(KeyCode::Char('q'), KeyModifiers::NONE), &cfg);
+        assert!(
+            matches!(out, KeyOutcome::Consumed),
+            "gq is consumed by the editor"
+        );
+        assert!(s.confirm_close.is_none());
+    }
+
+    #[test]
+    fn rq_in_header_replaces_instead_of_closing() {
+        let mut s = blank();
+        // Seed a char to replace, then return to Normal at column 0.
+        s.set_focus(ComposeField::To);
+        let cfg = Config::default();
+        handle_key(&mut s, key(KeyCode::Char('i'), KeyModifiers::NONE), &cfg);
+        handle_key(&mut s, key(KeyCode::Char('z'), KeyModifiers::NONE), &cfg);
+        handle_key(&mut s, key(KeyCode::Esc, KeyModifiers::NONE), &cfg);
+        // `r` arms the replace latch; `q` is its target char, not a close.
+        handle_key(&mut s, key(KeyCode::Char('r'), KeyModifiers::NONE), &cfg);
+        let out = handle_key(&mut s, key(KeyCode::Char('q'), KeyModifiers::NONE), &cfg);
+        assert!(matches!(out, KeyOutcome::Consumed));
+        assert!(s.confirm_close.is_none());
+        assert_eq!(s.to.as_str(), "q", "rq replaced the char");
     }
 
     #[test]

@@ -269,7 +269,7 @@ pub fn hint(mode: HeaderMode) -> &'static str {
             " -- INSERT --  Esc normal  Tab fields  Alt-f from  Ctrl-J body  :send "
         }
         HeaderMode::Normal => {
-            " -- NORMAL --  i insert  j/k fields  x/D/dd edit  Alt-f from  Ctrl-J body  :send "
+            " -- NORMAL --  i insert  j/k fields  x/D/dd edit  Alt-f from  Ctrl-J body  :send  q close "
         }
     }
 }
