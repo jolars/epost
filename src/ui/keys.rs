@@ -606,7 +606,10 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                 KeyCode::Char('y') => {
                     app.pending_y = Some(String::new());
                 }
-                KeyCode::Char('Y') => yank_line(app, cfg),
+                // `Y` — yank from the cursor to end of line (vim's `y$`,
+                // the consistency mapping Neovim ships as default). `yy`
+                // is the whole-line yank.
+                KeyCode::Char('Y') => yank_motion(app, cfg, Motion::LineEnd, 1),
                 KeyCode::Char('v') => {
                     app.enter_visual(crate::ui::app::VisualKind::Char);
                 }
@@ -909,8 +912,9 @@ fn yank_body(app: &mut App, cfg: &Config, trailing: bool) {
     dispatch_yank(app, cfg, text, "yanked entire body".to_string());
 }
 
-/// Yank the current reader line. `Y` / `yy` in the Reader pane, matching
-/// vim's line-wise yank (the line plus its trailing newline). Reads the
+/// Yank the current reader line. `yy` in the Reader pane, matching
+/// vim's line-wise yank (the line plus its trailing newline). `Y` is the
+/// separate cursor-to-EOL yank (`y$`). Reads the
 /// per-frame `last_reader_body_line_text` so it lines up exactly with
 /// what's on screen, and flashes the whole row.
 fn yank_line(app: &mut App, cfg: &Config) {

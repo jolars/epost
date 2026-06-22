@@ -737,8 +737,9 @@ impl BodyEditor {
             }
             KeyCode::Char('C') => self.change_to_eol(),
             KeyCode::Char('D') => self.delete_to_eol(),
-            // `Y` is vim's line-yank, same as `yy`.
-            KeyCode::Char('Y') => self.yank_current_line(),
+            // `Y` yanks to end of line (`y$`), matching `D`/`C` above and
+            // the reader. `yy` is the whole-line yank.
+            KeyCode::Char('Y') => self.yank_to_eol(),
             KeyCode::Char('p') => self.paste_after(),
             KeyCode::Char('P') => self.paste_before(),
             KeyCode::Char('u') => {
@@ -1939,15 +1940,24 @@ impl BodyEditor {
 
     // ---------- Line ops ----------
 
-    fn yank_current_line(&mut self) {
-        let (row, _) = self.textarea.cursor();
-        let line = self.textarea.lines().get(row).cloned().unwrap_or_default();
+    /// `Y` — yank from the cursor to end of line (`y$`), matching the
+    /// composer's `D`/`C` EOL operators. `yy` is the whole-line yank.
+    fn yank_to_eol(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let len = self.textarea.lines()[row].chars().count();
+        let region = Region {
+            start: (row, col),
+            end: (row, len),
+            linewise: false,
+        };
+        if region.start == region.end {
+            return;
+        }
         self.yank = Some(Yank {
-            text: format!("{line}\n"),
-            line_wise: true,
+            text: self.region_text(&region),
+            line_wise: false,
         });
-        let ranges = self.line_ranges(row, row);
-        self.arm_yank_highlight(ranges);
+        self.arm_yank_highlight(vec![(row as u16, col as u16, (len - col) as u16)]);
     }
 
     fn yank_selection(&mut self, kind: VisualKind) {
@@ -2489,10 +2499,12 @@ mod tests {
     }
 
     #[test]
-    fn capital_y_yanks_line_like_yy() {
+    fn capital_y_yanks_to_eol() {
+        // `Y` is `y$`: from the cursor to end of line, char-wise (not the
+        // whole line — that's `yy`). Yank "pha", then paste it past EOL.
         let mut ed = BodyEditor::new("alpha\nbeta");
-        feed(&mut ed, &[k('Y'), k('p')]);
-        assert_eq!(ed.text(), "alpha\nalpha\nbeta");
+        feed(&mut ed, &[k('l'), k('l'), k('Y'), k('P')]);
+        assert_eq!(ed.text(), "alphapha\nbeta");
     }
 
     #[test]
