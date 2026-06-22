@@ -58,6 +58,11 @@ mode = "native"
 # Wrap width for the native editor's reflow operators (`gq` / `gw`).
 # Default 72 (the conventional plain-text mail body width).
 # text_width = 72
+# Soft-wrap mode for the native body editor. Visual-only — wraps long
+# logical lines (e.g. quoted reply text) to the pane width without
+# inserting newlines. `word-or-glyph` (default) / `word` / `glyph` /
+# `off` (old horizontal-scroll behaviour).
+# wrap = "word-or-glyph"
 
 # Address completion for To / Cc / Bcc. The native source (Sent-folder
 # harvest at startup) is always on; the external source is opt-in via

@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tempfile::NamedTempFile;
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use crate::config::Config;
+use crate::config::{ComposeWrap, Config};
 use crate::mail::compose as mail_compose;
 use crate::mail::compose::Draft;
 use crate::ui::address_complete::{self, AddressCompleteState};
@@ -191,9 +191,10 @@ impl ComposeScreen {
     /// starts false. Callers that want `$EDITOR` to auto-spawn on tab
     /// open (the `mode = "external"` config branch) flip
     /// `editor_pending = true` after constructing.
-    pub fn from_draft(draft: Draft) -> std::io::Result<Self> {
+    pub fn from_draft(draft: Draft, wrap: ComposeWrap) -> std::io::Result<Self> {
         let title = title_for(&draft);
-        let body = BodyEditor::new(&draft.body);
+        let mut body = BodyEditor::new(&draft.body);
+        body.set_wrap(wrap);
         Ok(Self {
             title,
             account: draft.account,
@@ -898,31 +899,25 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
             f.render_widget(placeholder, body_inner);
         }
     } else {
-        // Native editor: tui-textarea's own cursor cell is disabled in
-        // `BodyEditor::new` so we drive the real host cursor here. Mode
-        // is signalled by DECSCUSR (steady block in Normal/Visual, steady
-        // bar in Insert) — emitted by the main loop's
-        // `collect_cursor_style_escapes` based on `body.mode`. The data
-        // cursor maps to (body_inner.x + col, body_inner.y + row); for
-        // bodies that fit in the pane (the typical case) there's no
-        // scroll to subtract. Bodies large enough to scroll the textarea
-        // will see a brief cursor-position drift until the next motion;
-        // acceptable v1 trade-off vs poking at tui-textarea internals.
+        // Native editor. Under soft-wrap tui-textarea owns cursor and
+        // selection placement (only the crate knows a glyph's post-wrap /
+        // post-scroll screen cell), so we let it paint both: the cursor
+        // cell is styled by mode in `BodyEditor::sync_cursor_style`
+        // (REVERSED block in Normal/Visual, UNDERLINED in Insert/Replace —
+        // approximating the old DECSCUSR shapes), and char/line visual
+        // selection rides the crate's own selection. The block-wise
+        // selection and yank-flash overlays, which the crate can't express,
+        // are registered as data-coordinate `custom_highlight`s by
+        // `apply_overlays` *before* the immutable render borrow.
+        screen.body.apply_overlays();
         f.render_widget(&screen.body.textarea, body_inner);
-        paint_body_block_selection(f.buffer_mut(), body_inner, &screen.body);
-        paint_body_yank_highlight(f.buffer_mut(), body_inner, &screen.body);
-        let (cursor_row, col) = screen.body.textarea.cursor();
+        // Scrollbar driven by logical row / line count. v1 drift: under
+        // wrap a long line spans several visual rows, so the thumb tracks
+        // logical position, not visual — the crate exposes no public
+        // scroll-top to drive an exact visual thumb.
+        let (cursor_row, _col) = screen.body.textarea.cursor();
         let line_count = screen.body.textarea.lines().len();
         pane_scrollbar(f, body_area, cursor_row, line_count, body_focused);
-        if body_focused {
-            let x = body_inner.x.saturating_add(col as u16);
-            let y = body_inner.y.saturating_add(cursor_row as u16);
-            if x < body_inner.x.saturating_add(body_inner.width)
-                && y < body_inner.y.saturating_add(body_inner.height)
-            {
-                f.set_cursor_position((x, y));
-            }
-        }
     }
 
     let hint = if editing {
@@ -1101,68 +1096,6 @@ fn draw_from_picker(f: &mut Frame, from_row: Rect, picker: &FromPicker, bounds: 
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Paint the body editor's transient yank-highlight flash: a
-/// yellow-on-black background over the yanked cells, drawn on top of the
-/// rendered textarea. Coordinates are textarea char `(row, col)` mapped
-/// straight onto `body_inner` (no scroll subtraction — same simplifying
-/// assumption the cursor placement makes). A background color rather than
-/// REVERSED so it reads as feedback even right after a visual selection.
-/// The host loop clears the highlight once `[reader].yank_highlight_ms`
-/// elapses, so a present highlight here is always within its window.
-fn paint_body_yank_highlight(buf: &mut ratatui::buffer::Buffer, inner: Rect, body: &BodyEditor) {
-    let Some(hl) = body.yank_highlight.as_ref() else {
-        return;
-    };
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    for (row, c_start, c_end_excl) in &hl.ranges {
-        if *row >= inner.height {
-            continue;
-        }
-        let y = inner.y + row;
-        let x_start = inner.x.saturating_add(*c_start).min(inner.x + inner.width);
-        let x_end = inner
-            .x
-            .saturating_add(*c_end_excl)
-            .min(inner.x + inner.width);
-        for x in x_start..x_end {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                let style = cell.style().bg(Color::Yellow).fg(Color::Black);
-                cell.set_style(style);
-            }
-        }
-    }
-}
-
-/// Paint the block-wise visual selection (`Ctrl-V`) over the body pane.
-/// tui-textarea's single-range selection can't draw a rectangle, so we
-/// flip `REVERSED` on each row's `[c0, c1]` span ourselves, mirroring the
-/// reader's block paint. Ranges are body-relative char coords (char ==
-/// cell here, same assumption as the yank-highlight painter).
-fn paint_body_block_selection(buf: &mut ratatui::buffer::Buffer, inner: Rect, body: &BodyEditor) {
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    for (row, c_start, c_end_excl) in body.block_selection_ranges() {
-        if row >= inner.height {
-            continue;
-        }
-        let y = inner.y + row;
-        let x_start = inner.x.saturating_add(c_start).min(inner.x + inner.width);
-        let x_end = inner
-            .x
-            .saturating_add(c_end_excl)
-            .min(inner.x + inner.width);
-        for x in x_start..x_end {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                let style = cell.style().add_modifier(Modifier::REVERSED);
-                cell.set_style(style);
-            }
-        }
-    }
 }
 
 fn render_field(
@@ -1369,8 +1302,11 @@ mod tests {
     use crate::mail::compose::Draft;
 
     fn blank() -> ComposeScreen {
-        ComposeScreen::from_draft(Draft::new_blank("acct", "me <me@example.com>"))
-            .expect("compose screen")
+        ComposeScreen::from_draft(
+            Draft::new_blank("acct", "me <me@example.com>"),
+            ComposeWrap::default(),
+        )
+        .expect("compose screen")
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {

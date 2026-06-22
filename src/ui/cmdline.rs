@@ -1017,7 +1017,7 @@ fn open_blank_compose(app: &mut App, cfg: &Config) {
         return;
     };
     let draft = Draft::new_blank(&name, &account.from);
-    match ComposeScreen::from_draft(draft) {
+    match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
         Ok(mut screen) => {
             // `[compose].mode = "external"`: behave like the old
             // pty-only path and spawn `$EDITOR` as soon as the tab
@@ -1091,7 +1091,7 @@ pub fn resume_selected_draft_if_drafts(app: &mut App, cfg: &Config) -> bool {
         attachments: Vec::new(),
     };
 
-    match ComposeScreen::from_draft(draft) {
+    match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
         Ok(mut screen) => {
             screen.origin_draft_path = Some(path);
             app.open_compose(screen);
@@ -1152,7 +1152,7 @@ pub fn open_reply(app: &mut App, cfg: &Config, kind: ReplyKind) {
         ReplyKind::ReplyAll => Draft::reply_to(&headers, &body, &row.account, &from, true),
         ReplyKind::Forward => Draft::forward(&headers, &body, &row.account, &from),
     };
-    match ComposeScreen::from_draft(draft) {
+    match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
         Ok(mut screen) => {
             if matches!(cfg.compose.mode, config::ComposeMode::External) {
                 screen.editor_pending = true;

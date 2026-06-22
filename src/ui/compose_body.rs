@@ -28,12 +28,12 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::Style;
-use tui_textarea::{CursorMove, TextArea};
+use ratatui::style::{Color, Modifier, Style};
+use tui_textarea::{CursorMove, TextArea, WrapMode};
 use unicode_width::UnicodeWidthStr;
 
+use crate::config::ComposeWrap;
 use crate::ui::motion::{self, Motion, MotionKind, MotionSpan, MotionTarget, Region};
 use crate::ui::textobj::{self, TextObjKind};
 use crate::ui::words::{self, WordMotion};
@@ -268,16 +268,18 @@ impl BodyEditor {
     pub fn new(initial: &str) -> Self {
         let lines = split_for_textarea(initial);
         let mut textarea = TextArea::new(lines);
-        // We draw the cursor ourselves via `f.set_cursor_position()` +
-        // DECSCUSR (block in Normal/Visual, bar in Insert), so kill
-        // tui-textarea's own cell-painted cursor — otherwise it shows a
-        // REVERSED block in Insert that looks wrong against the host
-        // bar and lingers as a stray white cell at EOL.
-        textarea.set_cursor_style(Style::default());
-        // Same reason: the default UNDERLINED highlight on the cursor
-        // line is jarring for prose composition.
+        // Soft-wrap is what keeps long quoted-reply lines inside the pane.
+        // Default matches `[compose].wrap` default; `set_wrap` overrides it
+        // from config at the construction site.
+        textarea.set_wrap_mode(WrapMode::WordOrGlyph);
+        // The default UNDERLINED highlight on the whole cursor *line* is
+        // jarring for prose composition, so kill it. The cursor *cell*
+        // itself is painted by tui-textarea (see `sync_cursor_style`):
+        // under soft-wrap the crate is the only thing that knows the
+        // cursor's post-wrap/post-scroll screen position, so we can't
+        // host-drive it the way we used to.
         textarea.set_cursor_line_style(Style::default());
-        Self {
+        let mut ed = Self {
             textarea,
             mode: BodyMode::Normal,
             visual_anchor: (0, 0),
@@ -289,7 +291,23 @@ impl BodyEditor {
             yank_highlight: None,
             goal_col: GoalCol::Col(0),
             goal_anchor: 0,
-        }
+        };
+        ed.sync_cursor_style();
+        ed
+    }
+
+    /// Apply the configured soft-wrap mode. Visual-only — never inserts
+    /// newlines, so the logical line model (and every vim motion built on
+    /// it) is untouched. Called once from the construction site with
+    /// `[compose].wrap`.
+    pub fn set_wrap(&mut self, wrap: ComposeWrap) {
+        let mode = match wrap {
+            ComposeWrap::Off => WrapMode::None,
+            ComposeWrap::Word => WrapMode::Word,
+            ComposeWrap::Glyph => WrapMode::Glyph,
+            ComposeWrap::WordOrGlyph => WrapMode::WordOrGlyph,
+        };
+        self.textarea.set_wrap_mode(mode);
     }
 
     pub fn text(&self) -> String {
@@ -315,6 +333,7 @@ impl BodyEditor {
         self.yank_highlight = None;
         self.goal_col = GoalCol::Col(0);
         self.goal_anchor = 0;
+        self.sync_cursor_style();
     }
 
     /// Data-space cursor (row, col into the textarea's line vector).
@@ -326,14 +345,64 @@ impl BodyEditor {
         (row as u16, col as u16)
     }
 
-    /// DECSCUSR shape that matches the current mode. Wired up in a
-    /// future pass; today the cursor cell is rendered by tui-textarea.
-    #[allow(dead_code)]
-    pub fn cursor_style(&self) -> SetCursorStyle {
-        match self.mode {
-            BodyMode::Insert => SetCursorStyle::SteadyBar,
-            BodyMode::Replace => SetCursorStyle::SteadyUnderScore,
-            BodyMode::Normal | BodyMode::Visual(_) => SetCursorStyle::SteadyBlock,
+    /// Repaint the tui-textarea cursor cell to signal the current mode.
+    /// We used to host-drive the real terminal cursor and vary its
+    /// DECSCUSR shape (block / bar / underline); under soft-wrap the crate
+    /// owns cursor placement, so mode is approximated with a cell style:
+    /// a REVERSED block in Normal/Visual, an UNDERLINED cell in
+    /// Insert/Replace. Called after every keystroke so a mode change is
+    /// reflected on the next frame.
+    fn sync_cursor_style(&mut self) {
+        let style = match self.mode {
+            BodyMode::Insert | BodyMode::Replace => {
+                Style::default().add_modifier(Modifier::UNDERLINED)
+            }
+            BodyMode::Normal | BodyMode::Visual(_) => {
+                Style::default().add_modifier(Modifier::REVERSED)
+            }
+        };
+        self.textarea.set_cursor_style(style);
+    }
+
+    /// Register the block-wise visual selection and the yank-flash as
+    /// tui-textarea `custom_highlight`s so they render at the correct
+    /// post-wrap/post-scroll cells. Char/line visual selection is *not*
+    /// here — it rides the crate's own selection. Called once per frame
+    /// from `compose::draw`, just before the textarea is rendered.
+    ///
+    /// `custom_highlight` ranges are **byte** offsets within the logical
+    /// line (end exclusive), whereas our selection/flash ranges are char
+    /// columns, so each endpoint is converted via `char_col_to_byte`.
+    pub fn apply_overlays(&mut self) {
+        self.textarea.clear_custom_highlight();
+        let lines = self.textarea.lines();
+        let block_style = Style::default().add_modifier(Modifier::REVERSED);
+        // (start (row, byte), end (row, byte), style, priority) — collected
+        // first because `lines` holds an immutable borrow of the textarea
+        // while `custom_highlight` needs `&mut`.
+        let mut emit: Vec<HighlightSpec> = Vec::new();
+        for (row, c0, c1) in self.block_selection_ranges() {
+            let (row, c0, c1) = (row as usize, c0 as usize, c1 as usize);
+            if let Some(line) = lines.get(row) {
+                let b0 = char_col_to_byte(line, c0);
+                let b1 = char_col_to_byte(line, c1);
+                emit.push(((row, b0), (row, b1), block_style, 1));
+            }
+        }
+        if let Some(hl) = self.yank_highlight.as_ref() {
+            let yank_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+            for (row, c0, c1) in &hl.ranges {
+                let (row, c0, c1) = (*row as usize, *c0 as usize, *c1 as usize);
+                if let Some(line) = lines.get(row) {
+                    let b0 = char_col_to_byte(line, c0);
+                    let b1 = char_col_to_byte(line, c1);
+                    emit.push(((row, b0), (row, b1), yank_style, 2));
+                }
+            }
+        }
+        for (start, end, style, priority) in emit {
+            self.textarea
+                .custom_highlight((start, end), style, priority);
         }
     }
 
@@ -341,12 +410,16 @@ impl BodyEditor {
         // Refresh the reflow width each keystroke — the editor doesn't
         // hold the config, the host threads `[compose].text_width` in.
         self.text_width = if text_width == 0 { 72 } else { text_width };
-        match self.mode {
+        let outcome = match self.mode {
             BodyMode::Insert => self.handle_insert(k),
             BodyMode::Replace => self.handle_replace(k),
             BodyMode::Normal => self.handle_normal(k),
             BodyMode::Visual(kind) => self.handle_visual(k, kind),
-        }
+        };
+        // A keystroke may have changed the mode; keep the painted cursor
+        // cell in sync so its style always matches the live mode.
+        self.sync_cursor_style();
+        outcome
     }
 
     // ---------- Insert mode ----------
@@ -2174,6 +2247,21 @@ fn split_for_textarea(s: &str) -> Vec<String> {
     s.split('\n').map(str::to_string).collect()
 }
 
+/// A single `custom_highlight` registration: start `(row, byte)`, end
+/// `(row, byte)` (end exclusive), the cell style, and the layer priority.
+type HighlightSpec = ((usize, usize), (usize, usize), Style, u8);
+
+/// Byte offset of the `col`-th character in `line` (0-based, by `char`,
+/// matching the textarea's column model). Columns at or past the end of
+/// the line clamp to `line.len()`. Used to translate our char-column
+/// selection/flash ranges into the byte offsets `custom_highlight` wants.
+fn char_col_to_byte(line: &str, col: usize) -> usize {
+    line.char_indices()
+        .nth(col)
+        .map(|(b, _)| b)
+        .unwrap_or(line.len())
+}
+
 fn half_page() -> usize {
     // Vim's default is the rendered viewport / 2; without per-render
     // viewport tracking just step by a fixed amount. Eight matches
@@ -2945,5 +3033,123 @@ mod tests {
         let mut ed = BodyEditor::new("foo bar baz");
         feed(&mut ed, &[k('$'), k('g'), k('e')]);
         assert_eq!(ed.cursor(), (0, 6)); // end of "bar"
+    }
+
+    // ---------- soft-wrap ----------
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn char_col_to_byte_ascii_and_multibyte() {
+        // ASCII: byte offset == char index.
+        assert_eq!(char_col_to_byte("hello", 0), 0);
+        assert_eq!(char_col_to_byte("hello", 3), 3);
+        // At/past end clamps to the byte length.
+        assert_eq!(char_col_to_byte("hello", 5), 5);
+        assert_eq!(char_col_to_byte("hello", 99), 5);
+        // Multibyte: "é" is 2 bytes, "界" is 3, so columns advance by chars
+        // while byte offsets jump by encoded width.
+        let s = "aéb界c";
+        assert_eq!(char_col_to_byte(s, 0), 0); // a
+        assert_eq!(char_col_to_byte(s, 1), 1); // é
+        assert_eq!(char_col_to_byte(s, 2), 3); // b
+        assert_eq!(char_col_to_byte(s, 3), 4); // 界
+        assert_eq!(char_col_to_byte(s, 4), 7); // c
+        assert_eq!(char_col_to_byte(s, 5), 8); // end
+    }
+
+    /// Render the editor's textarea into a fixed-size test buffer and
+    /// return one row's visible text (trailing blanks trimmed).
+    fn render_rows(ed: &BodyEditor, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| f.render_widget(&ed.textarea, Rect::new(0, 0, w, h)))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn long_line_soft_wraps_onto_multiple_rows() {
+        // Default wrap (WordOrGlyph): a line wider than the pane spills onto
+        // the next visual row instead of scrolling off the right edge.
+        let ed = BodyEditor::new("the quick brown fox jumps");
+        let rows = render_rows(&ed, 12, 4);
+        assert!(rows[0].starts_with("the quick"), "row 0: {:?}", rows[0]);
+        assert!(
+            !rows[1].is_empty(),
+            "long line should continue on row 1, got {rows:?}"
+        );
+        // No row exceeds the pane width (nothing ran off-screen).
+        assert!(rows.iter().all(|r| r.chars().count() <= 12));
+    }
+
+    #[test]
+    fn wrap_off_keeps_one_logical_row() {
+        // With wrap disabled the logical line stays on a single visual row
+        // (horizontal scroll), so row 1 is blank.
+        let mut ed = BodyEditor::new("the quick brown fox jumps");
+        ed.set_wrap(ComposeWrap::Off);
+        let rows = render_rows(&ed, 12, 4);
+        assert!(rows[1].is_empty(), "no wrap → row 1 empty, got {rows:?}");
+    }
+
+    #[test]
+    fn cursor_style_tracks_mode() {
+        let mut ed = BodyEditor::new("hello world");
+        // Normal: REVERSED block.
+        assert!(
+            ed.textarea
+                .cursor_style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        // Insert: UNDERLINED.
+        feed(&mut ed, &[k('i')]);
+        assert!(
+            ed.textarea
+                .cursor_style()
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        // Back to Normal.
+        feed(&mut ed, &[esc()]);
+        assert!(
+            ed.textarea
+                .cursor_style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn block_selection_registers_reversed_overlay() {
+        // Ctrl-V block-select two columns on row 0, then ensure the overlay
+        // renders as REVERSED cells via custom_highlight (not a bespoke
+        // painter). "ab" at cols 0..=1.
+        let mut ed = BodyEditor::new("abcd\nefgh");
+        feed(&mut ed, &[ctrl('v'), k('j'), k('l')]);
+        ed.apply_overlays();
+        let mut term = Terminal::new(TestBackend::new(8, 4)).unwrap();
+        term.draw(|f| f.render_widget(&ed.textarea, Rect::new(0, 0, 8, 4)))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        // Column 0 of both selected rows should carry REVERSED.
+        for y in 0..=1u16 {
+            let m = buf.cell((0, y)).unwrap().modifier;
+            assert!(
+                m.contains(Modifier::REVERSED),
+                "cell (0,{y}) should be REVERSED, modifier = {m:?}"
+            );
+        }
     }
 }

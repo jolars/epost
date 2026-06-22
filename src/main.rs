@@ -306,52 +306,17 @@ fn collect_cursor_style_escapes(app: &mut App) -> Vec<u8> {
             bytes.extend_from_slice(format!("\x1b[{shape} q").as_bytes());
         }
     }
-    // Native compose body editor: emit DECSCUSR based on the focused
-    // body's mode (steady block in Normal/Visual, steady bar in Insert).
-    // Only the active tab counts — tabbing away from a compose tab
-    // resets the shape to terminal default. Tracked on App so we emit
-    // only on transitions instead of every frame.
-    let desired_native = native_body_cursor_shape(app);
-    if desired_native != app.native_cursor_shape_emitted {
-        match desired_native {
-            Some(shape) => {
-                bytes.extend_from_slice(format!("\x1b[{shape} q").as_bytes());
-            }
-            None => {
-                bytes.extend_from_slice(b"\x1b[0 q");
-            }
-        }
-        app.native_cursor_shape_emitted = desired_native;
-    }
+    // The native compose body editor no longer drives the real terminal
+    // cursor: under soft-wrap tui-textarea owns cursor placement and paints
+    // the cursor *cell* itself (styled by mode in `sync_cursor_style`), so
+    // we don't emit DECSCUSR for it and the hardware cursor stays hidden.
+    // Only the embedded `$EDITOR` path above touches cursor shape; its exit
+    // queues the reset below.
     if app.cursor_style_reset_pending {
         app.cursor_style_reset_pending = false;
-        // The pending-reset path also clears our tracked shape so the
-        // next focus into a compose body re-emits its shape from scratch.
-        app.native_cursor_shape_emitted = None;
         bytes.extend_from_slice(b"\x1b[0 q");
     }
     bytes
-}
-
-/// Desired DECSCUSR param for the native compose body editor on the
-/// active tab. `None` when no native body is focused (either we're on
-/// the inbox, on a compose tab with a different field focused, or the
-/// compose tab is running `$EDITOR` and thus drives the shape itself).
-fn native_body_cursor_shape(app: &App) -> Option<u16> {
-    use ui::compose::ComposeField;
-    use ui::compose_body::BodyMode;
-    let screen = app.screens.get(app.active)?;
-    let ui::app::Screen::Compose(c) = screen else {
-        return None;
-    };
-    if c.editor.is_some() || c.focused != ComposeField::Body {
-        return None;
-    }
-    Some(match c.body.mode {
-        BodyMode::Insert => 6,                       // steady bar
-        BodyMode::Replace => 4,                      // steady underline
-        BodyMode::Normal | BodyMode::Visual(_) => 2, // steady block
-    })
 }
 
 fn finalize_finished_editors(app: &mut App) {

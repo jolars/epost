@@ -296,7 +296,8 @@ mod tests {
             references: Vec::new(),
             attachments: Vec::new(),
         };
-        let mut s = ComposeScreen::from_draft(draft).unwrap();
+        let mut s =
+            ComposeScreen::from_draft(draft, crate::config::ComposeWrap::default()).unwrap();
         s.set_focus(ComposeField::To);
         // from_draft seeds the To row from the joined draft addresses; for
         // these tests park the cursor on the first char (Normal default).

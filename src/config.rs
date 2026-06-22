@@ -269,6 +269,10 @@ pub struct Compose {
     /// Default 72 — the conventional plain-text mail body width.
     #[serde(default = "default_text_width")]
     pub text_width: u16,
+    /// Soft-wrap mode for the native body editor. Visual-only (no newlines
+    /// inserted); default `word-or-glyph`. See [`ComposeWrap`].
+    #[serde(default)]
+    pub wrap: ComposeWrap,
 }
 
 impl Default for Compose {
@@ -279,6 +283,7 @@ impl Default for Compose {
             send_delay_secs: default_send_delay_secs(),
             address_book: AddressBook::default(),
             text_width: default_text_width(),
+            wrap: ComposeWrap::default(),
         }
     }
 }
@@ -342,6 +347,22 @@ pub enum ComposeMode {
     #[default]
     Native,
     External,
+}
+
+/// Soft-wrap mode for the native compose body editor. Visual-only: long
+/// logical lines wrap to the body pane width at render time, no newlines
+/// are inserted, so the sent message keeps its long lines. `word-or-glyph`
+/// (default) wraps at word boundaries and falls back to per-glyph wrapping
+/// for words wider than the pane (e.g. long URLs); `off` keeps the old
+/// horizontal-scroll behaviour.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComposeWrap {
+    Off,
+    Word,
+    Glyph,
+    #[default]
+    WordOrGlyph,
 }
 
 /// Resolve the editor argv at spawn time. Done late (not at parse) so
@@ -577,6 +598,27 @@ fn expand_tilde(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_wrap_defaults_to_word_or_glyph() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.compose.wrap, ComposeWrap::WordOrGlyph);
+    }
+
+    #[test]
+    fn compose_wrap_parses_kebab_values() {
+        let cfg: Config = toml::from_str("[compose]\nwrap = \"off\"\n").unwrap();
+        assert_eq!(cfg.compose.wrap, ComposeWrap::Off);
+        let cfg: Config = toml::from_str("[compose]\nwrap = \"word-or-glyph\"\n").unwrap();
+        assert_eq!(cfg.compose.wrap, ComposeWrap::WordOrGlyph);
+        let cfg: Config = toml::from_str("[compose]\nwrap = \"word\"\n").unwrap();
+        assert_eq!(cfg.compose.wrap, ComposeWrap::Word);
+    }
+
+    #[test]
+    fn compose_wrap_rejects_unknown() {
+        assert!(toml::from_str::<Config>("[compose]\nwrap = \"nope\"\n").is_err());
+    }
 
     #[test]
     fn primary_account_returns_flagged_one() {

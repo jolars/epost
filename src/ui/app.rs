@@ -352,13 +352,6 @@ pub struct App {
     /// loop drains this and emits `CSI 0 SP q` so the rest of the app
     /// (and the user's shell after exit) doesn't inherit a stuck shape.
     pub cursor_style_reset_pending: bool,
-    /// Last DECSCUSR shape param emitted for the native compose body
-    /// editor (steady block in Normal/Visual, steady bar in Insert).
-    /// Tracked here so the main draw loop only emits the escape on
-    /// actual transitions instead of every frame. `None` means we
-    /// haven't emitted a native-editor shape yet (or it has since been
-    /// reset to the terminal default).
-    pub native_cursor_shape_emitted: Option<u16>,
     /// Undo/redo for message-view mutations (moves + flag flips).
     /// Recorded by the user-initiated wrappers (`toggle_flag_selected_user`,
     /// `move_selected_to_user`) — internal callsites like auto-Seen
@@ -676,7 +669,6 @@ impl App {
             address_debounce_until: None,
             event_tx,
             cursor_style_reset_pending: false,
-            native_cursor_shape_emitted: None,
             undo_stack: UndoStack::new(),
         }
     }
