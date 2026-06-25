@@ -785,6 +785,7 @@ fn send_active(app: &mut App, cfg: &Config) {
     };
     let account_name = c.account.clone();
     let origin_draft_path = c.origin_draft_path.clone();
+    let reply_origin = c.reply_origin.clone();
     let draft = match c.collect_draft() {
         Ok(d) => d,
         Err(e) => {
@@ -826,6 +827,7 @@ fn send_active(app: &mut App, cfg: &Config) {
         cancel_tx: handle.cancel_tx,
         label: label.clone(),
         origin_draft_path,
+        reply_origin,
     });
     // `:send` always runs on a compose tab, so close_active_tab won't
     // touch the inbox. Surface the close error defensively just in case.
@@ -1147,6 +1149,11 @@ pub fn open_reply(app: &mut App, cfg: &Config, kind: ReplyKind) {
             return;
         }
     };
+    // A reply (but not a forward) marks the original Replied (`R`) on send.
+    let reply_origin = match kind {
+        ReplyKind::Reply | ReplyKind::ReplyAll => Some(MsgRef::of(&row)),
+        ReplyKind::Forward => None,
+    };
     let draft = match kind {
         ReplyKind::Reply => Draft::reply_to(&headers, &body, &row.account, &from, false),
         ReplyKind::ReplyAll => Draft::reply_to(&headers, &body, &row.account, &from, true),
@@ -1154,6 +1161,7 @@ pub fn open_reply(app: &mut App, cfg: &Config, kind: ReplyKind) {
     };
     match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
         Ok(mut screen) => {
+            screen.reply_origin = reply_origin;
             if matches!(cfg.compose.mode, config::ComposeMode::External) {
                 screen.editor_pending = true;
             }

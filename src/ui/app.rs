@@ -389,6 +389,10 @@ pub struct PendingSend {
     /// `SentNoCopy` and on send failure so the user has a recovery
     /// copy. `None` for fresh-compose / reply / forward sends.
     pub origin_draft_path: Option<PathBuf>,
+    /// Original message this send is a reply to (`:reply` / `:reply-all`).
+    /// On a successful send the maildir Replied (`R`) flag is set on it so
+    /// the list shows the ↩ indicator. `None` for fresh compose and forward.
+    pub reply_origin: Option<MsgRef>,
 }
 
 /// Per-screen state for the maildir reader: pane visibility/focus, scan
@@ -757,6 +761,18 @@ impl App {
                                 self.self_writes.consume(path);
                             }
                         }
+                    }
+                    // The mail went out for both `Sent` and `SentNoCopy`
+                    // (the latter only failed the Sent-folder copy), so a
+                    // reply marks its original Replied in both cases — but
+                    // not on `Cancelled` (the user aborted in the delay
+                    // window) or `Err`.
+                    if matches!(
+                        result,
+                        Ok(SendOutcome::Sent) | Ok(SendOutcome::SentNoCopy(_))
+                    ) && let Some(origin) = pending.reply_origin.as_ref()
+                    {
+                        self.mark_replied(origin);
                     }
                     self.status_error = Some(format_send_status(&pending.label, result));
                 }
@@ -1207,6 +1223,64 @@ impl App {
             })
         } else {
             None
+        }
+    }
+
+    /// Set the maildir Replied (`R`) flag on `target`, the message a
+    /// just-sent reply answered. Idempotent and an automatic side effect of
+    /// a successful reply send, so it records no undo entry. When the
+    /// original is in the current scope's view the in-memory list + index
+    /// are patched so the ↩ glyph repaints live; otherwise the file is
+    /// flipped on disk via the index so the flag is correct after the next
+    /// rescan.
+    pub fn mark_replied(&mut self, target: &MsgRef) {
+        let in_view = {
+            let Self {
+                screens,
+                cache_path,
+                self_writes,
+                status_error,
+                ..
+            } = self;
+            let Some(Screen::Inbox(inbox)) = screens.get_mut(0) else {
+                unreachable!("inbox is pinned at index 0")
+            };
+            inbox.set_flag_msgid('R', target, cache_path, self_writes, status_error)
+        };
+        if !in_view {
+            self.mark_replied_via_index(target);
+        }
+    }
+
+    /// Fallback for [`App::mark_replied`] when the original isn't in the
+    /// current view: resolve its file through the index, set `R` on disk
+    /// (idempotently), and mirror the new path/flags back into the index.
+    fn mark_replied_via_index(&mut self, target: &MsgRef) {
+        let row = match Index::open(&self.cache_path)
+            .and_then(|idx| idx.get(&target.msgid, &target.account, &target.folder))
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return, // not indexed (e.g. moved/expunged) — nothing to flag
+            Err(e) => {
+                self.status_error = Some(format!("mark replied: {e:#}"));
+                return;
+            }
+        };
+        if row.flags.contains('R') {
+            return;
+        }
+        match flags::set_flag_recorded(&row.path, 'R', FlagOp::Add, &self.self_writes) {
+            Ok((new_path, new_flags)) => {
+                let mut updated = row;
+                updated.path = new_path;
+                updated.flags = new_flags;
+                if let Err(e) = mirror_to_index(&self.cache_path, &updated) {
+                    self.status_error = Some(format!("mark replied: index mirror: {e:#}"));
+                }
+            }
+            Err(e) => {
+                self.status_error = Some(format!("mark replied: {e}"));
+            }
         }
     }
 
@@ -2286,6 +2360,36 @@ impl InboxScreen {
                 false
             }
         }
+    }
+
+    /// Add `flag` to the in-view message, idempotently (unlike the toggling
+    /// `toggle_flag_msgid`). Returns `false` only when `target` isn't in the
+    /// current in-memory view, so the caller can fall back to the index;
+    /// returns `true` when the flag was set or was already present.
+    pub fn set_flag_msgid(
+        &mut self,
+        flag: char,
+        target: &MsgRef,
+        cache_path: &Path,
+        self_writes: &SelfWrites,
+        status_error: &mut Option<String>,
+    ) -> bool {
+        let Some(row) = self.find_row(target) else {
+            return false;
+        };
+        if row.flags.contains(flag) {
+            return true; // already set — nothing to do, but it is in view
+        }
+        let path = row.path.clone();
+        match flags::set_flag_recorded(&path, flag, FlagOp::Add, self_writes) {
+            Ok((new_path, new_flags)) => {
+                self.apply_flag_change(target, &new_path, &new_flags, cache_path, status_error);
+            }
+            Err(e) => {
+                *status_error = Some(format!("flag {flag}: {e}"));
+            }
+        }
+        true
     }
 
     /// Rename `msgid`'s file into `<account_maildir>/.<folder>/cur/`,

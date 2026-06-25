@@ -23,6 +23,7 @@ use crate::config::{ComposeWrap, Config};
 use crate::mail::compose as mail_compose;
 use crate::mail::compose::Draft;
 use crate::ui::address_complete::{self, AddressCompleteState};
+use crate::ui::app::MsgRef;
 pub use crate::ui::compose_body::KeyOutcome;
 use crate::ui::compose_body::{BodyEditor, BodyMode, VisualKind};
 use crate::ui::compose_header::{self, HeaderMode};
@@ -136,6 +137,12 @@ pub struct ComposeScreen {
     /// success uses it to delete the stale draft file. `None` for fresh
     /// `:compose`, `:reply`, and `:forward` flows.
     pub origin_draft_path: Option<PathBuf>,
+    /// The original message this tab is a reply to, captured at `:reply` /
+    /// `:reply-all` open time. On a successful send the host loop sets the
+    /// maildir Replied (`R`) flag on it so the list shows a ↩ indicator.
+    /// `None` for fresh `:compose` and for `:forward` (forwarding is not a
+    /// reply, so it must not mark the original replied).
+    pub reply_origin: Option<MsgRef>,
     /// Open close-confirm prompt. `Some` while the "Save / Discard /
     /// Cancel" overlay is up; `None` ambient. Set by `:close` when the
     /// composer is dirty; cleared by Cancel (or by Save on success).
@@ -226,6 +233,7 @@ impl ComposeScreen {
             pending_status: None,
             from_picker: None,
             origin_draft_path: None,
+            reply_origin: None,
             confirm_close: None,
             address_complete: None,
             address_complete_suppressed: None,

@@ -283,8 +283,9 @@ fn render_search_row(
     let unread = !flags.contains('S');
     let flagged = flags.contains('F');
     let trashed = flags.contains('T');
+    let replied = flags.contains('R');
 
-    let flag_glyph = if flagged { "★ " } else { "  " };
+    let (flag_span, replied_span) = flag_spans(flagged, replied);
     let flag_cells: usize = 2;
 
     let mut subj_mods = Modifier::empty();
@@ -326,7 +327,8 @@ fn render_search_row(
     Line::from(vec![
         Span::styled(from_span, Style::default().fg(Color::Cyan)),
         Span::styled(folder_span, Style::default().fg(Color::Magenta)),
-        Span::styled(flag_glyph.to_string(), Style::default().fg(Color::Yellow)),
+        flag_span,
+        replied_span,
         Span::styled(subject_truncated, subj_style),
         Span::raw(filler),
         Span::styled(date_label, Style::default().fg(Color::DarkGray)),
@@ -351,11 +353,12 @@ fn render_row(t: &ThreadedRow, width: usize, now: &Zoned) -> Line<'static> {
     let unread = !flags.contains('S');
     let flagged = flags.contains('F');
     let trashed = flags.contains('T');
+    let replied = flags.contains('R');
 
-    // Fixed 2-cell flag column: ★ + space when Flagged, two spaces
-    // otherwise. Budgeted as 2 cells below; ★ is multi-byte so a `.len()`
-    // would mis-budget.
-    let flag_glyph = if flagged { "★ " } else { "  " };
+    // Fixed 2-cell flag column: a ★ cell (yellow) when Flagged and a ↩ cell
+    // (green) when Replied, each a space otherwise. Budgeted as 2 cells below;
+    // the glyphs are multi-byte so a `.len()` would mis-budget.
+    let (flag_span, replied_span) = flag_spans(flagged, replied);
     let flag_cells: usize = 2;
 
     let mut subj_mods = Modifier::empty();
@@ -388,7 +391,8 @@ fn render_row(t: &ThreadedRow, width: usize, now: &Zoned) -> Line<'static> {
 
     Line::from(vec![
         Span::styled(from_span, Style::default().fg(Color::Cyan)),
-        Span::styled(flag_glyph.to_string(), Style::default().fg(Color::Yellow)),
+        flag_span,
+        replied_span,
         Span::raw(indent),
         Span::styled(arrow.to_string(), Style::default().fg(Color::DarkGray)),
         Span::styled(subject_truncated, subj_style),
@@ -399,6 +403,19 @@ fn render_row(t: &ThreadedRow, width: usize, now: &Zoned) -> Line<'static> {
 
 fn disp_w(s: &str) -> usize {
     UnicodeWidthStr::width(s)
+}
+
+/// The two single-cell spans of the fixed-width flag column: a yellow ★ when
+/// the message is Flagged (`F`) and a green ↩ when it has been Replied to
+/// (`R`), each a blank cell otherwise. Kept to a 2-cell total so the subject
+/// budget math is unchanged. Shared by the threaded and search row renderers.
+fn flag_spans(flagged: bool, replied: bool) -> (Span<'static>, Span<'static>) {
+    let flag = if flagged { "★" } else { " " };
+    let reply = if replied { "↩" } else { " " };
+    (
+        Span::styled(flag, Style::default().fg(Color::Yellow)),
+        Span::styled(reply, Style::default().fg(Color::Green)),
+    )
 }
 
 /// Relative date label. `now` is the local-zoned wall clock for this frame;
@@ -507,6 +524,22 @@ mod tests {
         // A previous year → year + full month + day.
         // 2025-04-09 00:00 UTC = 1744156800.
         assert_eq!(format_date(1_744_156_800, &now), "2025 April 9");
+    }
+
+    #[test]
+    fn flag_spans_reflect_flagged_and_replied() {
+        let cells = |flagged, replied| {
+            let (f, r) = flag_spans(flagged, replied);
+            (f.content.to_string(), r.content.to_string())
+        };
+        // Neither flag: both cells blank, column stays 2 wide.
+        assert_eq!(cells(false, false), (" ".into(), " ".into()));
+        // Flagged only: ★ in the first cell, replied cell blank.
+        assert_eq!(cells(true, false), ("★".into(), " ".into()));
+        // Replied only: ↩ in the second cell, flag cell blank.
+        assert_eq!(cells(false, true), (" ".into(), "↩".into()));
+        // Both: ★ and ↩ side by side.
+        assert_eq!(cells(true, true), ("★".into(), "↩".into()));
     }
 
     #[test]
