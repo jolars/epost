@@ -1,5 +1,5 @@
 {
-  description = "epost — linux maildir email reader/composer";
+  description = "epost: linux maildir email reader/composer";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
