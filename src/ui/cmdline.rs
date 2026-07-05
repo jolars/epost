@@ -245,7 +245,7 @@ fn move_named(app: &mut App, cfg: &Config, kind: MoveKind) {
         return;
     }
     let label = kind.label();
-    let Some(row) = app.inbox().selected_row().map(|t| t.row.clone()) else {
+    let Some(row) = app.inbox().selected_message_row().cloned() else {
         app.status_error = Some(format!("{label}: no message selected"));
         return;
     };
@@ -1043,7 +1043,7 @@ fn open_blank_compose(app: &mut App, cfg: &Config) {
 /// opening a known-Drafts row surface in the status row and still
 /// return `true`; the caller treats them as "handled."
 pub fn resume_selected_draft_if_drafts(app: &mut App, cfg: &Config) -> bool {
-    let Some(row) = app.inbox().selected_row().map(|t| t.row.clone()) else {
+    let Some(row) = app.inbox().selected_message_row().cloned() else {
         return false;
     };
     let Some(account) = cfg.accounts.get(&row.account) else {
@@ -1122,7 +1122,7 @@ pub fn open_reply(app: &mut App, cfg: &Config, kind: ReplyKind) {
         ReplyKind::ReplyAll => "reply-all",
         ReplyKind::Forward => "forward",
     };
-    let Some(row) = app.inbox().selected_row().map(|t| t.row.clone()) else {
+    let Some(row) = app.inbox().selected_message_row().cloned() else {
         app.status_error = Some(format!("{label}: no message selected"));
         return;
     };
