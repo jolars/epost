@@ -9,14 +9,34 @@
 //! read them; `xdg-open` returns immediately, so the worker doesn't
 //! wait. `open_url` hands a single URL/path through to the same command.
 
+use std::ffi::OsString;
 use std::io::Write;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow};
 use tempfile::Builder;
 
 use crate::mail::parse::Attachment;
 use crate::ui::app::ParsedBody;
+
+/// Run `cmd` with `target` appended, on a detached worker thread, with all
+/// stdio nulled. The null stdio is load-bearing: the child would otherwise
+/// inherit the TUI's terminal, and anything it prints (e.g. `xdg-open`
+/// usage output on a bad argument) lands in the alternate screen and
+/// corrupts the frame.
+fn spawn_opener(cmd: Vec<String>, target: OsString) {
+    std::thread::spawn(move || {
+        let mut c = Command::new(&cmd[0]);
+        for arg in &cmd[1..] {
+            c.arg(arg);
+        }
+        c.arg(&target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = c.status();
+    });
+}
 
 pub fn open_message(body: &ParsedBody, cmd: &[String]) -> Result<()> {
     if cmd.is_empty() {
@@ -58,15 +78,7 @@ pub fn open_message(body: &ParsedBody, cmd: &[String]) -> Result<()> {
     let html_path = html_tmp.path().to_path_buf();
     drop(html_tmp);
 
-    let cmd = cmd.to_vec();
-    std::thread::spawn(move || {
-        let mut c = Command::new(&cmd[0]);
-        for arg in &cmd[1..] {
-            c.arg(arg);
-        }
-        c.arg(&html_path);
-        let _ = c.status();
-    });
+    spawn_opener(cmd.to_vec(), html_path.into_os_string());
     Ok(())
 }
 
@@ -98,15 +110,7 @@ pub fn open_attachment(att: &Attachment, cmd: &[String]) -> Result<()> {
     let path = tmp.path().to_path_buf();
     drop(tmp);
 
-    let cmd = cmd.to_vec();
-    std::thread::spawn(move || {
-        let mut c = Command::new(&cmd[0]);
-        for arg in &cmd[1..] {
-            c.arg(arg);
-        }
-        c.arg(&path);
-        let _ = c.status();
-    });
+    spawn_opener(cmd.to_vec(), path.into_os_string());
     Ok(())
 }
 
@@ -139,15 +143,7 @@ pub fn drag_attachment(att: &Attachment, cmd: Option<&[String]>) -> Result<()> {
     let path = tmp.path().to_path_buf();
     drop(tmp);
 
-    let cmd = cmd.to_vec();
-    std::thread::spawn(move || {
-        let mut c = Command::new(&cmd[0]);
-        for arg in &cmd[1..] {
-            c.arg(arg);
-        }
-        c.arg(&path);
-        let _ = c.status();
-    });
+    spawn_opener(cmd.to_vec(), path.into_os_string());
     Ok(())
 }
 
@@ -155,16 +151,10 @@ pub fn open_url(href: &str, cmd: &[String]) -> Result<()> {
     if cmd.is_empty() {
         return Err(anyhow!("no browser command configured"));
     }
-    let cmd = cmd.to_vec();
-    let href = href.to_string();
-    std::thread::spawn(move || {
-        let mut c = Command::new(&cmd[0]);
-        for arg in &cmd[1..] {
-            c.arg(arg);
-        }
-        c.arg(&href);
-        let _ = c.status();
-    });
+    if href.trim().is_empty() {
+        return Err(anyhow!("link has no target"));
+    }
+    spawn_opener(cmd.to_vec(), href.into());
     Ok(())
 }
 
@@ -224,6 +214,15 @@ mod tests {
             lines.iter().any(|l| l.contains("example.test")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn open_url_empty_href_errors() {
+        let cmd = vec!["xdg-open".to_string()];
+        let err = open_url("", &cmd).unwrap_err().to_string();
+        assert!(err.contains("no target"), "{err}");
+        let err = open_url("  ", &cmd).unwrap_err().to_string();
+        assert!(err.contains("no target"), "{err}");
     }
 
     #[test]
