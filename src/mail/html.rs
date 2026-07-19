@@ -242,7 +242,15 @@ fn walk_inline(node: &Handle, buf: &mut Vec<Inline>, parent_style: InlineStyle) 
                 for child in node.children.borrow().iter() {
                     walk_inline_child(child, &mut runs, parent_style);
                 }
-                if !runs.is_empty() {
+                if runs.is_empty() {
+                    return;
+                }
+                if href.trim().is_empty() {
+                    // Styling-only anchor with no target: keep the text but
+                    // don't emit a link, so it gets no pick id and can't be
+                    // "followed" into `xdg-open ""`.
+                    buf.extend(runs);
+                } else {
                     buf.push(Inline::Link { href, runs });
                 }
                 return;
@@ -653,6 +661,31 @@ mod tests {
         let (href, inner) = link.expect("link");
         assert_eq!(href, "https://x.example/");
         assert_eq!(inner, vec![text("here")]);
+    }
+
+    #[test]
+    fn anchor_without_href_keeps_text_but_no_link() {
+        // Styling-only anchors (no href, or href="") must not become
+        // links: they'd get pick ids and "following" one would hand an
+        // empty argument to the browser command.
+        let blocks =
+            parse(r#"<p><a style="color:inherit">Search Console</a> and <a href="">more</a></p>"#);
+        let Block::Paragraph(runs) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            !runs.iter().any(|r| matches!(r, Inline::Link { .. })),
+            "{runs:?}"
+        );
+        let text: String = runs
+            .iter()
+            .filter_map(|r| match r {
+                Inline::Text { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("Search Console"), "{text:?}");
+        assert!(text.contains("more"), "{text:?}");
     }
 
     #[test]
