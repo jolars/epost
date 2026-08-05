@@ -1390,7 +1390,14 @@ fn render_headers(inbox: &InboxScreen) -> Vec<Line<'static>> {
         "Subject",
         row.subject.as_deref().unwrap_or("(no subject)"),
     ));
-    out.push(header_line("Folder", &row.folder));
+    // `account · folder`, mirroring the INBOX tab badge's grammar
+    // (`ui/tabs.rs::inbox_label`). Always shown, including inside a
+    // single-account scope: the reader is where a reply gets started, and
+    // the reply's From is picked from the owning account.
+    out.push(header_line(
+        "Folder",
+        &format!("{} · {}", row.account, row.folder),
+    ));
     if !row.flags.is_empty() {
         out.push(header_line("Flags", &row.flags));
     }

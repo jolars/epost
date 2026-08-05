@@ -30,6 +30,19 @@ usability gap.
       frequent first), or pull through the index instead of walking on each
       startup.
 
+## Reader
+
+- **`To:` / `Cc:` header rows.** Standard mail-client info the reader doesn't
+  show today (direct recipient vs cc'd vs list mail). Note this is *not* an
+  account indicator --- the `Folder: account · folder` row covers that; on
+  BCC'd and list mail the reader's own address isn't in `To:` at all, and an
+  alias there doesn't identify the owning account. Plumbing: `parse::Body`
+  doesn't carry recipients, so `parse_body` needs to capture `to`/`cc` (the
+  extraction already exists in `parse_headers`) and `render_headers` needs to
+  read them off `ParsedBody` rather than the index `MessageRow`. Long
+  recipient lists want an elide (`a@x, b@y, +3 more`) so the header block
+  doesn't push the body offscreen.
+
 ## Multi-account follow-ups
 
 - **Account ordering config.** Today's order is alphabetic by `cfg.accounts`
