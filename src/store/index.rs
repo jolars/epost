@@ -49,6 +49,15 @@ impl Index {
         // realistic per-transaction write time.
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .context("setting busy_timeout")?;
+        // WAL + `synchronous = NORMAL` skips the per-commit fsync (the WAL
+        // is still fsynced at checkpoints). The window it opens is losing
+        // the last few transactions on a power cut or kernel panic — not
+        // on a process crash — and the index is a disposable cache
+        // reconstructible from the maildir (DESIGN.md invariant: maildir
+        // is truth), so that is the right trade for a write path the UI
+        // thread sits on.
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .context("setting synchronous=NORMAL")?;
         migrate(&conn)?;
         Ok(Self { conn })
     }
@@ -90,6 +99,86 @@ impl Index {
             )
             .context("upserting msg row")?;
         Ok(())
+    }
+
+    /// Upsert a batch of rows inside a single transaction.
+    ///
+    /// A folder rescan used to upsert row-by-row in autocommit, which is
+    /// one write transaction (and one WAL fsync) per message: walking a
+    /// 10k-message Trash cost seconds and held the single sqlite writer
+    /// slot in a tight loop, so the UI thread's own index writes (every
+    /// `d`, every flag flip) queued behind it on `busy_timeout` backoff.
+    /// One transaction for the whole folder keeps the writer lock held
+    /// for the write burst only, not for the disk walk that produced it.
+    pub fn upsert_many(&mut self, rows: &[MessageRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction().context("begin upsert_many")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO msg(msgid, account, folder, path, date, from_addr, subject, in_reply, refs, flags) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                     ON CONFLICT(msgid, account, folder) DO UPDATE SET \
+                       path=excluded.path, \
+                       date=excluded.date, \
+                       from_addr=excluded.from_addr, \
+                       subject=excluded.subject, \
+                       in_reply=excluded.in_reply, \
+                       refs=excluded.refs, \
+                       flags=excluded.flags",
+                )
+                .context("preparing upsert_many")?;
+            for row in rows {
+                stmt.execute(params![
+                    row.msgid,
+                    row.account,
+                    row.folder,
+                    row.path.to_string_lossy(),
+                    row.date,
+                    row.from_addr,
+                    row.subject,
+                    row.in_reply,
+                    row.refs.join(" "),
+                    row.flags,
+                ])
+                .context("executing upsert_many")?;
+            }
+        }
+        tx.commit().context("committing upsert_many")?;
+        Ok(())
+    }
+
+    /// `path -> msgid` for every row indexed under `(account, folder)`.
+    ///
+    /// Drives the rescan's skip check. A maildir filename encodes both
+    /// identity and flags, so a directory entry whose exact path is
+    /// already indexed cannot have changed in any way we track — rewriting
+    /// an existing maildir file in place is a spec violation, and the
+    /// watcher already drops `Modify(Data)` events on that basis. Letting
+    /// the rescan skip those files turns a re-walk of a large folder from
+    /// "read and MIME-parse every message" into a `readdir` plus hash
+    /// lookups.
+    pub fn folder_paths(
+        &self,
+        account: &str,
+        folder: &str,
+    ) -> Result<std::collections::HashMap<PathBuf, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, msgid FROM msg WHERE account = ?1 AND folder = ?2")
+            .context("preparing folder_paths")?;
+        let rows = stmt
+            .query_map(params![account, folder], |r| {
+                Ok((
+                    PathBuf::from(r.get::<_, String>(0)?),
+                    r.get::<_, String>(1)?,
+                ))
+            })
+            .context("executing folder_paths")?;
+        rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+            .context("collecting folder_paths")
     }
 
     /// Drop rows for `(account, folder)` whose `msgid` is not in `keep`.

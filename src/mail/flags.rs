@@ -230,8 +230,8 @@ pub fn set_flag_recorded(
     match do_rename(current_path, &new_path) {
         Ok(()) => Ok((new_path, new_flags)),
         Err(e) => {
-            sw.consume(current_path);
-            sw.consume(&new_path);
+            sw.forget(current_path);
+            sw.forget(&new_path);
             Err(e)
         }
     }
@@ -251,8 +251,8 @@ pub fn move_to_folder_recorded(
     match do_rename(current_path, &new_path) {
         Ok(()) => Ok(new_path),
         Err(e) => {
-            sw.consume(current_path);
-            sw.consume(&new_path);
+            sw.forget(current_path);
+            sw.forget(&new_path);
             Err(e)
         }
     }

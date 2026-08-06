@@ -33,8 +33,23 @@ use crate::ui::events::AppEvent;
 
 // ---------- SelfWrites ----------
 
+/// How long a recorded self-write stays suppressible. One `rename(2)`
+/// does *not* produce one inotify event: Linux fires `IN_MOVED_FROM` on
+/// the source directory and `IN_MOVED_TO` on the destination, and
+/// `notify` additionally synthesises the cookie-paired
+/// `Modify(Name(Both))` — so the same path arrives up to twice. A
+/// registry that dropped the entry on first match therefore suppressed
+/// the From/To pair and then let the coalesced `Both` event through,
+/// marking both the source and destination folders dirty and kicking a
+/// full rescan of (typically enormous) Trash/Archive after every `d`.
+/// Entries are matched by presence and expire on a timer instead, so
+/// every echo of one rename is covered. Two seconds is far above the
+/// inotify delivery latency and far below any interval at which an
+/// external tool would plausibly recreate the exact same filename.
+const SELF_WRITE_TTL: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Default)]
-pub struct SelfWrites(Arc<Mutex<HashSet<PathBuf>>>);
+pub struct SelfWrites(Arc<Mutex<HashMap<PathBuf, Instant>>>);
 
 impl SelfWrites {
     pub fn new() -> Self {
@@ -46,17 +61,30 @@ impl SelfWrites {
     /// suppresses both the delete and the create event.
     pub fn record(&self, path: impl Into<PathBuf>) {
         let mut g = self.0.lock().expect("SelfWrites poisoned");
-        g.insert(normalize(&path.into()));
+        let now = Instant::now();
+        g.retain(|_, at| now.duration_since(*at) < SELF_WRITE_TTL);
+        g.insert(normalize(&path.into()), now);
     }
 
-    /// Returns true iff `path` was registered by us, removing it so a
-    /// later genuinely-external write on the same path is not swallowed.
-    /// Called by the notify watcher to skip echoes of our own renames,
-    /// and by the `_recorded` flag-flow wrappers to clean up after a
-    /// failed rename.
+    /// Returns true iff `path` was registered by us within
+    /// [`SELF_WRITE_TTL`]. Called by the notify watcher to skip echoes of
+    /// our own renames. Deliberately *non*-consuming: one rename lands as
+    /// several events naming the same path, and all of them are ours.
+    /// Expired entries are dropped in passing so a genuinely external
+    /// write on the same path later is not swallowed.
     pub fn consume(&self, path: &Path) -> bool {
         let mut g = self.0.lock().expect("SelfWrites poisoned");
-        g.remove(&normalize(path))
+        let now = Instant::now();
+        g.retain(|_, at| now.duration_since(*at) < SELF_WRITE_TTL);
+        g.contains_key(&normalize(path))
+    }
+
+    /// Drop a registration outright. Used by the `_recorded` wrappers to
+    /// clean up after a rename that failed: no event is coming, so the
+    /// entry must not linger and swallow an unrelated external write.
+    pub fn forget(&self, path: &Path) {
+        let mut g = self.0.lock().expect("SelfWrites poisoned");
+        g.remove(&normalize(path));
     }
 
     #[cfg(test)]
@@ -636,10 +664,37 @@ mod tests {
         sw.record(&p);
         assert_eq!(sw.len(), 1);
         assert!(sw.consume(&p));
+        // Still suppressible: one `rename(2)` reaches the watcher as
+        // `Modify(Name(From))` / `Modify(Name(To))` *and* the paired
+        // `Modify(Name(Both))`, so every echo naming this path is ours.
+        assert!(sw.consume(&p));
+        assert_eq!(sw.len(), 1);
+    }
+
+    #[test]
+    fn self_writes_forget_drops_registration() {
+        let sw = SelfWrites::new();
+        let p = PathBuf::from("/tmp/epost-test/cur/x:2,S");
+        sw.record(&p);
+        // The rename failed, so no event is coming — the entry must go
+        // rather than linger and swallow an unrelated external write.
+        sw.forget(&p);
         assert_eq!(sw.len(), 0);
-        // Second consume returns false — the watcher won't accidentally
-        // swallow a later genuine event on the same path.
         assert!(!sw.consume(&p));
+    }
+
+    #[test]
+    fn self_writes_expire_after_ttl() {
+        let sw = SelfWrites::new();
+        let p = normalize(&PathBuf::from("/tmp/epost-test/cur/x:2,S"));
+        // Backdate the record past the TTL: a genuinely external write on
+        // the same path long after ours must not be suppressed.
+        sw.0.lock().unwrap().insert(
+            p.clone(),
+            Instant::now() - SELF_WRITE_TTL - Duration::from_secs(1),
+        );
+        assert!(!sw.consume(&p));
+        assert_eq!(sw.len(), 0);
     }
 
     #[test]
@@ -677,7 +732,6 @@ mod tests {
             sw.consume(&canonical_event),
             "normalised self-write must match the canonical event path"
         );
-        assert_eq!(sw.len(), 0);
     }
 
     #[test]
@@ -741,6 +795,62 @@ mod tests {
         assert!(g.last_event_at.is_some());
     }
 
+    /// Regression for the "every `d` rescans Trash" lag: `rename(2)`
+    /// across directories reaches the watcher as *three* events — the
+    /// `IN_MOVED_FROM`/`IN_MOVED_TO` pair plus notify's cookie-paired
+    /// `Modify(Name(Both))` naming both paths. A registry that dropped
+    /// each entry on first match suppressed the first two and let `Both`
+    /// through, marking the source *and* destination folders dirty and
+    /// kicking a full re-walk of the destination (typically Trash, often
+    /// tens of thousands of messages) after every single delete.
+    #[test]
+    fn handle_event_swallows_every_echo_of_one_rename() {
+        use notify::event::RenameMode;
+
+        let lookup = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = lookup.lock().unwrap();
+            g.insert(PathBuf::from("/m/dev/cur"), ("dev".into(), "INBOX".into()));
+            g.insert(
+                PathBuf::from("/m/dev/.Trash/cur"),
+                ("dev".into(), "Trash".into()),
+            );
+        }
+        let state = Arc::new((Mutex::new(DirtyState::default()), Condvar::new()));
+        let sw = SelfWrites::new();
+        let src = PathBuf::from("/m/dev/cur/1.M0.h:2,S");
+        let dst = PathBuf::from("/m/dev/.Trash/cur/1.M0.h:2,S");
+        sw.record(&src);
+        sw.record(&dst);
+
+        for ev in [
+            notify::Event {
+                kind: EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                paths: vec![src.clone()],
+                attrs: Default::default(),
+            },
+            notify::Event {
+                kind: EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                paths: vec![dst.clone()],
+                attrs: Default::default(),
+            },
+            notify::Event {
+                kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                paths: vec![src.clone(), dst.clone()],
+                attrs: Default::default(),
+            },
+        ] {
+            handle_event(ev, &lookup, &state, &sw);
+        }
+
+        let g = state.0.lock().unwrap();
+        assert!(
+            g.dirty.is_empty(),
+            "no echo of our own move may dirty a folder, got {:?}",
+            g.dirty
+        );
+    }
+
     #[test]
     fn handle_event_swallows_self_write() {
         let lookup = Arc::new(Mutex::new(HashMap::new()));
@@ -766,8 +876,8 @@ mod tests {
             "self-write must not produce a dirty mark"
         );
         assert!(
-            !sw.consume(&path),
-            "registry entry should already be consumed"
+            sw.consume(&path),
+            "registry entry stays live for the rest of the rename's echoes"
         );
     }
 

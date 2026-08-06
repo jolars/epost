@@ -758,7 +758,7 @@ impl App {
                                 // file is best-effort cleanup. Drop the
                                 // self-write record so a future write
                                 // at the same path isn't suppressed.
-                                self.self_writes.consume(path);
+                                self.self_writes.forget(path);
                             }
                         }
                     }
@@ -3190,6 +3190,7 @@ impl InboxScreen {
                 accounts,
                 dirty,
                 (self.current_account.clone(), self.current_folder.clone()),
+                self.event_tx.clone(),
             ));
         }
     }

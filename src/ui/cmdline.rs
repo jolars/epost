@@ -913,10 +913,10 @@ pub fn postpone_active(app: &mut App, cfg: &Config) -> Result<(), String> {
         match std::fs::remove_file(&old) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                app.self_writes.consume(&old);
+                app.self_writes.forget(&old);
             }
             Err(e) => {
-                app.self_writes.consume(&old);
+                app.self_writes.forget(&old);
                 app.status_error = Some(format!("postpone: clean old draft: {e}"));
             }
         }

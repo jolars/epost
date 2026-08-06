@@ -245,17 +245,25 @@ fn fill_configured_folders<'a>(
 /// current scope (`current_scope`) and whose `groups` rebuilds the
 /// multi-account sidebar stats. Disk I/O is restricted to the dirty
 /// folders' `cur/` and `new/`; everything else is pure SQL.
+/// On completion the worker pushes an `AppEvent::Wake` (when an event
+/// channel is plumbed in) so the refreshed list surfaces immediately
+/// instead of on the next idle heartbeat, mirroring
+/// [`start_switch_worker`].
 pub fn rescan_folders(
     cache_path: PathBuf,
     accounts: HashMap<String, AccountSpec>,
     dirty: HashSet<(String, String)>,
     current_scope: (Option<String>, String),
+    event_tx: Option<Sender<AppEvent>>,
 ) -> Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = rescan_run(&cache_path, &accounts, &dirty, &current_scope)
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(result);
+        if let Some(wake) = event_tx {
+            let _ = wake.send(AppEvent::Wake);
+        }
     });
     rx
 }
@@ -303,6 +311,20 @@ pub struct ScanReport {
     pub skipped: usize,
 }
 
+/// Walk `{cur,new}` under `folder_root` and reconcile the index with
+/// what's on disk. Returns the msgid set the caller feeds to
+/// `prune_folder`.
+///
+/// Two properties keep a re-walk cheap, which matters because *any*
+/// external write in a folder dirties the whole folder: a message moved
+/// to a 10k-message Trash re-walks that Trash.
+///
+/// 1. Files whose exact path is already indexed are skipped without
+///    being read. A maildir filename encodes identity and flags, so an
+///    unchanged name means an unchanged row (see `Index::folder_paths`).
+/// 2. The rows that *did* change are written in one transaction rather
+///    than one-per-message, so the sqlite writer lock is held for the
+///    write burst instead of for the whole walk.
 fn scan_folder(
     account: &str,
     folder_root: &Path,
@@ -310,7 +332,9 @@ fn scan_folder(
     index: &mut Index,
     report: &mut ScanReport,
 ) -> Result<HashSet<String>> {
+    let known = index.folder_paths(account, folder)?;
     let mut found = HashSet::new();
+    let mut fresh: Vec<MessageRow> = Vec::new();
     for sub in ["cur", "new"] {
         let dir = folder_root.join(sub);
         if !dir.is_dir() {
@@ -320,6 +344,12 @@ fn scan_folder(
             std::fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))?;
         for entry in entries.flatten() {
             let path = entry.path();
+            // Already indexed at this exact path — nothing to re-read.
+            // `found` still gets the msgid so the prune pass keeps it.
+            if let Some(msgid) = known.get(&path) {
+                found.insert(msgid.clone());
+                continue;
+            }
             if !path.is_file() {
                 continue;
             }
@@ -358,7 +388,7 @@ fn scan_folder(
                         refs: headers.refs,
                         flags,
                     };
-                    index.upsert(&row)?;
+                    fresh.push(row);
                     found.insert(msgid);
                     report.scanned += 1;
                 }
@@ -366,6 +396,7 @@ fn scan_folder(
             }
         }
     }
+    index.upsert_many(&fresh)?;
     Ok(found)
 }
 
@@ -430,6 +461,51 @@ mod tests {
     #[test]
     fn extract_flags_blank_when_missing() {
         assert_eq!(extract_flags(Path::new("1778850000.M0P6.epost-dev")), "");
+    }
+
+    /// A re-walk must not re-read files it already has indexed at the
+    /// same path. Any external write dirties the *whole* folder, so a
+    /// message landing in a 10k-message Trash used to re-read and
+    /// MIME-parse all 10k — seconds of I/O plus one sqlite write
+    /// transaction per message, with the UI thread's own index writes
+    /// queued behind them. `ScanReport::scanned` counts actual parses, so
+    /// a second walk reporting zero is the observable form of the skip.
+    #[test]
+    fn scan_folder_skips_already_indexed_paths() {
+        use std::fs;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("dev");
+        fs::create_dir_all(root.join("cur")).unwrap();
+        for (name, mid) in [("1.M0.h:2,S", "a"), ("2.M0.h:2,S", "b")] {
+            let mut f = fs::File::create(root.join("cur").join(name)).unwrap();
+            writeln!(f, "Message-ID: <{mid}>\nFrom: a@b\nSubject: t\n\nbody").unwrap();
+        }
+        let mut idx = Index::open(&tmp.path().join("idx.sqlite")).unwrap();
+
+        let mut first = ScanReport::default();
+        let found = scan_folder("dev", &root, "INBOX", &mut idx, &mut first).unwrap();
+        assert_eq!(first.scanned, 2);
+        assert_eq!(found.len(), 2);
+
+        let mut second = ScanReport::default();
+        let again = scan_folder("dev", &root, "INBOX", &mut idx, &mut second).unwrap();
+        assert_eq!(second.scanned, 0, "unchanged files must not be re-parsed");
+        assert_eq!(again, found, "the keep-set must survive the skip");
+
+        // A flag flip renames the file, so the new path is unknown and
+        // gets re-read — the skip can't mask a real change.
+        fs::rename(
+            root.join("cur").join("1.M0.h:2,S"),
+            root.join("cur").join("1.M0.h:2,FS"),
+        )
+        .unwrap();
+        let mut third = ScanReport::default();
+        let after = scan_folder("dev", &root, "INBOX", &mut idx, &mut third).unwrap();
+        assert_eq!(third.scanned, 1, "the renamed file must be re-read");
+        assert_eq!(after, found);
     }
 
     #[test]
@@ -499,6 +575,7 @@ mod tests {
             accounts.clone(),
             dirty,
             (None, "INBOX".to_string()),
+            None,
         );
         let data = rx.recv().unwrap().unwrap();
 

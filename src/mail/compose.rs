@@ -607,8 +607,8 @@ pub fn save_draft(
     })();
 
     if let Err(e) = write_result {
-        sw.consume(&tmp_path);
-        sw.consume(&final_path);
+        sw.forget(&tmp_path);
+        sw.forget(&final_path);
         return Err(e);
     }
     Ok(final_path)
