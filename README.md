@@ -1,5 +1,8 @@
 # epost
 
+[![build-and-test](https://github.com/jolars/epost/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/jolars/epost/actions/workflows/build-and-test.yml)
+[![lint](https://github.com/jolars/epost/actions/workflows/lint.yml/badge.svg)](https://github.com/jolars/epost/actions/workflows/lint.yml)
+
 A terminal email client for Linux maildirs, written in Rust.
 
 `epost` reads mail that `mbsync` (or any other maildir writer) put on disk and
