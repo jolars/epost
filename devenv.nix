@@ -30,14 +30,7 @@
 
   languages.rust = {
     enable = true;
-    channel = "stable";
-    components = [
-      "rustc"
-      "cargo"
-      "clippy"
-      "rustfmt"
-      "rust-analyzer"
-    ];
+    toolchainFile = ./rust-toolchain.toml;
     mold.enable = true;
     # cranelift.enable = true;  # debug-only, currently nightly; revisit after baseline
   };
