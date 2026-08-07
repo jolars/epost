@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::mail::addressbook::Contact;
 use crate::ui::compose::ComposeField;
 use crate::ui::text_input::TextInput;
+use crate::ui::width::{disp_w, truncate_pad};
 
 /// Maximum items rendered in the popup at once. Beyond this the user
 /// should keep typing to narrow the list.
@@ -237,7 +238,7 @@ pub fn draw(f: &mut Frame, anchor: Rect, state: &AddressCompleteState, bounds: R
                 Style::default()
             };
             let name = c.name.clone().unwrap_or_default();
-            let name = pad_truncate(&name, name_width as usize);
+            let name = truncate_pad(&name, name_width as usize);
             let email_style = if selected {
                 style
             } else {
@@ -268,28 +269,8 @@ fn field_label(field: ComposeField) -> &'static str {
 }
 
 fn display_width(c: &Contact) -> usize {
-    // Approximate cell width as char count — same approximation the
-    // rest of the TUI uses. Combining marks etc. drift a little but
-    // the popup is cosmetic.
     let name = c.name.as_deref().unwrap_or("");
-    name.chars().count() + 2 + c.email.chars().count()
-}
-
-fn pad_truncate(s: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut count = 0usize;
-    for ch in s.chars() {
-        if count + 1 > width {
-            break;
-        }
-        out.push(ch);
-        count += 1;
-    }
-    while count < width {
-        out.push(' ');
-        count += 1;
-    }
-    out
+    disp_w(name) + 2 + disp_w(&c.email)
 }
 
 #[cfg(test)]

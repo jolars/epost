@@ -21,4 +21,5 @@ pub mod tabs;
 pub mod text_input;
 pub mod textobj;
 pub mod tty;
+pub mod width;
 pub mod words;

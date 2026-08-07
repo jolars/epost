@@ -1,16 +1,15 @@
+use crate::store::index::MessageRow;
+use crate::store::thread::ThreadedRow;
+use crate::ui::app::{InboxScreen, Pane, ScanState};
+use crate::ui::search::SearchKind;
+use crate::ui::style::{pane_block, pane_scrollbar};
+use crate::ui::width::{disp_w, truncate_pad, truncate_to};
 use jiff::{Timestamp, Zoned};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState};
-use unicode_width::UnicodeWidthStr;
-
-use crate::store::index::MessageRow;
-use crate::store::thread::ThreadedRow;
-use crate::ui::app::{InboxScreen, Pane, ScanState};
-use crate::ui::search::SearchKind;
-use crate::ui::style::{pane_block, pane_scrollbar};
 
 /// Cells of margin to keep visible above / below the selected row.
 /// Vim's `scrolloff` semantic: walking the cursor *inside* the viewport
@@ -401,10 +400,6 @@ fn render_row(t: &ThreadedRow, width: usize, now: &Zoned) -> Line<'static> {
     ])
 }
 
-fn disp_w(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
-}
-
 /// The two single-cell spans of the fixed-width flag column: a yellow ★ when
 /// the message is Flagged (`F`) and a green ↩ when it has been Replied to
 /// (`R`), each a blank cell otherwise. Kept to a 2-cell total so the subject
@@ -464,33 +459,6 @@ const MONTH_FULL: [&str; 12] = [
     "December",
 ];
 
-fn truncate_to(s: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (count, ch) in s.chars().enumerate() {
-        if count + 1 > max_chars {
-            if max_chars >= 1 {
-                out.pop();
-                out.push('…');
-            }
-            return out;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn truncate_pad(s: &str, width: usize) -> String {
-    let mut out: String = s.chars().take(width).collect();
-    let len = out.chars().count();
-    if len < width {
-        out.push_str(&" ".repeat(width - len));
-    } else if s.chars().count() > width && width >= 1 {
-        out.pop();
-        out.push('…');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,10 +510,61 @@ mod tests {
         assert_eq!(cells(true, true), ("★".into(), "↩".into()));
     }
 
+    fn row(from: &str, subject: &str) -> ThreadedRow {
+        ThreadedRow {
+            row: MessageRow {
+                msgid: "<m@example.com>".into(),
+                account: "acct".into(),
+                folder: "INBOX".into(),
+                path: std::path::PathBuf::new(),
+                date: 1_779_796_800,
+                from_addr: Some(from.to_string()),
+                subject: Some(subject.to_string()),
+                in_reply: None,
+                refs: vec![],
+                flags: "S".into(),
+            },
+            depth: 0,
+        }
+    }
+
+    /// A CJK display name must occupy exactly the 16-cell `From` column,
+    /// not 16 *chars* (~32 cells). Over-wide, the subject was pushed right
+    /// and the right-flushed date fell off the pane.
     #[test]
-    fn truncate_to_short_unchanged() {
-        assert_eq!(truncate_to("hello", 10), "hello");
-        assert_eq!(truncate_to("hello", 5), "hello");
+    fn wide_from_stays_inside_its_column() {
+        let now = utc_now(1_779_796_800);
+        let width = 80;
+        let ascii = render_row(&row("Bob Smith", "Hello there"), width, &now);
+        let cjk = render_row(&row("王小明王小明王小明王小明", "Hello there"), width, &now);
+        // Both rows are the same total width...
+        assert_eq!(line_cells(&ascii), line_cells(&cjk));
+        assert!(line_cells(&cjk) <= width, "{}", line_cells(&cjk));
+        // ...and the subject starts at the same column in both.
+        assert_eq!(subject_col(&ascii), subject_col(&cjk));
+    }
+
+    /// The date is right-flushed off the *cell* width, so a wide subject
+    /// must not push it past the pane edge either.
+    #[test]
+    fn wide_subject_keeps_the_date_visible() {
+        let now = utc_now(1_779_796_800);
+        let width = 60;
+        let subject = "会議の議事録について確認をお願いします".repeat(3);
+        let line = render_row(&row("Bob", &subject), width, &now);
+        assert!(line_cells(&line) <= width, "{}", line_cells(&line));
+        let last = line.spans.last().unwrap().content.to_string();
+        assert_eq!(last, format_date(1_779_796_800, &now));
+    }
+
+    fn line_cells(line: &Line<'static>) -> usize {
+        line.spans.iter().map(|s| disp_w(&s.content)).sum()
+    }
+
+    /// Cell column at which the subject span starts (spans before it are
+    /// from / flags / indent / arrow).
+    fn subject_col(line: &Line<'static>) -> usize {
+        line.spans.iter().take(5).map(|s| disp_w(&s.content)).sum()
     }
 
     #[test]
@@ -585,15 +604,5 @@ mod tests {
         assert_eq!(clamp_offset(7, 3, 10, 0), 0);
         // List shorter than the viewport → everything fits at offset 0.
         assert_eq!(clamp_offset(3, 4, 20, 5), 0);
-    }
-
-    #[test]
-    fn truncate_to_long_gets_ellipsis() {
-        assert_eq!(truncate_to("hello world", 7), "hello …");
-    }
-
-    #[test]
-    fn truncate_pad_short_padded() {
-        assert_eq!(truncate_pad("bob", 6), "bob   ");
     }
 }

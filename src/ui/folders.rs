@@ -8,6 +8,7 @@ use crate::store::index::FolderStat;
 use crate::store::scan::AccountFolderStats;
 use crate::ui::app::{InboxScreen, Pane, ScanState};
 use crate::ui::style::pane_block;
+use crate::ui::width::{disp_w, truncate_to};
 
 /// The default folder name across maildirs. Pinned to the top of each
 /// account group (and the unified `[all]` group) so users always have
@@ -203,11 +204,13 @@ fn render_folder_row(name: &str, total: u64, unread: u64, width: usize) -> Line<
     };
 
     // Name flush left, counts flush right, at least one space between.
-    let counts_w = counts.chars().count();
+    // All three measurements are in cells, not chars, so a CJK folder
+    // label can't run the counts off the pane.
+    let counts_w = disp_w(&counts);
     let label_max = width.saturating_sub(counts_w).saturating_sub(1);
     let label = truncate_to(name, label_max);
     let gap = width
-        .saturating_sub(label.chars().count())
+        .saturating_sub(disp_w(&label))
         .saturating_sub(counts_w)
         .max(1);
 
@@ -216,21 +219,6 @@ fn render_folder_row(name: &str, total: u64, unread: u64, width: usize) -> Line<
         Span::raw(" ".repeat(gap)),
         Span::styled(counts, Style::default().fg(Color::DarkGray)),
     ])
-}
-
-fn truncate_to(s: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (count, ch) in s.chars().enumerate() {
-        if count + 1 > max_chars {
-            if max_chars >= 1 {
-                out.pop();
-                out.push('…');
-            }
-            return out;
-        }
-        out.push(ch);
-    }
-    out
 }
 
 #[cfg(test)]

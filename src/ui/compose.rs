@@ -30,6 +30,7 @@ use crate::ui::compose_header::{self, HeaderMode};
 use crate::ui::embed::EditorSession;
 use crate::ui::style::{pane_block, pane_scrollbar};
 use crate::ui::text_input::TextInput;
+use crate::ui::width::disp_w;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeField {
@@ -1051,9 +1052,7 @@ fn draw_from_picker(f: &mut Frame, from_row: Rect, picker: &FromPicker, bounds: 
     let max_option_width = picker
         .options
         .iter()
-        .map(|o| {
-            (o.account.chars().count() + " — ".chars().count() + o.from.chars().count()) as u16
-        })
+        .map(|o| (disp_w(&o.account) + disp_w(" — ") + disp_w(&o.from)) as u16)
         .max()
         .unwrap_or(20);
     // 2 cells for the L/R border, 2 cells of inner padding.

@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::ui::app::{App, Mode, Screen};
+use crate::ui::width::{disp_w, truncate_to};
 
 /// Maximum width of the `account · folder` portion baked into the INBOX
 /// tab label before the folder side is truncated with an ellipsis. Sized
@@ -88,7 +89,7 @@ fn search_chip(app: &App) -> Line<'static> {
     // whatever fits in SEARCH_CHIP_WIDTH after the fixed parts.
     let q = s.query.as_str();
     let count = format!(" ({})", s.results.len());
-    let fixed = 1 + prefix.chars().count() + count.chars().count() + 1; // leading + trailing space
+    let fixed = 1 + disp_w(prefix) + disp_w(&count) + 1; // leading + trailing space
     let q_budget = SEARCH_CHIP_WIDTH.saturating_sub(fixed);
     let q_t = truncate_to(q, q_budget);
     Line::from(vec![
@@ -111,29 +112,14 @@ fn search_chip(app: &App) -> Line<'static> {
 fn inbox_label(account: &str, folder: &str, max_width: usize) -> String {
     // "{account} · {folder}" is the target; budget so it fits in
     // `max_width` cells (the tab's own padding is added by the caller).
-    let prefix_chars = account.chars().count() + 3; // "{account} · "
-    if prefix_chars >= max_width {
+    let prefix_w = disp_w(account) + 3; // "{account} · "
+    if prefix_w >= max_width {
         // Account name alone already overflows; truncate that.
         return truncate_to(account, max_width);
     }
-    let folder_budget = max_width - prefix_chars;
+    let folder_budget = max_width - prefix_w;
     let folder_t = truncate_to(folder, folder_budget);
     format!("{account} · {folder_t}")
-}
-
-fn truncate_to(s: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (count, ch) in s.chars().enumerate() {
-        if count + 1 > max_chars {
-            if max_chars >= 1 {
-                out.pop();
-                out.push('…');
-            }
-            return out;
-        }
-        out.push(ch);
-    }
-    out
 }
 
 fn tab_label(screen: &Screen) -> String {
