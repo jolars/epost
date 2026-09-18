@@ -240,6 +240,10 @@ pub struct BodyEditor {
     /// on every keystroke (the editor doesn't store the whole config).
     text_width: u16,
     yank: Option<Yank>,
+    /// Explicit yank waiting for the host to publish it through the
+    /// configured system-clipboard sink. Deletes and changes still update
+    /// `yank` for Vim-style paste, but deliberately leave this empty.
+    clipboard_yank: Option<String>,
     /// Active yank-highlight flash, if any. Painted by `compose::draw`
     /// and expired by the host loop via [`Self::expire_yank_highlight`].
     pub yank_highlight: Option<BodyYankHighlight>,
@@ -288,6 +292,7 @@ impl BodyEditor {
             ops: OpState::default(),
             text_width: 72,
             yank: None,
+            clipboard_yank: None,
             yank_highlight: None,
             goal_col: GoalCol::Col(0),
             goal_anchor: 0,
@@ -420,6 +425,17 @@ impl BodyEditor {
         // cell in sync so its style always matches the live mode.
         self.sync_cursor_style();
         outcome
+    }
+
+    /// Take the most recent explicit yank for delivery to the system
+    /// clipboard. The host calls this after each handled compose key.
+    pub fn take_clipboard_yank(&mut self) -> Option<String> {
+        self.clipboard_yank.take()
+    }
+
+    fn record_yank(&mut self, text: String, line_wise: bool) {
+        self.clipboard_yank = Some(text.clone());
+        self.yank = Some(Yank { text, line_wise });
     }
 
     // ---------- Insert mode ----------
@@ -870,10 +886,7 @@ impl BodyEditor {
         let text = self.region_text(&region);
         match op {
             Operator::Yank => {
-                self.yank = Some(Yank {
-                    text,
-                    line_wise: region.linewise,
-                });
+                self.record_yank(text, region.linewise);
                 let ranges = self.region_ranges(&region);
                 self.arm_yank_highlight(ranges);
                 self.textarea.cancel_selection();
@@ -1820,10 +1833,7 @@ impl BodyEditor {
             return;
         };
         let text = self.block_text(r0, r1, c0, c1);
-        self.yank = Some(Yank {
-            text,
-            line_wise: false,
-        });
+        self.record_yank(text, false);
         let ranges = self.block_selection_ranges();
         self.arm_yank_highlight(ranges);
     }
@@ -1953,10 +1963,7 @@ impl BodyEditor {
         if region.start == region.end {
             return;
         }
-        self.yank = Some(Yank {
-            text: self.region_text(&region),
-            line_wise: false,
-        });
+        self.record_yank(self.region_text(&region), false);
         self.arm_yank_highlight(vec![(row as u16, col as u16, (len - col) as u16)]);
     }
 
@@ -1980,10 +1987,7 @@ impl BodyEditor {
             // Block routes through `yank_block`, never here.
             VisualKind::Block => unreachable!("block yank handled by yank_block"),
         };
-        self.yank = Some(Yank {
-            text,
-            line_wise: matches!(kind, VisualKind::Line),
-        });
+        self.record_yank(text, matches!(kind, VisualKind::Line));
         let ranges = match kind {
             VisualKind::Char => self.char_ranges(sr, sc, er, ec),
             VisualKind::Line => self.line_ranges(sr, er),
@@ -2636,6 +2640,23 @@ mod tests {
         let hl = ed.yank_highlight.as_ref().expect("highlight armed");
         // Row 0, full width of "alpha" (5 cells), starting at col 0.
         assert_eq!(hl.ranges, vec![(0, 0, 5)]);
+    }
+
+    #[test]
+    fn yy_queues_text_for_the_system_clipboard() {
+        let mut ed = BodyEditor::new("alpha\nbeta");
+        feed(&mut ed, &[k('y'), k('y')]);
+
+        assert_eq!(ed.take_clipboard_yank().as_deref(), Some("alpha\n"));
+        assert!(ed.take_clipboard_yank().is_none());
+    }
+
+    #[test]
+    fn delete_does_not_queue_text_for_the_system_clipboard() {
+        let mut ed = BodyEditor::new("alpha beta");
+        feed(&mut ed, &[k('d'), k('w')]);
+
+        assert!(ed.take_clipboard_yank().is_none());
     }
 
     #[test]

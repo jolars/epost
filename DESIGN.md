@@ -207,7 +207,7 @@ prefer = "html"               # "html" | "plain"
 # the final argument. Override to e.g. firefox / qutebrowser / lynx.
 browser = ["xdg-open"]
 # Reader yanks (`Y`/`yy` line, `yip`/`yap` paragraph, `yie`/`yae` whole
-# body, `yl` link) emit OSC 52 to the host terminal by
+# body, `yl` link), and explicit composer yanks emit OSC 52 to the host terminal by
 # default. Set `clipboard` to a command vec to pipe the selected text
 # to that command's stdin instead — for tmux setups or terminals where
 # OSC 52 is disabled. E.g. `["wl-copy"]` or `["xclip", "-selection",

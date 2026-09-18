@@ -240,12 +240,16 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
     // editor returns PassThrough for `:` so the cmdline still works.
     if let Some(Screen::Compose(c)) = app.screens.get_mut(app.active) {
         let outcome = compose::handle_key(c, k, cfg);
+        let clipboard_yank = c.body.take_clipboard_yank();
         // The inline attachment flow stages user-facing messages here so
         // the host loop can mirror them into `app.status_error` (same
         // place `:attach` writes), without plumbing `&mut App` through
         // compose-mode key dispatch.
         if let Some(msg) = c.pending_status.take() {
             app.status_error = Some(msg);
+        }
+        if let Some(text) = clipboard_yank {
+            dispatch_yank(app, cfg, text, "yanked".to_string());
         }
         match outcome {
             compose::KeyOutcome::Consumed => {

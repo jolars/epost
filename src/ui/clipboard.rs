@@ -1,4 +1,4 @@
-//! Reader-yank clipboard sink.
+//! System-clipboard sink for reader and composer yanks.
 //!
 //! Two paths, chosen exclusively by `[reader].clipboard`:
 //!
@@ -7,7 +7,7 @@
 //!   sequence — no cells painted, no display side-effect; it only needs
 //!   to reach the tty stream.
 //!
-//! * **Shell-out fallback**: when the user sets `[reader].clipboard =
+//! * **Shell-out adapter**: when the user sets `[reader].clipboard =
 //!   ["wl-copy"]` (or similar), the text is piped to that command's
 //!   stdin on a `std::thread` worker. Mirrors `store::sync::start_worker`
 //!   so the polling pattern is identical: `mpsc::Receiver` + an

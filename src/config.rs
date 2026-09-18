@@ -80,8 +80,8 @@ pub struct Reader {
     pub prefer: ReaderPrefer,
     #[serde(default = "default_browser")]
     pub browser: Vec<String>,
-    /// Optional shell-out fallback for yank/copy. When set, reader yanks
-    /// pipe the selected text to this command's stdin instead of
+    /// Optional shell-out fallback for yank/copy. When set, reader and
+    /// composer yanks pipe the selected text to this command's stdin instead of
     /// emitting OSC 52. Use for tmux setups or terminals where OSC 52 is
     /// disabled, e.g. `["wl-copy"]` or `["xclip", "-selection", "clipboard"]`.
     #[serde(default)]
