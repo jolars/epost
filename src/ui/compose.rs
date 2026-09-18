@@ -300,7 +300,13 @@ impl ComposeScreen {
             ComposeField::Attach => self.attach.adding.is_none(),
             // From / To / Cc / Bcc / Subject share the header modal; a
             // pending `d`/`c`/`r` latch (e.g. `rq`) must consume `q`.
-            _ => self.header_mode == HeaderMode::Normal && self.header_pending.is_none(),
+            _ => {
+                self.header_mode == HeaderMode::Normal
+                    && self.header_pending.is_none()
+                    && [&self.from, &self.to, &self.cc, &self.bcc, &self.subject]
+                        .iter()
+                        .all(|input| input.paste_prefix == crate::ui::paste::Prefix::None)
+            }
         }
     }
 
@@ -326,6 +332,7 @@ impl ComposeScreen {
     /// picker commit) so the Ctrl-K "return to last header" jump always
     /// points at the most recent header the user actually visited.
     pub fn set_focus(&mut self, field: ComposeField) {
+        self.clear_paste_prefixes();
         if field != ComposeField::Body {
             self.last_header_focused = field;
         }
@@ -372,6 +379,22 @@ impl ComposeScreen {
             ComposeField::Body | ComposeField::Attach => return None,
         })
     }
+
+    pub fn clear_paste_prefixes(&mut self) {
+        self.body.clear_paste_prefix();
+        for input in [
+            &mut self.from,
+            &mut self.to,
+            &mut self.cc,
+            &mut self.bcc,
+            &mut self.subject,
+        ] {
+            input.paste_prefix = Default::default();
+        }
+        if let Some(input) = self.attach.adding.as_mut() {
+            input.paste_prefix = Default::default();
+        }
+    }
 }
 
 /// Compose-mode key dispatch. Only called when no `$EDITOR` pty
@@ -401,6 +424,19 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
     if screen.from_picker.is_some() {
         handle_from_picker_key(screen, k);
         return KeyOutcome::Consumed;
+    }
+
+    // A register continuation owns Enter and popup navigation until resolved.
+    // Field-switch chords still reach their usual handlers and clear it.
+    if !k
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && !matches!(k.code, KeyCode::Tab | KeyCode::BackTab)
+        && screen
+            .focused_input_mut()
+            .is_some_and(|input| input.paste_prefix != crate::ui::paste::Prefix::None)
+    {
+        return compose_header::handle_field_key(screen, k);
     }
 
     // Address-completion popup intercepts navigation + accept keys
@@ -448,6 +484,7 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
     // `:edit`, just a chord. Kept for muscle memory from the old
     // external-only flow.
     if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('e') {
+        screen.clear_paste_prefixes();
         screen.editor_pending = true;
         return KeyOutcome::Consumed;
     }
@@ -456,6 +493,7 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
     // Alt-e for the editor — the picker is otherwise only reachable
     // by tabbing to From and pressing Enter, which is hard to discover.
     if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('f') {
+        screen.clear_paste_prefixes();
         open_from_picker(screen, cfg);
         return KeyOutcome::Consumed;
     }
@@ -499,8 +537,9 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
     // also passes through the editor and we use it below to cycle out
     // of the body to other fields.
     if screen.focused == ComposeField::Body {
-        if let KeyOutcome::Consumed = screen.body.handle_key(k, cfg.compose.text_width) {
-            return KeyOutcome::Consumed;
+        let outcome = screen.body.handle_key(k, cfg.compose.text_width);
+        if !matches!(outcome, KeyOutcome::PassThrough) {
+            return outcome;
         }
         // Tab / BackTab: cycle fields. Other passthroughs (`:` etc.)
         // are routed up to the app.
@@ -594,6 +633,14 @@ fn handle_attach_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutcome {
 }
 
 fn handle_attach_adding_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutcome {
+    if let Some(input) = screen.attach.adding.as_mut()
+        && let Some(shortcut) = input.paste_prefix.handle(k, false)
+    {
+        return match shortcut {
+            crate::ui::paste::Shortcut::Consumed => KeyOutcome::Consumed,
+            crate::ui::paste::Shortcut::Read(placement) => KeyOutcome::ClipboardPaste(placement),
+        };
+    }
     match k.code {
         KeyCode::Esc => {
             screen.attach.adding = None;

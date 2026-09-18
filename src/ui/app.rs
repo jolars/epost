@@ -317,6 +317,7 @@ pub struct App {
     /// receivers and the most recent one wins for status display —
     /// fine because real fallback commands return in milliseconds.
     pub clipboard_rx: Option<Receiver<ClipboardResult>>,
+    pub clipboard_read: Option<crate::ui::paste::PendingRead>,
     /// Native address-book cache (recipients harvested from each
     /// account's Sent folder at startup). Empty until
     /// `address_book_rx` reports back; the compose popup just sees no
@@ -668,6 +669,7 @@ impl App {
             sync_rx: None,
             pending_sends: Vec::new(),
             clipboard_rx: None,
+            clipboard_read: None,
             address_book: AddressBook::new(),
             address_book_rx,
             address_ext_rx: None,
@@ -699,6 +701,8 @@ impl App {
 
     /// Push a new compose tab, mark it active, return its index.
     pub fn open_compose(&mut self, screen: ComposeScreen) -> usize {
+        crate::ui::paste::cancel_read(self);
+        crate::ui::paste::clear_prefixes(self);
         self.screens.push(Screen::Compose(Box::new(screen)));
         let idx = self.screens.len() - 1;
         self.active = idx;
@@ -708,6 +712,8 @@ impl App {
     /// Close the currently active tab unless it's the inbox (index 0).
     /// Returns Ok(()) on close, Err(msg) when blocked.
     pub fn close_active_tab(&mut self) -> Result<(), &'static str> {
+        crate::ui::paste::cancel_read(self);
+        crate::ui::paste::clear_prefixes(self);
         if self.active == 0 {
             return Err("cannot close the inbox tab");
         }

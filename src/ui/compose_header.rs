@@ -14,8 +14,8 @@
 //! full operator engine: motions `h l 0 ^ $ w W b B e E`, mode entry
 //! `i a I A`, edits `x s D C dd cc S r ~`, and `j`/`k` field navigation.
 //! There are no counts, no `f`/`t` find-char, no text objects, and no
-//! `d{motion}`/`y`/`p` — addresses and subjects are short, single-line
-//! strings where that surface buys little. (v1 drift: `~` only flips
+//! `d{motion}`/`y`/`p`; explicit clipboard paste uses `"+p`/`"+P` or
+//! Insert-mode `Ctrl-R +`. (v1 drift: `~` only flips
 //! ASCII case; `^` treats the field as having no leading indent.)
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -51,6 +51,16 @@ enum InsertAt {
 /// (Tab/BackTab cycle, Enter-on-From picker) have had their crack, and
 /// only when a header field (not Body / Attach) holds focus.
 pub fn handle_field_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutcome {
+    let normal = screen.header_mode == HeaderMode::Normal;
+    if screen.header_pending.is_none()
+        && let Some(input) = screen.focused_input_mut()
+        && let Some(shortcut) = input.paste_prefix.handle(k, normal)
+    {
+        return match shortcut {
+            crate::ui::paste::Shortcut::Consumed => KeyOutcome::Consumed,
+            crate::ui::paste::Shortcut::Read(placement) => KeyOutcome::ClipboardPaste(placement),
+        };
+    }
     match screen.header_mode {
         HeaderMode::Insert => handle_insert(screen, k),
         HeaderMode::Normal => handle_normal(screen, k),

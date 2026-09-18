@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{DisableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use ratatui::Terminal;
@@ -217,10 +217,22 @@ fn next_deadline(app: &App, cfg: &Config) -> Option<Duration> {
 fn process_event(app: &mut App, cfg: &Config, ev: AppEvent) {
     match ev {
         AppEvent::Input(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+            ui::paste::cancel_read(app);
+            let context = (app.active, app.mode);
             ui::keys::handle(app, cfg, k);
+            if context != (app.active, app.mode) {
+                ui::paste::clear_prefixes(app);
+            }
         }
         AppEvent::Input(Event::Mouse(m)) => {
+            ui::paste::cancel_read(app);
+            ui::paste::clear_prefixes(app);
             ui::mouse::handle(app, cfg, m);
+        }
+        AppEvent::Input(Event::Paste(text)) => {
+            ui::paste::cancel_read(app);
+            ui::paste::clear_prefixes(app);
+            ui::paste::insert(app, cfg, &text, ui::paste::Placement::Cursor);
         }
         AppEvent::Input(_) => {}
         AppEvent::Wake => {}
@@ -239,6 +251,7 @@ fn tick(
     app.poll_pending_sends();
     app.poll_sync();
     app.poll_clipboard();
+    ui::paste::poll(app, cfg);
     app.poll_address_book(cfg);
     expire_yank_highlight(app);
     if let Some(c) = app.active_compose_mut() {
@@ -414,8 +427,204 @@ fn install_panic_hook() {
         // never saw EnableMouseCapture ignore the corresponding DEC
         // private-mode resets, so this is safe regardless of the
         // session's config.
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
         original(info);
     }));
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+    use crate::mail::compose::Draft;
+    use crate::ui::app::{Mode, Screen};
+    use crate::ui::compose::{ComposeField, ComposeScreen};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn compose_app() -> (App, Config, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut app = App::new(&cfg, dir.path().join("index.sqlite"), None, None);
+        let screen =
+            ComposeScreen::from_draft(Draft::new_blank("test", "me@example.com"), cfg.compose.wrap)
+                .unwrap();
+        app.open_compose(screen);
+        (app, cfg, dir)
+    }
+
+    fn paste(app: &mut App, cfg: &Config, text: &str) {
+        process_event(app, cfg, AppEvent::Input(Event::Paste(text.into())));
+    }
+
+    fn key(app: &mut App, cfg: &Config, code: KeyCode) {
+        process_event(
+            app,
+            cfg,
+            AppEvent::Input(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))),
+        );
+    }
+
+    #[test]
+    fn paste_event_inserts_body_text_without_executing_keys() {
+        let (mut app, cfg, _dir) = compose_app();
+        app.active_compose_mut()
+            .unwrap()
+            .set_focus(ComposeField::Body);
+        paste(&mut app, &cfg, "héllo\r\n\t:send\rq\n\n");
+        assert_eq!(
+            app.active_compose().unwrap().body.text(),
+            "héllo\n\t:send\nq\n\n"
+        );
+        assert!(!app.quit);
+        assert!(app.pending_sends.is_empty());
+        key(&mut app, &cfg, KeyCode::Char('u'));
+        assert_eq!(app.active_compose().unwrap().body.text(), "");
+    }
+
+    #[test]
+    fn paste_event_inserts_single_line_fields_at_unicode_cursor() {
+        let (mut app, cfg, _dir) = compose_app();
+        let c = app.active_compose_mut().unwrap();
+        c.to = crate::ui::text_input::TextInput::from_string("éø");
+        c.to.set_cursor_char(1);
+        paste(&mut app, &cfg, "a\r\nb\tc\u{1b}\u{0}");
+        assert_eq!(app.active_compose().unwrap().to.as_str(), "éa b cø");
+    }
+
+    #[test]
+    fn paste_event_does_not_submit_command_or_attachment() {
+        let (mut app, cfg, _dir) = compose_app();
+        app.mode = Mode::Command;
+        paste(&mut app, &cfg, "close\nsend");
+        assert_eq!(app.cmdline.as_str(), "close send");
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.screens.len(), 2);
+        app.mode = Mode::Normal;
+        let c = app.active_compose_mut().unwrap();
+        c.set_focus(ComposeField::Attach);
+        c.attach.adding = Some(crate::ui::text_input::TextInput::new());
+        paste(&mut app, &cfg, "/tmp/a\n");
+        let c = app.active_compose().unwrap();
+        assert_eq!(c.attach.adding.as_ref().unwrap().as_str(), "/tmp/a ");
+        assert!(c.attachments.is_empty());
+    }
+
+    #[test]
+    fn paste_event_is_ignored_in_read_only_contexts() {
+        let (mut app, cfg, _dir) = compose_app();
+        app.active = 0;
+        paste(&mut app, &cfg, "q:send\n");
+        assert!(matches!(app.screens[0], Screen::Inbox(_)));
+        assert!(!app.quit);
+        assert!(app.cmdline.is_empty());
+    }
+
+    fn ctrl(app: &mut App, cfg: &Config, c: char) {
+        process_event(
+            app,
+            cfg,
+            AppEvent::Input(Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+            ))),
+        );
+    }
+
+    #[test]
+    fn clipboard_shortcuts_reach_provider_in_every_text_input() {
+        let (mut app, cfg, _dir) = compose_app();
+        for field in [
+            ComposeField::From,
+            ComposeField::To,
+            ComposeField::Cc,
+            ComposeField::Bcc,
+            ComposeField::Subject,
+            ComposeField::Body,
+        ] {
+            app.active_compose_mut().unwrap().set_focus(field);
+            for c in ['"', '+', 'P'] {
+                key(&mut app, &cfg, KeyCode::Char(c));
+            }
+            assert!(
+                app.status_error.take().unwrap().contains("paste_command"),
+                "{field:?}"
+            );
+            key(&mut app, &cfg, KeyCode::Char('i'));
+            ctrl(&mut app, &cfg, 'r');
+            key(&mut app, &cfg, KeyCode::Char('+'));
+            assert!(
+                app.status_error.take().unwrap().contains("paste_command"),
+                "{field:?}"
+            );
+            key(&mut app, &cfg, KeyCode::Esc);
+        }
+        app.mode = Mode::Command;
+        ctrl(&mut app, &cfg, 'r');
+        key(&mut app, &cfg, KeyCode::Char('+'));
+        assert!(app.status_error.take().unwrap().contains("paste_command"));
+        assert!(app.cmdline.is_empty());
+        app.mode = Mode::Normal;
+        let c = app.active_compose_mut().unwrap();
+        c.set_focus(ComposeField::Attach);
+        c.attach.adding = Some(crate::ui::text_input::TextInput::new());
+        ctrl(&mut app, &cfg, 'r');
+        key(&mut app, &cfg, KeyCode::Char('+'));
+        assert!(app.status_error.take().unwrap().contains("paste_command"));
+    }
+
+    #[test]
+    fn clipboard_prefix_cancellation_does_not_close_draft_or_leak_across_fields() {
+        let (mut app, cfg, _dir) = compose_app();
+        key(&mut app, &cfg, KeyCode::Char('"'));
+        key(&mut app, &cfg, KeyCode::Char('q'));
+        assert_eq!(app.screens.len(), 2);
+        key(&mut app, &cfg, KeyCode::Char('"'));
+        key(&mut app, &cfg, KeyCode::Tab);
+        key(&mut app, &cfg, KeyCode::Char('+'));
+        key(&mut app, &cfg, KeyCode::Char('p'));
+        assert!(app.status_error.is_none());
+        assert!(app.active_compose().unwrap().cc.is_empty());
+    }
+
+    #[test]
+    fn clipboard_prefix_enter_does_not_open_from_picker() {
+        let (mut app, cfg, _dir) = compose_app();
+        app.active_compose_mut()
+            .unwrap()
+            .set_focus(ComposeField::From);
+        key(&mut app, &cfg, KeyCode::Char('"'));
+        key(&mut app, &cfg, KeyCode::Enter);
+        assert!(app.active_compose().unwrap().from_picker.is_none());
+        assert_eq!(
+            app.active_compose().unwrap().from.paste_prefix,
+            crate::ui::paste::Prefix::None
+        );
+    }
+
+    #[test]
+    fn paste_updates_completion_without_accepting_suggestion() {
+        let (mut app, cfg, _dir) = compose_app();
+        key(&mut app, &cfg, KeyCode::Char('i'));
+        paste(&mut app, &cfg, "ali");
+        assert_eq!(
+            app.active_compose()
+                .unwrap()
+                .address_complete
+                .as_ref()
+                .unwrap()
+                .token,
+            "ali"
+        );
+        paste(&mut app, &cfg, "ce@example.com\n");
+        assert_eq!(
+            app.active_compose().unwrap().to.as_str(),
+            "alice@example.com "
+        );
+        assert_eq!(app.active_compose().unwrap().focused, ComposeField::To);
+    }
 }

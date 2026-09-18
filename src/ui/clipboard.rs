@@ -1,6 +1,6 @@
-//! System-clipboard sink for reader and composer yanks.
+//! System clipboard writes for yanks and command-based reads for paste.
 //!
-//! Two paths, chosen exclusively by `[reader].clipboard`:
+//! Copy has two paths, chosen exclusively by `[reader].clipboard`:
 //!
 //! * **OSC 52** (default): emits `ESC ] 52 ; c ; <base64> ESC \` to
 //!   stdout. The terminal interprets it as a clipboard-set control
@@ -17,10 +17,14 @@
 //! wrapped in the multiplexer's DCS passthrough so the outer terminal
 //! actually sees it; without the wrap, tmux eats the sequence by default
 //! and the user pastes nothing. Detection is per-call on `$TMUX` / `$STY`.
+//!
+//! Explicit paste reads UTF-8 stdout from `[clipboard].paste_command` on a
+//! worker. It does not query the terminal or reuse the copy command.
 
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -56,6 +60,78 @@ pub enum YankOutcome {
 
 /// Result reported by the fallback worker.
 pub type ClipboardResult = Result<usize, String>;
+
+/// Read on a worker so an unavailable desktop cannot stall editing.
+pub fn read(
+    cmd: Vec<String>,
+    event_tx: Option<Sender<AppEvent>>,
+) -> Receiver<Result<String, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = read_command(&cmd, Duration::from_secs(5));
+        let _ = tx.send(result);
+        if let Some(wake) = event_tx {
+            let _ = wake.send(AppEvent::Wake);
+        }
+    });
+    rx
+}
+
+fn read_command(cmd: &[String], timeout: Duration) -> Result<String, String> {
+    let Some(program) = cmd.first().filter(|s| !s.is_empty()) else {
+        return Err("clipboard command not configured".into());
+    };
+    // Anonymous files avoid pipe backpressure and let us enforce the deadline
+    // even if a command's descendant keeps its stdout or stderr open.
+    let mut stdout = tempfile::tempfile().map_err(|e| format!("capture stdout: {e}"))?;
+    let mut stderr = tempfile::tempfile().map_err(|e| format!("capture stderr: {e}"))?;
+    let mut child = Command::new(program)
+        .args(&cmd[1..])
+        .stdin(Stdio::null())
+        .stdout(
+            stdout
+                .try_clone()
+                .map_err(|e| format!("capture stdout: {e}"))?,
+        )
+        .stderr(
+            stderr
+                .try_clone()
+                .map_err(|e| format!("capture stderr: {e}"))?,
+        )
+        .spawn()
+        .map_err(|e| format!("{program}: {e}"))?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result {
+                    Err(e) => format!("wait: {e}"),
+                    _ => "clipboard command timed out".into(),
+                });
+            }
+        }
+    };
+    if !status.success() {
+        let mut error = String::new();
+        let _ = stderr.seek(SeekFrom::Start(0));
+        let _ = stderr.take(4096).read_to_string(&mut error);
+        return Err(format!("{program} exited with {status}: {}", error.trim()));
+    }
+    stdout
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("read stdout: {e}"))?;
+    let mut text = String::new();
+    stdout
+        .read_to_string(&mut text)
+        .map_err(|e| format!("clipboard is not readable UTF-8 text: {e}"))?;
+    Ok(text)
+}
 
 /// Copy `text` to the clipboard. Selects OSC 52 vs the fallback worker
 /// based on `[reader].clipboard`. `event_tx` is cloned into the worker
@@ -192,8 +268,68 @@ fn run_blocking(cmd: &[String], text: &str) -> ClipboardResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
+    fn read_script(script: &str) -> Result<String, String> {
+        read_command(
+            &["/bin/sh".into(), "-c".into(), script.into()],
+            Duration::from_secs(1),
+        )
+    }
+
+    #[test]
+    fn clipboard_read_preserves_text_and_empty_output() {
+        assert_eq!(read_script("printf 'héllo\\n\\n'").unwrap(), "héllo\n\n");
+        assert_eq!(read_script("printf ''").unwrap(), "");
+    }
+
+    #[test]
+    fn clipboard_read_reports_spawn_exit_and_encoding_errors() {
+        assert!(
+            read_command(
+                &["/nonexistent/epost-clipboard-test".into()],
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        assert!(
+            read_script("printf failed >&2; exit 7")
+                .unwrap_err()
+                .contains("failed")
+        );
+        assert!(read_script("printf '\\377'").unwrap_err().contains("UTF-8"));
+    }
+
+    #[test]
+    fn clipboard_read_times_out_and_reaps_child() {
+        let start = Instant::now();
+        let error = read_command(
+            &["/bin/sh".into(), "-c".into(), "exec sleep 30".into()],
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn clipboard_read_worker_wakes_the_event_loop() {
+        let (tx, rx) = mpsc::channel();
+        let result = read(
+            vec!["/bin/sh".into(), "-c".into(), "printf text".into()],
+            Some(tx),
+        );
+        assert_eq!(
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            "text"
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AppEvent::Wake
+        ));
+    }
     fn recv_blocking(rx: Receiver<ClipboardResult>) -> ClipboardResult {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

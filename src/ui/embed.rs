@@ -60,7 +60,7 @@ struct ReplyCallbacks {
 impl vt100::Callbacks for ReplyCallbacks {
     fn unhandled_csi(
         &mut self,
-        _: &mut vt100::Screen,
+        screen: &mut vt100::Screen,
         i1: Option<u8>,
         i2: Option<u8>,
         params: &[&[u16]],
@@ -84,13 +84,16 @@ impl vt100::Callbacks for ReplyCallbacks {
                 6 => self.pending.extend_from_slice(b"\x1b[1;1R"), // cursor pos (we don't actually know)
                 _ => {}
             },
-            // DECRQM: "is mode N set?" — reply "not recognized" for any
-            // mode. We don't currently support synchronized output,
-            // bracketed paste, etc. at this layer; answering 0 lets nvim
-            // know immediately and pick its fallback path without waiting.
+            // Report bracketed paste accurately so editors can negotiate it.
+            // Other modes remain unrecognized, avoiding query timeouts.
             (Some(b'?'), Some(b'$'), 'p') => {
                 let mode = first_param();
-                let reply = format!("\x1b[?{mode};0$y");
+                let state = if mode == 2004 {
+                    if screen.bracketed_paste() { 1 } else { 2 }
+                } else {
+                    0
+                };
+                let reply = format!("\x1b[?{mode};{state}$y");
                 self.pending.extend_from_slice(reply.as_bytes());
             }
             // DECSCUSR: cursor shape. Captured here and surfaced via
@@ -112,7 +115,7 @@ impl vt100::Callbacks for ReplyCallbacks {
 pub struct EditorSession {
     parser: Arc<Mutex<vt100::Parser<ReplyCallbacks>>>,
     master: Box<dyn MasterPty + Send>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: Sender<Vec<u8>>,
     done_rx: Receiver<()>,
     /// Set by the reader thread on first byte read from the pty.
     /// Until then the UI keeps showing the form preview, so the
@@ -185,7 +188,7 @@ impl EditorSession {
         let primed = Arc::new(AtomicBool::new(false));
 
         let raw_writer = pair.master.take_writer().context("taking pty writer")?;
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(raw_writer));
+        let writer = input_writer(raw_writer);
 
         // Reader thread: pull bytes from the pty master, feed the
         // parser, write any capability-query replies the callbacks
@@ -213,11 +216,8 @@ impl EditorSession {
                                 p.process(&buf[..n]);
                                 replies = std::mem::take(&mut p.callbacks_mut().pending);
                             }
-                            if !replies.is_empty()
-                                && let Ok(mut w) = writer.lock()
-                            {
-                                let _ = w.write_all(&replies);
-                                let _ = w.flush();
+                            if !replies.is_empty() {
+                                let _ = writer.send(replies);
                             }
                             primed.store(true, Ordering::Release);
                             let now = Instant::now();
@@ -344,11 +344,41 @@ impl EditorSession {
         if bytes.is_empty() {
             return false;
         }
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(&bytes);
-            let _ = w.flush();
+        self.writer.send(bytes).is_ok()
+    }
+
+    pub fn forward_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
         }
-        true
+        let bracketed = self.with_screen(|screen| screen.bracketed_paste());
+        let _ = self.writer.send(encode_paste(text, bracketed));
+    }
+}
+
+fn input_writer(mut writer: Box<dyn Write + Send>) -> Sender<Vec<u8>> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // A single queue preserves paste/key/reply ordering without making the UI
+    // or PTY reader wait for a child to consume a large clipboard payload.
+    std::thread::spawn(move || {
+        for bytes in rx {
+            if writer
+                .write_all(&bytes)
+                .and_then(|()| writer.flush())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    tx
+}
+
+fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+    } else {
+        text.replace("\r\n", "\n").replace('\n', "\r").into_bytes()
     }
 }
 
@@ -423,6 +453,59 @@ fn encode_key(k: KeyEvent) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_encoding_follows_child_bracketed_mode() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        assert_eq!(
+            encode_paste("é\r\nx", parser.screen().bracketed_paste()),
+            "é\rx".as_bytes()
+        );
+        parser.process(b"\x1b[?2004h");
+        assert_eq!(
+            encode_paste("é\nx", parser.screen().bracketed_paste()),
+            "\x1b[200~é\nx\x1b[201~".as_bytes()
+        );
+        parser.process(b"\x1b[?2004l");
+        assert!(!parser.screen().bracketed_paste());
+    }
+
+    #[test]
+    fn paste_capability_query_reports_enabled_and_disabled() {
+        let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, ReplyCallbacks::default());
+        parser.process(b"\x1b[?2004$p");
+        assert_eq!(
+            std::mem::take(&mut parser.callbacks_mut().pending),
+            b"\x1b[?2004;2$y"
+        );
+        parser.process(b"\x1b[?2004h\x1b[?2004$p");
+        assert_eq!(parser.callbacks_mut().pending, b"\x1b[?2004;1$y");
+    }
+
+    #[test]
+    fn paste_and_following_keys_are_written_in_order() {
+        struct Sink(Sender<Vec<u8>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let writer = input_writer(Box::new(Sink(tx)));
+        let text = "x".repeat(100_000);
+        let paste = encode_paste(&text, true);
+        writer.send(paste.clone()).unwrap();
+        writer.send(b"\x1b:wq\r".to_vec()).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), paste);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            b"\x1b:wq\r"
+        );
+    }
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())

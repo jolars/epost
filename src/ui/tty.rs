@@ -6,7 +6,9 @@
 use std::io::{self, BufWriter, Stdout};
 
 use anyhow::{Context, Result};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -26,21 +28,36 @@ use ratatui::backend::CrosstermBackend;
 /// users on terminals where they want native drag-select can opt out.
 pub fn enter(mouse: bool) -> Result<Terminal<CrosstermBackend<BufWriter<Stdout>>>> {
     enable_raw_mode().context("enabling raw mode")?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen).context("entering alternate screen")?;
-    if mouse {
-        execute!(out, EnableMouseCapture).context("enabling mouse capture")?;
+    let result = (|| {
+        let mut out = io::stdout();
+        execute!(out, EnterAlternateScreen, EnableBracketedPaste)
+            .context("entering alternate screen")?;
+        if mouse {
+            execute!(out, EnableMouseCapture).context("enabling mouse capture")?;
+        }
+        let buffered = BufWriter::with_capacity(1 << 16, out);
+        Terminal::new(CrosstermBackend::new(buffered)).context("constructing terminal")
+    })();
+    if result.is_err() {
+        let _ = leave(mouse);
     }
-    let buffered = BufWriter::with_capacity(1 << 16, out);
-    Terminal::new(CrosstermBackend::new(buffered)).context("constructing terminal")
+    result
 }
 
 pub fn leave(mouse: bool) -> Result<()> {
     let mut out = io::stdout();
-    if mouse {
-        execute!(out, DisableMouseCapture).context("disabling mouse capture")?;
-    }
-    execute!(out, LeaveAlternateScreen).context("leaving alternate screen")?;
-    disable_raw_mode().context("disabling raw mode")?;
+    // Attempt every reset even if an earlier write fails.
+    let paste = execute!(out, DisableBracketedPaste);
+    let mouse = if mouse {
+        execute!(out, DisableMouseCapture)
+    } else {
+        Ok(())
+    };
+    let screen = execute!(out, LeaveAlternateScreen);
+    let raw = disable_raw_mode();
+    paste.context("disabling bracketed paste")?;
+    mouse.context("disabling mouse capture")?;
+    screen.context("leaving alternate screen")?;
+    raw.context("disabling raw mode")?;
     Ok(())
 }

@@ -15,6 +15,7 @@ pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
     // Tab-switch chords stay global so the user can navigate away
     // even when an editor session is intercepting everything else.
     if global(app, k) {
+        crate::ui::paste::clear_prefixes(app);
         return;
     }
 
@@ -252,6 +253,10 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             dispatch_yank(app, cfg, text, "yanked".to_string());
         }
         match outcome {
+            compose::KeyOutcome::ClipboardPaste(placement) => {
+                crate::ui::paste::request(app, cfg, placement);
+                return;
+            }
             compose::KeyOutcome::Consumed => {
                 // After every consumed compose key, re-derive the
                 // address-completion popup state. This is where the
@@ -781,6 +786,12 @@ pub(crate) fn yank_visual(app: &mut App, cfg: &Config) {
 }
 
 fn command(app: &mut App, cfg: &Config, k: KeyEvent) {
+    if let Some(shortcut) = app.cmdline.paste_prefix.handle(k, false) {
+        if let crate::ui::paste::Shortcut::Read(placement) = shortcut {
+            crate::ui::paste::request(app, cfg, placement);
+        }
+        return;
+    }
     match k.code {
         KeyCode::Esc => exit_command(app),
         KeyCode::Backspace if app.cmdline.is_empty() => exit_command(app),
@@ -801,7 +812,15 @@ fn command(app: &mut App, cfg: &Config, k: KeyEvent) {
 /// Up/Down (and Ctrl-N/Ctrl-P, fzf-style) walk the result list without
 /// leaving the search field — the reader pane follows automatically
 /// via the next-tick `ensure_body_for_selection`.
-fn search(app: &mut App, _cfg: &Config, k: KeyEvent) {
+fn search(app: &mut App, cfg: &Config, k: KeyEvent) {
+    if let Some(s) = app.inbox_mut().search.as_mut()
+        && let Some(shortcut) = s.query.paste_prefix.handle(k, false)
+    {
+        if let crate::ui::paste::Shortcut::Read(placement) = shortcut {
+            crate::ui::paste::request(app, cfg, placement);
+        }
+        return;
+    }
     match k.code {
         KeyCode::Esc => app.exit_search_cancel(),
         KeyCode::Enter => app.exit_search_commit(),

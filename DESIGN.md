@@ -228,6 +228,14 @@ browser = ["xdg-open"]
 protocol = "auto"
 max_height_cells = 24   # cap image height; preserves aspect ratio
 
+[clipboard]
+# Optional command for explicit Vim clipboard paste. Its stdout must be UTF-8
+# text; arguments are passed directly, without a shell. Unset = use the
+# terminal's paste shortcut, or configure a command before using Vim paste.
+# Copying remains controlled by [reader].clipboard.
+# paste_command = ["wl-paste", "--no-newline", "--type", "text"]
+# paste_command = ["xclip", "-selection", "clipboard", "-out"]
+
 # Accounts: named tables. The name ("personal", "work") is a stable id used
 # in the UI and in keybindings that reference an account.
 
@@ -582,6 +590,15 @@ fixture lets us catch layout drift without needing a window open.
   `emit_osc8_hyperlinks`.
 - **Resize:** crossterm `Resize` events trigger a re-layout of the reader
   cells and re-emission of inline image draws at the new geometry.
+- **Paste:** bracketed paste is enabled for the session and disabled on exit,
+  setup failure, or panic. Paste events insert text into the focused editable
+  input, bypassing key dispatch and command submission. The native body keeps
+  multiline text; single-line fields replace line breaks and tabs with spaces.
+  Composer `"+p`/`"+P` and text-input `Ctrl-R +` read the configured clipboard
+  command on a worker thread. Later input cancels pending insertion, and reads
+  time out after five seconds. Embedded editors receive ordered PTY paste
+  writes, bracketed when requested by the child. Visual Block paste, other
+  named registers, and terminal clipboard queries remain deferred.
 
 ## Out of scope for v1 (do not build)
 

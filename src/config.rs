@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub reader: Reader,
     #[serde(default)]
+    pub clipboard: Clipboard,
+    #[serde(default)]
     pub images: Images,
     #[serde(default)]
     pub compose: Compose,
@@ -32,6 +34,15 @@ pub struct Config {
     pub accounts: HashMap<String, Account>,
     #[serde(default)]
     pub keys: HashMap<String, HashMap<String, String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Clipboard {
+    /// Command whose stdout supplies text for explicit clipboard paste.
+    /// Terminal paste needs no command. Arguments are passed without a shell.
+    #[serde(default)]
+    pub paste_command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,6 +609,23 @@ fn expand_tilde(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_paste_command_is_optional_and_strict() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.clipboard.paste_command.is_none());
+        let cfg: Config = toml::from_str(
+            "[clipboard]\npaste_command = ['wl-paste', '--no-newline', '--type', 'text']",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.clipboard.paste_command.unwrap(),
+            ["wl-paste", "--no-newline", "--type", "text"]
+        );
+        assert!(toml::from_str::<Config>("[clipboard]\nunknown = true").is_err());
+        let cfg: Config = toml::from_str("[reader]\nclipboard = ['wl-copy']").unwrap();
+        assert_eq!(cfg.reader.clipboard.unwrap(), ["wl-copy"]);
+    }
 
     #[test]
     fn compose_wrap_defaults_to_word_or_glyph() {

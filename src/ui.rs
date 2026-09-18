@@ -14,6 +14,7 @@ pub mod keys;
 pub mod list;
 pub mod motion;
 pub mod mouse;
+pub mod paste;
 pub mod reader;
 pub mod search;
 pub mod style;

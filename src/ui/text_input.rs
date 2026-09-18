@@ -11,6 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub struct TextInput {
     buf: String,
     cursor: usize,
+    pub paste_prefix: crate::ui::paste::Prefix,
 }
 
 impl TextInput {
@@ -21,7 +22,11 @@ impl TextInput {
     pub fn from_string(s: impl Into<String>) -> Self {
         let buf: String = s.into();
         let cursor = buf.len();
-        Self { buf, cursor }
+        Self {
+            buf,
+            cursor,
+            paste_prefix: Default::default(),
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -41,6 +46,11 @@ impl TextInput {
     pub fn insert_char(&mut self, c: char) {
         self.buf.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+    }
+
+    pub fn insert_str(&mut self, text: &str) {
+        self.buf.insert_str(self.cursor, text);
+        self.cursor += text.len();
     }
 
     pub fn delete_left(&mut self) {
@@ -81,6 +91,7 @@ impl TextInput {
     }
 
     pub fn clear(&mut self) {
+        self.paste_prefix = Default::default();
         self.buf.clear();
         self.cursor = 0;
     }
@@ -176,6 +187,7 @@ impl TextInput {
 
     /// Take the buffer's contents, leaving the input empty.
     pub fn take(&mut self) -> String {
+        self.paste_prefix = Default::default();
         self.cursor = 0;
         std::mem::take(&mut self.buf)
     }

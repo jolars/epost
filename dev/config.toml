@@ -27,6 +27,11 @@ browser = ["./dev/browser-stub"]
 # keep the terminal's native drag-select and middle-click paste.
 # mouse = false
 
+[clipboard]
+# Optional command for `"+p` / `"+P` and Insert-mode `Ctrl-R +`.
+# Terminal paste works without this setting.
+# paste_command = ["wl-paste", "--no-newline", "--type", "text"]
+
 [search]
 # Folders covered by `g/` (global) search, in priority order. Empty list
 # means "every folder, score-only ranking." Trash/Spam are excluded by

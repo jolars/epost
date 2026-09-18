@@ -22,7 +22,8 @@
 //!   top row, replayed across the rest on Esc).
 //!
 //! Out of scope (deferred): block-paste (`p` of a rectangle), dot-repeat
-//! (`.`), named registers, macros, `;`/`,` find-repeat, ex-commands
+//! (`.`), named registers other than clipboard paste (`+`), macros,
+//! `;`/`,` find-repeat, ex-commands
 //! beyond the host cmdline. Case/reflow/indent operators are 2 undo
 //! steps (delete + insert); deletes and yanks are 1.
 
@@ -35,6 +36,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::ComposeWrap;
 use crate::ui::motion::{self, Motion, MotionKind, MotionSpan, MotionTarget, Region};
+use crate::ui::paste::{Placement, Prefix, Shortcut};
 use crate::ui::textobj::{self, TextObjKind};
 use crate::ui::words::{self, WordMotion};
 
@@ -207,6 +209,7 @@ pub struct BodyYankHighlight {
 pub enum KeyOutcome {
     Consumed,
     PassThrough,
+    ClipboardPaste(Placement),
     /// Compose-level signal: close the active tab without saving.
     /// Used by the "discard" arm of the close-confirm prompt.
     CloseTab,
@@ -236,6 +239,7 @@ pub struct BodyEditor {
     block_insert: Option<BlockInsert>,
     /// Operator-pending / count / chord parse state.
     ops: OpState,
+    paste_prefix: Prefix,
     /// Reflow width for `gw` / `gq`, refreshed from `[compose].text_width`
     /// on every keystroke (the editor doesn't store the whole config).
     text_width: u16,
@@ -290,6 +294,7 @@ impl BodyEditor {
             block_anchor: None,
             block_insert: None,
             ops: OpState::default(),
+            paste_prefix: Prefix::None,
             text_width: 72,
             yank: None,
             clipboard_yank: None,
@@ -324,10 +329,15 @@ impl BodyEditor {
     /// awaiting its next key). The compose `q` quick-close defers to
     /// this so `gq` and friends complete instead of closing the tab.
     pub fn pending_chord(&self) -> bool {
-        self.ops.pending()
+        self.ops.pending() || self.paste_prefix != Prefix::None
+    }
+
+    pub fn clear_paste_prefix(&mut self) {
+        self.paste_prefix = Prefix::None;
     }
 
     pub fn set_text(&mut self, s: &str) {
+        self.clear_paste_prefix();
         let lines = split_for_textarea(s);
         self.textarea.set_lines(lines, (0, 0));
         self.textarea.cancel_selection();
@@ -412,6 +422,19 @@ impl BodyEditor {
     }
 
     pub fn handle_key(&mut self, k: KeyEvent, text_width: u16) -> KeyOutcome {
+        // Quoted text objects and find/replace captures must see their literal
+        // target before the clipboard register parser gets a chance to run.
+        if !self.ops.pending()
+            && let Some(shortcut) = self.paste_prefix.handle(
+                k,
+                matches!(self.mode, BodyMode::Normal | BodyMode::Visual(_)),
+            )
+        {
+            return match shortcut {
+                Shortcut::Consumed => KeyOutcome::Consumed,
+                Shortcut::Read(placement) => KeyOutcome::ClipboardPaste(placement),
+            };
+        }
         // Refresh the reflow width each keystroke — the editor doesn't
         // hold the config, the host threads `[compose].text_width` in.
         self.text_width = if text_width == 0 { 72 } else { text_width };
@@ -431,6 +454,81 @@ impl BodyEditor {
     /// clipboard. The host calls this after each handled compose key.
     pub fn take_clipboard_yank(&mut self) -> Option<String> {
         self.clipboard_yank.take()
+    }
+
+    pub fn paste(&mut self, text: &str, placement: Placement) -> Result<(), &'static str> {
+        if self.mode == BodyMode::Visual(VisualKind::Block) {
+            return Err("paste: visual-block paste is not supported");
+        }
+        self.clear_paste_prefix();
+        self.ops = OpState::default();
+        let text = crate::ui::paste::normalize(text, false);
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.yank_highlight = None;
+        // A pasted chunk is independent of a preceding block-insert gesture.
+        // Otherwise Esc could replay clipboard text onto unrelated rows.
+        self.block_insert = None;
+        let mut linewise_row = None;
+        if let BodyMode::Visual(kind) = self.mode {
+            let region = self.visual_region(kind).expect("block rejected above");
+            let replacement = if region.linewise {
+                text.strip_suffix('\n').unwrap_or(&text)
+            } else {
+                &text
+            };
+            if region.start == region.end && !region.linewise {
+                self.textarea.cancel_selection();
+                self.textarea.insert_str(replacement);
+            } else {
+                self.replace_region(&region, replacement);
+            }
+            self.exit_visual_to_normal();
+        } else if self.mode == BodyMode::Normal
+            && placement != Placement::Cursor
+            && text.ends_with('\n')
+        {
+            let row = self.textarea.cursor().0;
+            if self.textarea.lines().len() == 1 && self.textarea.lines()[0].is_empty() {
+                // The empty buffer's placeholder line is replaced by the put;
+                // it should not become an extra blank line beside the payload.
+                self.textarea.insert_str(text.strip_suffix('\n').unwrap());
+                linewise_row = Some(0);
+            } else if placement == Placement::Before {
+                self.textarea.move_cursor(CursorMove::Head);
+                self.textarea.insert_str(&text);
+                linewise_row = Some(row);
+            } else {
+                self.textarea.move_cursor(CursorMove::End);
+                // Rotate exactly one newline to the front, retaining trailing
+                // blank lines while recording the insertion as one undo step.
+                self.textarea
+                    .insert_str(format!("\n{}", text.strip_suffix('\n').unwrap()));
+                linewise_row = Some(row + 1);
+            }
+        } else {
+            if placement == Placement::After {
+                let (row, col) = self.textarea.cursor();
+                let end = self.textarea.lines()[row].chars().count();
+                if col < end {
+                    self.textarea.move_cursor(CursorMove::Forward);
+                }
+            }
+            self.textarea.insert_str(&text);
+        }
+        if let Some(row) = linewise_row {
+            self.textarea.move_cursor(CursorMove::Jump(row as u16, 0));
+        } else if self.mode == BodyMode::Normal {
+            // Relative movement avoids truncating a long paste's coordinates
+            // to the u16 values accepted by Jump.
+            if self.textarea.cursor().1 > 0 {
+                self.textarea.move_cursor(CursorMove::Back);
+            }
+        }
+        self.sync_goal();
+        self.sync_cursor_style();
+        Ok(())
     }
 
     fn record_yank(&mut self, text: String, line_wise: bool) {
@@ -2500,6 +2598,121 @@ mod tests {
         for ke in keys {
             ed.handle_key(*ke, 72);
         }
+    }
+
+    #[test]
+    fn clipboard_paste_is_one_undo_step_and_preserves_register() {
+        let mut ed = BodyEditor::new("ab");
+        feed(&mut ed, &[k('y'), k('y')]);
+        let yank = ed.yank.as_ref().unwrap().text.clone();
+        let _ = ed.take_clipboard_yank();
+        ed.paste("é\r\n\tq\n\n", Placement::Cursor).unwrap();
+        assert_eq!(ed.text(), "é\n\tq\n\nab");
+        assert_eq!(ed.mode, BodyMode::Normal);
+        assert_eq!(ed.yank.as_ref().unwrap().text, yank);
+        assert!(ed.take_clipboard_yank().is_none());
+        ed.handle_key(k('u'), 72);
+        assert_eq!(ed.text(), "ab");
+        ed.handle_key(ctrl('r'), 72);
+        assert_eq!(ed.text(), "é\n\tq\n\nab");
+    }
+
+    #[test]
+    fn clipboard_put_before_after_and_linewise_blank_lines() {
+        for (placement, expected) in [(Placement::Before, "éab"), (Placement::After, "aéb")] {
+            let mut ed = BodyEditor::new("ab");
+            ed.paste("é", placement).unwrap();
+            assert_eq!(ed.text(), expected);
+        }
+        for (placement, expected, cursor) in [
+            (Placement::Before, "x\n\na\nb", (0, 0)),
+            (Placement::After, "a\nx\n\nb", (1, 0)),
+        ] {
+            let mut ed = BodyEditor::new("a\nb");
+            ed.paste("x\n\n", placement).unwrap();
+            assert_eq!(ed.text(), expected);
+            assert_eq!(ed.textarea.cursor(), cursor);
+            ed.handle_key(k('u'), 72);
+            assert_eq!(ed.text(), "a\nb");
+        }
+    }
+
+    #[test]
+    fn clipboard_linewise_put_into_empty_body_does_not_add_a_blank_line() {
+        for placement in [Placement::Before, Placement::After] {
+            let mut ed = BodyEditor::new("");
+            ed.paste("first\n\n", placement).unwrap();
+            assert_eq!(ed.text(), "first\n");
+            assert_eq!(ed.textarea.cursor(), (0, 0));
+            ed.handle_key(k('u'), 72);
+            assert_eq!(ed.text(), "");
+        }
+    }
+
+    #[test]
+    fn clipboard_paste_insert_and_replace_preserve_modes() {
+        for key in ['i', 'R'] {
+            let mut ed = BodyEditor::new("ab");
+            ed.handle_key(k(key), 72);
+            let mode = ed.mode;
+            ed.paste("文\tx", Placement::Cursor).unwrap();
+            assert_eq!(ed.text(), "文\txab");
+            assert_eq!(ed.textarea.cursor(), (0, 3));
+            assert_eq!(ed.mode, mode);
+        }
+    }
+
+    #[test]
+    fn clipboard_paste_keeps_cursor_on_long_lines() {
+        let mut ed = BodyEditor::new("");
+        let text = "é".repeat(70_000);
+        ed.paste(&text, Placement::Cursor).unwrap();
+        assert_eq!(ed.textarea.cursor(), (0, 69_999));
+        ed.paste("x", Placement::After).unwrap();
+        assert_eq!(ed.textarea.cursor(), (0, 70_000));
+        assert!(ed.text().ends_with("éx"));
+    }
+
+    #[test]
+    fn clipboard_paste_replaces_visual_char_and_line_but_not_block() {
+        let mut ed = BodyEditor::new("abc\ndef\nghi");
+        feed(&mut ed, &[k('v'), k('l')]);
+        ed.paste("文", Placement::Cursor).unwrap();
+        assert_eq!(ed.text(), "文c\ndef\nghi");
+        assert_eq!(ed.mode, BodyMode::Normal);
+        feed(&mut ed, &[k('V'), k('j')]);
+        ed.paste("one\ntwo\n", Placement::Cursor).unwrap();
+        assert_eq!(ed.text(), "one\ntwo\nghi");
+        assert_eq!(ed.mode, BodyMode::Normal);
+        ed.handle_key(ctrl('v'), 72);
+        let before = ed.text();
+        assert!(ed.paste("bad", Placement::Cursor).is_err());
+        assert_eq!(ed.text(), before);
+        assert_eq!(ed.mode, BodyMode::Visual(VisualKind::Block));
+    }
+
+    #[test]
+    fn clipboard_shortcuts_do_not_steal_quotes_or_redo() {
+        let mut ed = BodyEditor::new("a\"bc\"d");
+        feed(&mut ed, &[k('l'), k('d'), k('i'), k('"')]);
+        assert_eq!(ed.text(), "a\"\"d");
+        ed.handle_key(k('u'), 72);
+        ed.handle_key(ctrl('r'), 72);
+        assert_eq!(ed.text(), "a\"\"d");
+        ed.handle_key(k('r'), 72);
+        ed.handle_key(k('"'), 72);
+        assert_eq!(ed.paste_prefix, Prefix::None);
+        feed(&mut ed, &[k('"'), k('+')]);
+        assert!(matches!(
+            ed.handle_key(k('p'), 72),
+            KeyOutcome::ClipboardPaste(Placement::After)
+        ));
+        feed(&mut ed, &[k('i'), ctrl('r')]);
+        assert!(matches!(
+            ed.handle_key(k('+'), 72),
+            KeyOutcome::ClipboardPaste(Placement::Cursor)
+        ));
+        assert_eq!(ed.mode, BodyMode::Insert);
     }
 
     #[test]

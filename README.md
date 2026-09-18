@@ -78,6 +78,36 @@ schema.
 CLI flags: `--config <path>` and `--cache <path>` override the config and index
 locations.
 
+## Clipboard paste
+
+Use your terminal's paste shortcut (often `Ctrl-Shift-V`) in the composer
+body, headers, attachment path input, command line, or search. Pasted text
+stays in the focused input; line breaks in single-line fields become spaces,
+and pasting never submits the field. Terminal paste also works inside the
+embedded `$EDITOR`.
+
+For Vim clipboard paste, configure a command that prints clipboard text:
+
+```toml
+[clipboard]
+paste_command = ["wl-paste", "--no-newline", "--type", "text"]
+# X11 alternative:
+# paste_command = ["xclip", "-selection", "clipboard", "-out"]
+```
+
+Install the chosen command separately (for example, `wl-clipboard` on
+NixOS). Use `"+p` or `"+P` in composer Normal mode to paste after or before
+the cursor. In Insert/Replace mode, the attachment path input, command line,
+or search, use `Ctrl-R` followed by `+`. Ordinary body `p`/`P` keep using
+epost's internal yank buffer, and Normal-mode `Ctrl-R` remains redo.
+
+Body paste preserves indentation and trailing newlines. Visual Char/Line
+paste replaces the selection; Visual Block paste is not supported. Clipboard
+commands run on the desktop hosting epost; use terminal paste over SSH.
+A clipboard read expires after five seconds, and further keyboard, paste,
+or mouse input cancels its pending insertion. Existing `[reader].clipboard`
+settings continue to control copying.
+
 ## Development
 
 The devshell (Rust toolchain, `bacon`, `mbsync`, `msmtp`, `cargo-insta`) comes
