@@ -791,7 +791,7 @@ pub fn draw(
     let lines: Vec<Line<'static>> = if inbox.selected_message_row().is_some() {
         match &inbox.parsed {
             Some(parsed) => {
-                let mut out = render_headers(inbox);
+                let mut out = render_headers(inbox, inner_width);
                 out.push(Line::raw(""));
                 let pick = if mode == Mode::LinkPick {
                     Some(link_pick_buf)
@@ -832,7 +832,7 @@ pub fn draw(
                 laid = Some(body);
                 combined
             }
-            None => render_headers(inbox),
+            None => render_headers(inbox, inner_width),
         }
     } else if inbox.search.is_some() {
         vec![dim_line("(no matches)")]
@@ -1377,15 +1377,29 @@ fn selected_subject(inbox: &InboxScreen) -> Option<String> {
     inbox.selected_message_row().and_then(|r| r.subject.clone())
 }
 
-fn render_headers(inbox: &InboxScreen) -> Vec<Line<'static>> {
+fn render_headers(inbox: &InboxScreen, width: u16) -> Vec<Line<'static>> {
     let Some(row) = inbox.selected_message_row() else {
         return Vec::new();
     };
-    let mut out = Vec::with_capacity(6);
+    let mut out = Vec::with_capacity(7);
     out.push(header_line(
         "From",
         row.from_addr.as_deref().unwrap_or("(unknown)"),
     ));
+    let to = inbox
+        .parsed
+        .as_ref()
+        .map(|parsed| parsed.to.join(", "))
+        .unwrap_or_default();
+    out.push(header_line("To", &to));
+    if let Some(parsed) = &inbox.parsed {
+        if !parsed.cc.is_empty() {
+            out.push(header_line("Cc", &parsed.cc.join(", ")));
+        }
+        if !parsed.bcc.is_empty() {
+            out.push(header_line("Bcc", &parsed.bcc.join(", ")));
+        }
+    }
     out.push(header_line(
         "Subject",
         row.subject.as_deref().unwrap_or("(no subject)"),
@@ -1401,7 +1415,10 @@ fn render_headers(inbox: &InboxScreen) -> Vec<Line<'static>> {
     if !row.flags.is_empty() {
         out.push(header_line("Flags", &row.flags));
     }
-    out
+    // Count wrapped header rows before positioning the body cursor and images.
+    out.into_iter()
+        .flat_map(|line| hard_wrap_line(line, width))
+        .collect()
 }
 
 /// Walk a Block-IR tree at the given width into ratatui lines plus a
@@ -2350,6 +2367,115 @@ fn _force_use(_inbox: &InboxScreen, _mode: Mode, _parsed: &ParsedBody) {}
 mod tests {
     use super::*;
     use crate::mail::html;
+
+    fn inbox_with_recipients(recipients: &str) -> (tempfile::TempDir, InboxScreen) {
+        use crate::mail::parse;
+        use crate::store::{index::MessageRow, thread::ThreadedRow, watch::SelfWrites};
+        use crate::ui::app::ScanState;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("message:2,S");
+        let message = format!(
+            "Message-ID: <recipients@example.com>\r\n\
+             From: Sender <sender@example.com>\r\n\
+             {recipients}\
+             Subject: Recipients\r\n\r\nbody\r\n"
+        );
+        std::fs::write(&path, &message).unwrap();
+        let headers = parse::parse_headers(message.as_bytes()).unwrap();
+        let cache = tmp.path().join("index.sqlite");
+        let self_writes = SelfWrites::new();
+        let mut inbox = InboxScreen::new(
+            &crate::config::Config::default(),
+            &cache,
+            self_writes.clone(),
+            None,
+        );
+        inbox.scan = ScanState::Ready(vec![ThreadedRow {
+            depth: 0,
+            row: MessageRow {
+                msgid: headers.msgid,
+                account: "personal".into(),
+                folder: "INBOX".into(),
+                path,
+                date: headers.date,
+                from_addr: headers.from,
+                subject: headers.subject,
+                in_reply: headers.in_reply,
+                refs: headers.refs,
+                flags: "S".into(),
+            },
+        }]);
+        let mut error = None;
+        inbox.ensure_body(None, 24, &cache, &self_writes, &mut error);
+        assert!(error.is_none(), "{error:?}");
+        (tmp, inbox)
+    }
+
+    #[test]
+    fn recipient_headers_show_to_and_only_present_cc_and_bcc() {
+        for (optional, expected) in [
+            ("", vec![]),
+            ("Cc:\r\nBcc:\r\n", vec![]),
+            (
+                "Cc: Copy <copy@example.com>\r\n",
+                vec!["Cc: Copy <copy@example.com>"],
+            ),
+            (
+                "Bcc: hidden@example.com\r\n",
+                vec!["Bcc: hidden@example.com"],
+            ),
+            (
+                "Cc: Copy <copy@example.com>\r\nBcc: hidden@example.com\r\n",
+                vec!["Cc: Copy <copy@example.com>", "Bcc: hidden@example.com"],
+            ),
+        ] {
+            let recipients = format!(
+                "To: =?UTF-8?Q?Jos=C3=A9?= <first@example.com>,\r\n \
+                 second@example.com\r\n{optional}"
+            );
+            let (_tmp, inbox) = inbox_with_recipients(&recipients);
+            let lines: Vec<String> = render_headers(&inbox, 120)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            let recipients: Vec<&str> = lines
+                .iter()
+                .filter(|line| ["To:", "Cc:", "Bcc:"].iter().any(|p| line.starts_with(p)))
+                .map(String::as_str)
+                .collect();
+            let mut expected_headers = vec!["To: José <first@example.com>, second@example.com"];
+            expected_headers.extend(expected);
+            assert_eq!(recipients, expected_headers, "headers: {optional:?}");
+        }
+    }
+
+    #[test]
+    fn recipient_headers_wrap_without_displacing_body_cursor() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (_tmp, mut inbox) = inbox_with_recipients(
+            "To: First <first@example.com>, Second <second@example.com>\r\n\
+             Cc: copy@example.com\r\nBcc: hidden@example.com\r\n",
+        );
+        inbox.focus = Pane::Reader;
+        // The plain-text fallback note occupies the first body line.
+        inbox.reader_cursor_line = 1;
+        let mut terminal = Terminal::new(TestBackend::new(42, 20)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, frame.area(), &mut inbox, Mode::Normal, "", "", false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let body_row = (1..19)
+            .find(|&y| buffer[(1, y)].symbol() == "b" && buffer[(2, y)].symbol() == "o")
+            .expect("body should be visible below the recipient headers");
+        assert_eq!(
+            body_row,
+            1 + inbox.last_reader_header_offset + inbox.reader_cursor_line
+        );
+        assert!(buffer[(1, body_row)].modifier.contains(Modifier::REVERSED));
+        assert!(inbox.last_reader_header_offset >= 9);
+    }
 
     fn layout_first_para(html_src: &str, w: u16) -> Vec<String> {
         let blocks = html::parse(html_src);

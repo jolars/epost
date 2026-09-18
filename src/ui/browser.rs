@@ -231,6 +231,9 @@ mod tests {
         let cmd = run_stub(out);
         let body = ParsedBody {
             msgid: "x@y".into(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
             blocks: Vec::new(),
             raw_html: Some("<p>hello</p>".into()),
             plain_fallback: None,

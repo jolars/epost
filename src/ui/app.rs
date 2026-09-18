@@ -89,6 +89,9 @@ pub struct ParsedBody {
     // currently drives re-parsing.
     #[allow(dead_code)]
     pub msgid: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     pub blocks: Vec<Block>,
     pub raw_html: Option<String>,
     pub plain_fallback: Option<String>,
@@ -2268,6 +2271,9 @@ impl InboxScreen {
                 );
                 self.parsed = Some(Box::new(ParsedBody {
                     msgid: msgid.clone(),
+                    to: body.to,
+                    cc: body.cc,
+                    bcc: body.bcc,
                     blocks,
                     raw_html: body.html,
                     plain_fallback: body.plain,
@@ -3943,6 +3949,9 @@ mod focus_nav_tests {
     fn parsed_with_attachments(n: usize) -> Box<ParsedBody> {
         Box::new(ParsedBody {
             msgid: "x@y".into(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
             blocks: Vec::new(),
             raw_html: None,
             plain_fallback: None,

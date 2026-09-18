@@ -25,6 +25,9 @@ pub struct Headers {
 
 #[derive(Debug, Clone, Default)]
 pub struct Body {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     pub html: Option<String>,
     pub plain: Option<String>,
     /// Inline parts keyed by `Content-ID` (with surrounding `<>` stripped).
@@ -112,6 +115,9 @@ pub fn parse_body(bytes: &[u8]) -> Body {
     }
 
     Body {
+        to: collect_addrs(msg.to()),
+        cc: collect_addrs(msg.cc()),
+        bcc: collect_addrs(msg.bcc()),
         html,
         plain,
         cid_parts,

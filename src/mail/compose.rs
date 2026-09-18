@@ -687,6 +687,7 @@ mod tests {
             plain: Some("hey\n\nlet's grab food\n".into()),
             cid_parts: HashMap::new(),
             attachments: Vec::new(),
+            ..Body::default()
         }
     }
 
@@ -833,6 +834,7 @@ mod tests {
             plain: Some("one\n\nthree\n".into()),
             cid_parts: HashMap::new(),
             attachments: Vec::new(),
+            ..Body::default()
         };
         let q = quote_reply(&h, &b);
         assert!(q.contains("> one"));
