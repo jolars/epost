@@ -506,16 +506,16 @@ fn send_blocking(bytes: &[u8], smtp_cmd: &[String], sent_cur_dir: Option<&Path>)
 
     // Close stdin (by dropping it after writing) so msmtp sees EOF and
     // proceeds — leaving it open hangs the wait.
-    {
+    let write_result = {
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| "msmtp stdin not piped".to_string())?;
-        stdin
-            .write_all(bytes)
-            .map_err(|e| format!("msmtp stdin: {e}"))?;
-    }
+        stdin.write_all(bytes)
+    };
 
+    // Reap the child even if it closed stdin early, so its error takes
+    // precedence over a broken pipe.
     let output = child
         .wait_with_output()
         .map_err(|e| format!("waiting for msmtp: {e}"))?;
@@ -528,6 +528,7 @@ fn send_blocking(bytes: &[u8], smtp_cmd: &[String], sent_cur_dir: Option<&Path>)
             truncated.trim()
         ));
     }
+    write_result.map_err(|e| format!("msmtp stdin: {e}"))?;
 
     // msmtp accepted the message. Try to drop a copy in Sent/cur; a
     // failure here doesn't unsend the message, so surface it as
@@ -951,12 +952,56 @@ mod tests {
 
     #[test]
     fn send_blocking_non_zero_exit_errors() {
-        let cmd = vec!["/bin/sh".into(), "-c".into(), "exit 9".into()];
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat > /dev/null; exit 9".into(),
+        ];
         let out = send_blocking(b"x", &cmd, None);
         match out {
             Err(s) => assert!(s.contains("exit 9"), "msg: {s}"),
             Ok(o) => panic!("expected error, got {o:?}"),
         }
+    }
+
+    #[test]
+    fn send_blocking_early_exit_reports_status_and_stderr() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sent_cur = tmp.path().join("Sent/cur");
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo 'rejected message' >&2; exit 9".into(),
+        ];
+        // Exceed the pipe buffer so the write fails even if the parent runs first.
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
+        let out = send_blocking(&bytes, &cmd, Some(&sent_cur));
+        match out {
+            Err(s) => assert_eq!(s, "msmtp exit 9: rejected message"),
+            Ok(o) => panic!("expected error, got {o:?}"),
+        }
+        assert!(
+            !sent_cur.exists(),
+            "failed sends must not create a Sent copy"
+        );
+    }
+
+    #[test]
+    fn send_blocking_early_success_rejects_incomplete_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sent_cur = tmp.path().join("Sent/cur");
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+        // A successful exit cannot override failure to write the whole message.
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
+        let out = send_blocking(&bytes, &cmd, Some(&sent_cur));
+        assert!(
+            matches!(out, Err(ref s) if s.starts_with("msmtp stdin:")),
+            "{out:?}"
+        );
+        assert!(
+            !sent_cur.exists(),
+            "incomplete sends must not create a Sent copy"
+        );
     }
 
     #[test]
