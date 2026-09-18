@@ -51,7 +51,8 @@ pub struct AddressCompleteState {
 /// to the regular TextInput dispatch (and then re-queries the popup).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyDispatch {
-    /// Popup consumed the key (navigation, Esc, Enter).
+    /// Popup navigation or dismissal. The host also forwards Escape to
+    /// the header editor to leave Insert mode.
     Consumed,
     /// Key wasn't ours; host should pass it through to the TextInput
     /// for normal editing, then refresh the popup.
@@ -135,7 +136,7 @@ pub fn move_selection(state: &mut AddressCompleteState, delta: i32) {
 /// `PassThrough` for keys the popup doesn't bind (the host then routes
 /// them to the underlying TextInput and re-queries).
 pub fn handle_key(state: &mut AddressCompleteState, k: KeyEvent) -> KeyDispatch {
-    // Esc is always "close popup, don't leave compose mode."
+    // The host closes the popup and lets Escape leave header Insert mode.
     if k.code == KeyCode::Esc {
         return KeyDispatch::Consumed;
     }

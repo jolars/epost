@@ -420,8 +420,11 @@ pub fn handle_key(screen: &mut ComposeScreen, k: KeyEvent, cfg: &Config) -> KeyO
                     let parked = state.token.clone();
                     screen.address_complete = None;
                     screen.address_complete_suppressed = Some(parked);
+                    // Escape must also reach the header editor so one press
+                    // dismisses completion and leaves Insert mode.
+                } else {
+                    return KeyOutcome::Consumed;
                 }
-                return KeyOutcome::Consumed;
             }
             KeyDispatch::Accept => {
                 // Apply the chosen contact into the focused field.
@@ -1416,6 +1419,58 @@ mod tests {
         assert!(matches!(out, KeyOutcome::Consumed));
         assert!(s.confirm_close.is_none());
         assert_eq!(s.to.as_str(), "q", "q typed into the field");
+    }
+
+    #[test]
+    fn esc_leaves_recipient_insert_with_completion() {
+        use crate::mail::addressbook::{Contact, Source};
+
+        let cfg = Config::default();
+        for field in [ComposeField::To, ComposeField::Cc, ComposeField::Bcc] {
+            for has_matches in [true, false] {
+                let mut s = blank();
+                s.set_focus(field);
+                handle_key(&mut s, key(KeyCode::Char('i'), KeyModifiers::NONE), &cfg);
+                for ch in "ali".chars() {
+                    handle_key(&mut s, key(KeyCode::Char(ch), KeyModifiers::NONE), &cfg);
+                }
+                let items = if has_matches {
+                    vec![Contact::from_raw("Alice <alice@example.com>", Source::Native).unwrap()]
+                } else {
+                    Vec::new()
+                };
+                s.address_complete = Some(AddressCompleteState {
+                    field,
+                    token_start: 0,
+                    token: "ali".into(),
+                    items,
+                    selected: 0,
+                });
+
+                let out = handle_key(&mut s, key(KeyCode::Esc, KeyModifiers::NONE), &cfg);
+
+                assert!(matches!(out, KeyOutcome::Consumed));
+                assert_eq!(
+                    s.header_mode,
+                    HeaderMode::Normal,
+                    "{field:?}, {has_matches}"
+                );
+                assert_eq!(s.focused, field);
+                assert!(s.address_complete.is_none());
+                let input = s.focused_input_mut().unwrap();
+                assert_eq!(input.as_str(), "ali", "Escape must not accept a suggestion");
+                assert_eq!(input.cursor(), 2, "Escape must nudge the cursor left once");
+
+                handle_key(&mut s, key(KeyCode::Char('h'), KeyModifiers::NONE), &cfg);
+                let input = s.focused_input_mut().unwrap();
+                assert_eq!(input.as_str(), "ali");
+                assert_eq!(
+                    input.cursor(),
+                    1,
+                    "the next key must act as a Normal motion"
+                );
+            }
+        }
     }
 
     #[test]
