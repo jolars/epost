@@ -78,6 +78,23 @@ schema.
 CLI flags: `--config <path>` and `--cache <path>` override the config and index
 locations.
 
+## Attaching files
+
+In a compose tab, focus the Attach row and press Enter on `+ Add attachment...`,
+or run `:attach` to open the file picker. Type a path or part of a filename to
+fuzzy-filter the current directory. The same drop-down appears while typing
+`:attach <path>`.
+
+- Use Up/Down or Ctrl-N/Ctrl-P to select a match.
+- Press Tab to complete the selected path. Enter opens a directory or attaches
+  the selected file. Shift-Tab selects the previous match.
+- Use `~/` for your home directory and `../` to go up. Type a leading `.` to
+  show hidden entries. Matching browses one directory at a time.
+- Press Escape to cancel. Paths with spaces need no quotes.
+
+Directory reads and fuzzy matching run in the background. Files are read when
+you send the message, so you can still edit an attachment after adding it.
+
 ## Clipboard paste
 
 Use your terminal's paste shortcut (often `Ctrl-Shift-V`) in the composer

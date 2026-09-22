@@ -28,6 +28,7 @@ pub use crate::ui::compose_body::KeyOutcome;
 use crate::ui::compose_body::{BodyEditor, BodyMode, VisualKind};
 use crate::ui::compose_header::{self, HeaderMode};
 use crate::ui::embed::EditorSession;
+use crate::ui::file_complete::{FileComplete, KeyDispatch};
 use crate::ui::style::{pane_block, pane_scrollbar};
 use crate::ui::text_input::TextInput;
 use crate::ui::width::disp_w;
@@ -58,11 +59,12 @@ pub enum ComposeField {
 ///   a one-line `TextInput`; `Enter` validates via
 ///   [`mail_compose::validate_attachment`] and (on success) pushes to
 ///   `attachments`, drops the input, and lands `selected` on the new
-///   row. `Esc` / `Tab` / `BackTab` cancel the input.
+///   row. `Tab` completes a path; `Esc` cancels the input.
 #[derive(Debug, Default)]
 pub struct AttachState {
     pub selected: usize,
     pub adding: Option<TextInput>,
+    pub completion: FileComplete,
 }
 
 pub struct ComposeScreen {
@@ -641,9 +643,16 @@ fn handle_attach_adding_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutco
             crate::ui::paste::Shortcut::Read(placement) => KeyOutcome::ClipboardPaste(placement),
         };
     }
+    if let Some(input) = screen.attach.adding.as_mut() {
+        match screen.attach.completion.handle_key(input, k) {
+            KeyDispatch::Consumed => return KeyOutcome::Consumed,
+            KeyDispatch::Submit | KeyDispatch::PassThrough => {}
+        }
+    }
     match k.code {
         KeyCode::Esc => {
             screen.attach.adding = None;
+            screen.attach.completion.clear();
         }
         KeyCode::Enter => {
             let raw = screen
@@ -662,6 +671,7 @@ fn handle_attach_adding_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutco
                     let n = screen.attachments.len();
                     screen.attach.selected = n - 1;
                     screen.attach.adding = None;
+                    screen.attach.completion.clear();
                     screen.pending_status = Some(format!("attached: {name} ({n} total)"));
                 }
                 Err(e) => {
@@ -670,14 +680,7 @@ fn handle_attach_adding_key(screen: &mut ComposeScreen, k: KeyEvent) -> KeyOutco
                 }
             }
         }
-        KeyCode::Tab => {
-            screen.attach.adding = None;
-            screen.focus_next();
-        }
-        KeyCode::BackTab => {
-            screen.attach.adding = None;
-            screen.focus_prev();
-        }
+        KeyCode::Tab | KeyCode::BackTab => {}
         _ => {
             if let Some(input) = screen.attach.adding.as_mut() {
                 let _ = input.handle(k);
@@ -996,7 +999,7 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         ))
     } else if attach_focused {
         let text = if screen.attach.adding.is_some() {
-            " type path  Enter add  Esc cancel  ~/ expands to $HOME "
+            " type to filter  ↑/↓ pick  Tab complete  Enter open/add  Esc cancel "
         } else {
             " j/k navigate  Enter/a add  d/x remove  Tab next  Ctrl-J body "
         };
@@ -1031,6 +1034,15 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         )
     {
         address_complete::draw(f, anchor, state, area);
+    }
+
+    if attach_focused
+        && screen.attach.adding.is_some()
+        && screen.from_picker.is_none()
+        && screen.confirm_close.is_none()
+        && let Some(anchor) = rows.get(5 + screen.attachments.len())
+    {
+        screen.attach.completion.draw(f, *anchor, area);
     }
 
     // The Save / Discard / Cancel prompt sits in front of everything

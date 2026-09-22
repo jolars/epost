@@ -58,6 +58,9 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         }
     };
     f.render_widget(Paragraph::new(line), area);
+    if app.mode == Mode::Command && app.active_compose().is_some() {
+        app.file_completion.draw(f, area, f.area());
+    }
 }
 
 /// Status-row banner while a list-pane multi-select is open, e.g.
@@ -525,6 +528,13 @@ fn attach_path(app: &mut App, full_cmd: &str) {
         app.status_error = Some("attach: not on a compose tab".into());
         return;
     };
+    if raw.is_empty() {
+        c.set_focus(compose::ComposeField::Attach);
+        c.attach.selected = c.attachments.len();
+        c.attach.adding = Some(crate::ui::text_input::TextInput::new());
+        c.attach.completion.clear();
+        return;
+    }
     match mail_compose::validate_attachment(raw) {
         Ok(path) => {
             let name = path

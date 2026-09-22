@@ -252,6 +252,7 @@ impl UndoStack {
 pub struct App {
     pub mode: Mode,
     pub cmdline: TextInput,
+    pub file_completion: crate::ui::file_complete::FileComplete,
     pub link_pick_buf: String,
     /// Digit buffer for the reader attachment picker (`gf`), mirroring
     /// `link_pick_buf`. Active only in `Mode::AttachmentPick`.
@@ -651,6 +652,7 @@ impl App {
         Self {
             mode: Mode::Normal,
             cmdline: TextInput::new(),
+            file_completion: Default::default(),
             link_pick_buf: String::new(),
             attachment_pick_buf: String::new(),
             pending_g: false,

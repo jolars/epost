@@ -253,6 +253,7 @@ fn tick(
     app.poll_clipboard();
     ui::paste::poll(app, cfg);
     app.poll_address_book(cfg);
+    ui::file_complete::poll(app);
     expire_yank_highlight(app);
     if let Some(c) = app.active_compose_mut() {
         c.body.expire_yank_highlight(cfg.reader.yank_highlight_ms);

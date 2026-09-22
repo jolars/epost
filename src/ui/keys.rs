@@ -12,6 +12,7 @@ use crate::ui::textobj::{self, TextObjKind};
 use crate::ui::{cmdline, compose};
 
 pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
+    crate::ui::file_complete::poll(app);
     // Tab-switch chords stay global so the user can navigate away
     // even when an editor session is intercepting everything else.
     if global(app, k) {
@@ -792,11 +793,19 @@ fn command(app: &mut App, cfg: &Config, k: KeyEvent) {
         }
         return;
     }
+    if app.active_compose().is_some() {
+        match app.file_completion.handle_key(&mut app.cmdline, k) {
+            crate::ui::file_complete::KeyDispatch::Consumed => return,
+            crate::ui::file_complete::KeyDispatch::Submit
+            | crate::ui::file_complete::KeyDispatch::PassThrough => {}
+        }
+    }
     match k.code {
         KeyCode::Esc => exit_command(app),
         KeyCode::Backspace if app.cmdline.is_empty() => exit_command(app),
         KeyCode::Enter => {
             let buf = app.cmdline.take();
+            app.file_completion.clear();
             app.mode = Mode::Normal;
             cmdline::dispatch(buf.trim(), app, cfg);
         }
@@ -906,6 +915,7 @@ fn enter_command(app: &mut App) {
 
 fn exit_command(app: &mut App) {
     app.cmdline.clear();
+    app.file_completion.clear();
     app.mode = Mode::Normal;
     // A `:` opened from a list-visual selection keeps the range alive so
     // the command can act on it (vim's `:'<,'>`). Cancelling the command

@@ -57,6 +57,16 @@ TUI build in progress against `DESIGN.md`'s *Suggested build order*.
 
 - **Clipboard paste** — done. Terminal bracketed paste routes through `ui/paste.rs` to the body, headers, attachment path input, command line, and search without interpreting pasted text as keys. Native body paste preserves multiline text and undo history; single-line fields convert line breaks and tabs to spaces. Composer `"+p` / `"+P` and text-input `Ctrl-R +` request UTF-8 stdout from optional `[clipboard].paste_command` on a worker, with a five-second timeout and cancellation of pending insertion on further keyboard, paste, or mouse input. Ordinary body `p` / `P` retain the internal yank; `[reader].clipboard` still controls copy. Visual Char/Line paste replaces the selection; Visual Block paste remains deferred. Embedded `$EDITOR` paste follows the child's bracketed-paste mode, with all PTY input queued through one writer worker. Terminal setup, teardown, failure cleanup, and the panic hook manage bracketed-paste mode.
 
+- **Attachment completion and picker** — done. Path inputs share
+`ui/file_complete.rs`: the inline Attach field
+and `:attach <path>` show a fuzzy directory drop-down, backed by one worker
+thread per picker and generation-tagged replies. Tab completes, Enter opens a
+directory or attaches a file, Up/Down or Ctrl-N/Ctrl-P navigates, and Escape
+cancels. Bare `:attach` opens the inline picker. Matching uses the existing
+`nucleo-matcher` dependency and browses one directory at a time; `~/`, `../`,
+spaces, and Unicode names work without shell quoting. Hidden entries appear
+when the final path component starts with `.`.
+
 Next-up work tracked in `TODO.md`.
 
 ## Commands

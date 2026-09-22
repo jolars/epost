@@ -8,6 +8,7 @@ pub mod compose_body;
 pub mod compose_header;
 pub mod embed;
 pub mod events;
+pub mod file_complete;
 pub mod folders;
 pub mod images;
 pub mod keys;
