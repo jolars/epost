@@ -411,8 +411,8 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             KeyCode::Char('d') => cmdline::trash_selected(app, cfg),
             KeyCode::Char('D') => cmdline::trash_thread_selected(app, cfg),
             KeyCode::Char('c') => cmdline::open_blank_compose_external(app, cfg),
-            KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
-            KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
+            KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
+            KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 cmdline::open_reply(app, cfg, cmdline::ReplyKind::Forward)
             }
@@ -626,8 +626,8 @@ fn inbox_normal(app: &mut App, cfg: &Config, k: KeyEvent) {
                 KeyCode::Char('V') => {
                     app.enter_visual(crate::ui::app::VisualKind::Line);
                 }
-                KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
-                KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
+                KeyCode::Char('r') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::ReplyAll),
+                KeyCode::Char('R') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Reply),
                 KeyCode::Char('F') => cmdline::open_reply(app, cfg, cmdline::ReplyKind::Forward),
                 KeyCode::Esc => {
                     let inbox = app.inbox_mut();

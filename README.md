@@ -78,6 +78,12 @@ schema.
 CLI flags: `--config <path>` and `--cache <path>` override the config and index
 locations.
 
+## Replying
+
+In the message list or reader pane, press `r` to reply to all or `R` to reply
+only to the sender. Replies honor `Reply-To` when present. The commands
+`:reply-all` and `:reply` provide the same actions.
+
 ## Attaching files
 
 In a compose tab, focus the Attach row and press Enter on `+ Add attachment...`,
