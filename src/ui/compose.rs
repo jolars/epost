@@ -135,11 +135,10 @@ pub struct ComposeScreen {
     /// `from` (the visible header) so changing the displayed identity
     /// also changes the actual sending account.
     pub from_picker: Option<FromPicker>,
-    /// File this composer was loaded from in `Drafts/cur/`. `Some` when
-    /// the tab came from "Enter on a draft" — re-saving / `:send`
-    /// success uses it to delete the stale draft file. `None` for fresh
-    /// `:compose`, `:reply`, and `:forward` flows.
-    pub origin_draft_path: Option<PathBuf>,
+    /// Saved version replaced by the next postpone or send attempt.
+    pub origin_draft: Option<mail_compose::SavedDraft>,
+    /// Extracted draft attachments must live as long as this composer does.
+    pub attachment_tempdir: Option<tempfile::TempDir>,
     /// The original message this tab is a reply to, captured at `:reply` /
     /// `:reply-all` open time. On a successful send the host loop sets the
     /// maildir Replied (`R`) flag on it so the list shows a ↩ indicator.
@@ -235,13 +234,41 @@ impl ComposeScreen {
             attach: AttachState::default(),
             pending_status: None,
             from_picker: None,
-            origin_draft_path: None,
+            origin_draft: None,
+            attachment_tempdir: None,
             reply_origin: None,
             confirm_close: None,
             address_complete: None,
             address_complete_suppressed: None,
             last_complete_anchor: None,
         })
+    }
+
+    pub fn restore_attachments(
+        &mut self,
+        attachments: &[crate::mail::parse::Attachment],
+    ) -> std::io::Result<()> {
+        if attachments.is_empty() {
+            return Ok(());
+        }
+        let dir = tempfile::Builder::new().prefix("epost-draft-").tempdir()?;
+        let mut paths = Vec::with_capacity(attachments.len());
+        for (i, attachment) in attachments.iter().enumerate() {
+            // Separate directories preserve duplicate filenames without allowing
+            // a MIME filename to escape the private temporary directory.
+            let parent = dir.path().join(i.to_string());
+            std::fs::create_dir(&parent)?;
+            let filename = Path::new(&attachment.filename)
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "attachment".as_ref());
+            let path = parent.join(filename);
+            std::fs::write(&path, &attachment.bytes)?;
+            paths.push(path);
+        }
+        self.attachments = paths;
+        self.attachment_tempdir = Some(dir);
+        Ok(())
     }
 
     /// Materialise the current body to a fresh tempfile, store the

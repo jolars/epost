@@ -18,9 +18,9 @@ are the v1.x finish, not the original v1 spec.
 Carry-over from `AGENTS.md` Step 6 --- none of these block v1 but each is a real
 usability gap.
 
-- **Drafts/cur persistence across restart.** Serialize `Draft` into
-  `Drafts/cur/<unique>:2,` on editor exit; restore on `:compose`. Wipe on
-  successful `:send`.
+- **Draft autosave while editing.** `:postpone`, close-and-save, and `:send`
+  persist drafts; periodic autosave would also protect edits made before those
+  commands from a process crash.
 - **Address completion follow-ups.** v1 lands with prefix-match + Sent harvest
   + mutt `query_command`; remaining work:
     - live re-harvest (today the native cache is startup-only; new Sent mail

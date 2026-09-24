@@ -61,6 +61,7 @@ error) and never writes it. A minimal config:
 maildir = "~/Mail/personal"
 from = "Jane Doe <jane@example.com>"
 sent = "Sent"
+drafts = "Drafts"
 archive = "Archive"
 trash = "Trash"
 
@@ -77,6 +78,24 @@ schema.
 
 CLI flags: `--config <path>` and `--cache <path>` override the config and index
 locations.
+
+## Sending and drafts
+
+Configure `drafts` for each sending account, using the folder name in its
+maildir (for example, `"[Gmail]/Drafts"` for Gmail). Only configured folders
+appear in the sidebar. Use `:postpone` to save a draft and Enter in Drafts to
+resume it, including its attachments.
+
+`:send` saves the complete message to Drafts before invoking SMTP. If saving
+fails, the message stays in the composer and nothing is sent. A failed send
+or `:cancel-send` restores the composer and keeps the saved draft for recovery
+after a restart. Sending successfully removes the draft after writing the
+Sent copy. If only the Sent copy fails, the status says the message was sent
+and the draft remains; do not resend it.
+
+While a send is pending, wait for completion or use `:cancel-send` before
+quitting. Cancellation works during `[compose].send_delay_secs` (10 seconds
+by default), before SMTP starts. Failed sends are never retried automatically.
 
 ## Replying
 

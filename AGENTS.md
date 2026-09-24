@@ -67,6 +67,18 @@ cancels. Bare `:attach` opens the inline picker. Matching uses the existing
 spaces, and Unicode names work without shell quoting. Hidden entries appear
 when the final path component starts with `.`.
 
+- **Send recovery and Drafts** — done. Each sending account must bind `drafts`.
+  The send worker serializes attachments and atomically saves the complete MIME
+  before the cancellation window or SMTP. `PendingSend` retains the compose
+  screen, including its undo history and temporary attachment files. Failure,
+  cancellation, or worker disconnection restores it without interrupting another
+  active input. Successful sends clean up the recovery draft; Sent-copy failures
+  keep it and report that delivery already succeeded. Saved drafts resolve by
+  Message-ID so sync renames do not break cleanup. Completion explicitly refreshes
+  Drafts, including with the watcher disabled. Quitting is blocked while sends
+  are pending. Enter on the canonical Drafts role resumes provider-specific
+  folders and restores attachments into private temporary files.
+
 Next-up work tracked in `TODO.md`.
 
 ## Commands

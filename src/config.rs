@@ -263,9 +263,9 @@ pub struct Compose {
     /// falls back to `$VISUAL` / `$EDITOR` / `vi` at spawn time.
     #[serde(default)]
     pub editor: Option<String>,
-    /// "Undo send" window in seconds. `:send` hands the MIME bytes to a
-    /// worker that waits this long before invoking `msmtp`; `:cancel-send`
-    /// aborts in-flight sends still inside the window. `0` disables the
+    /// "Undo send" window in seconds. The send worker saves a recovery draft,
+    /// then waits this long before invoking `msmtp`; `:cancel-send` restores
+    /// the composer for sends still inside the window. `0` disables the
     /// delay (the worker dispatches immediately, same as pre-feature
     /// behaviour). Default 10s.
     #[serde(default = "default_send_delay_secs")]
@@ -505,6 +505,8 @@ pub struct Account {
     pub spam: Option<String>,
     #[serde(default)]
     pub trash: Option<String>,
+    /// Required for sending: the worker saves the complete message here before
+    /// invoking SMTP so failed or canceled sends remain recoverable.
     #[serde(default)]
     pub drafts: Option<String>,
     /// Folders that don't fit any canonical role but should still

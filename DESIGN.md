@@ -242,12 +242,14 @@ max_height_cells = 24   # cap image height; preserves aspect ratio
 [accounts.personal]
 maildir     = "~/Mail/personal"
 from        = "Jane Doe <jane@example.com>"
-sent_folder = "Sent"
+sent        = "Sent"
+drafts      = "Drafts"
 
 [accounts.work]
 maildir       = "~/Mail/work"
 from          = "Jane Doe <jane@work.example>"
-sent_folder   = "Sent Items"
+sent          = "Sent Items"
+drafts        = "Drafts"
 smtp.command  = ["msmtp", "-t", "-a", "work"]    # per-account override
 
 # Keybinds: nested table per mode. Keys are sequences (vim-style notation),
@@ -480,12 +482,27 @@ it; the mail client never does).
 
 ## Compose → send
 
-Build the MIME with `mail-builder`, then pipe the raw message to `msmtp -t` over
-stdin (`-t` makes msmtp read recipients from the To/Cc/Bcc headers). On success,
-write a copy into the account's `Sent/cur` with the `S` flag so it appears in
-the index on next scan. The compose UI itself shells out to `$EDITOR` (or
-`[compose].editor` in config) for the body --- consistent with how aerc /
-neomutt work and keeps us from re-implementing a text editor.
+The compose UI uses the native body editor, with `$EDITOR` available through
+`:edit`. On `:send`, retain the compose screen until the worker reports its
+result. The worker builds MIME with `mail-builder` and atomically saves those
+exact bytes to the account's configured Drafts maildir with the `D` flag,
+before the cancellation window or SMTP invocation. A missing Drafts binding
+or failed save prevents sending. Attachment reads and disk writes run on the
+worker thread.
+
+Pipe the message to `msmtp -t` over stdin (`-t` reads recipients from the
+To/Cc/Bcc headers). On success, write the Sent copy with the `S` flag and
+remove the recovery draft. Failure or cancellation restores the compose
+screen and retains the saved MIME, including attachments, for recovery after
+a restart. A Sent-copy failure is reported as already sent and keeps the
+draft without reopening the composer. No automatic retries occur.
+
+Saved draft identity is its Message-ID within its maildir. Paths are lookup
+hints because synchronization can rename files. Save replacements before
+removing old versions, and explicitly rescan Drafts after completion even
+when the watcher is disabled. Normal exit waits for pending sends or their
+cancellation to finish. Resuming a saved draft extracts attachments into
+private temporary files owned by the compose screen.
 
 ## Suggested build order
 

@@ -136,7 +136,7 @@ pub fn dispatch(cmd: &str, app: &mut App, cfg: &Config) {
     let mut parts = cmd.split_whitespace();
     let head = parts.next().unwrap_or("");
     match head {
-        "q" | "quit" => app.quit = true,
+        "q" | "quit" => app.request_quit(),
         "open" => match app.inbox_parsed() {
             Some(body) => {
                 if let Err(e) = browser::open_message(body, &cfg.reader.browser) {
@@ -794,8 +794,7 @@ fn send_active(app: &mut App, cfg: &Config) {
         return;
     };
     let account_name = c.account.clone();
-    let origin_draft_path = c.origin_draft_path.clone();
-    let reply_origin = c.reply_origin.clone();
+    let origin_draft = c.origin_draft.clone();
     let draft = match c.collect_draft() {
         Ok(d) => d,
         Err(e) => {
@@ -814,6 +813,13 @@ fn send_active(app: &mut App, cfg: &Config) {
             return;
         }
     };
+    let spec = crate::store::AccountSpec::from_account(&account_name, &cfg.accounts[&account_name]);
+    let Some(drafts) = spec.binding_by_role(config::FolderRole::Drafts) else {
+        app.status_error = Some(format!(
+            "send: no Drafts folder configured; set accounts.{account_name}.drafts"
+        ));
+        return;
+    };
     // Look up the Sent role on the account-derived binding list so the
     // disk path follows whatever the user wrote in `sent = "..."`.
     let sent_cur_dir = cfg.accounts.get(&account_name).and_then(|a| {
@@ -821,30 +827,33 @@ fn send_active(app: &mut App, cfg: &Config) {
             .binding_by_role(crate::config::FolderRole::Sent)
             .map(|b| b.path.join("cur"))
     });
-    let bytes = match mail_compose::serialize(&draft) {
-        Ok(b) => b,
-        Err(e) => {
-            app.status_error = Some(format!("send: serialize: {e}"));
-            return;
-        }
-    };
     let label = send_label(&draft);
     let delay = std::time::Duration::from_secs(cfg.compose.send_delay_secs);
-    let handle =
-        mail_compose::start_send_worker(bytes, smtp_cmd, sent_cur_dir, delay, app.event_tx.clone());
+    let handle = mail_compose::start_send_worker(
+        mail_compose::SendRequest {
+            draft,
+            smtp_cmd,
+            sent_cur_dir,
+            drafts_cur_dir: drafts.path.join("cur"),
+            origin_draft,
+            delay,
+        },
+        app.event_tx.clone(),
+    );
+    // Keep the whole editor alive until the worker confirms delivery, including
+    // undo history and any temporary files holding resumed draft attachments.
+    crate::ui::paste::cancel_read(app);
+    crate::ui::paste::clear_prefixes(app);
+    let Screen::Compose(compose) = app.screens.remove(app.active) else {
+        unreachable!("send requires a compose tab")
+    };
+    app.active = app.active.min(app.screens.len() - 1);
     app.pending_sends.push(PendingSend {
         rx: handle.rx,
         cancel_tx: handle.cancel_tx,
         label: label.clone(),
-        origin_draft_path,
-        reply_origin,
+        compose,
     });
-    // `:send` always runs on a compose tab, so close_active_tab won't
-    // touch the inbox. Surface the close error defensively just in case.
-    if let Err(msg) = app.close_active_tab() {
-        app.status_error = Some(format!("send: {msg}"));
-        return;
-    }
     app.status_error = Some(send_pending_status(&label, cfg.compose.send_delay_secs));
 }
 
@@ -895,7 +904,7 @@ pub fn postpone_active(app: &mut App, cfg: &Config) -> Result<(), String> {
             return Err("not on a compose tab".into());
         };
         let draft = c.collect_draft().map_err(|e| format!("read body: {e}"))?;
-        (c.account.clone(), draft, c.origin_draft_path.clone())
+        (c.account.clone(), draft, c.origin_draft.clone())
     };
 
     let Some(account) = cfg.accounts.get(&account_name) else {
@@ -910,27 +919,15 @@ pub fn postpone_active(app: &mut App, cfg: &Config) -> Result<(), String> {
     let saved = mail_compose::save_draft(&draft, &drafts_cur, &app.self_writes)
         .map_err(|e| format!("save to {}: {e}", drafts_binding.path.display()))?;
 
-    // Delete the originating draft if this composer was opened from
-    // one. Record the self-write first so the maildir watcher doesn't
-    // echo the deletion back as an external change. A NotFound here
-    // (mbsync raced us, or the user deleted manually) is benign;
-    // anything else surfaces as a status hint but doesn't unsave the
-    // new draft we just wrote.
+    // The new version is saved before the old one is removed. Resolve by
+    // Message-ID because synchronization may have renamed the original file.
     if let Some(old) = origin
-        && old != saved
+        && old.path != saved
+        && let Err(e) = old.remove()
     {
-        app.self_writes.record(&old);
-        match std::fs::remove_file(&old) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                app.self_writes.forget(&old);
-            }
-            Err(e) => {
-                app.self_writes.forget(&old);
-                app.status_error = Some(format!("postpone: clean old draft: {e}"));
-            }
-        }
+        app.status_error = Some(format!("postpone: clean old draft: {e}"));
     }
+    app.refresh_drafts(cfg, &account_name);
 
     // Clear the prompt before tearing down the tab (the screen is
     // about to drop, but the close-prompt's contract is "host clears
@@ -1059,7 +1056,7 @@ pub fn resume_selected_draft_if_drafts(app: &mut App, cfg: &Config) -> bool {
     let Some(account) = cfg.accounts.get(&row.account) else {
         return false;
     };
-    if account.drafts.as_deref() != Some(row.folder.as_str()) {
+    if account.drafts.is_none() || row.folder != config::FolderRole::Drafts.label() {
         return false;
     }
 
@@ -1082,8 +1079,6 @@ pub fn resume_selected_draft_if_drafts(app: &mut App, cfg: &Config) -> bool {
             return true;
         }
     };
-    let attachment_count = parse::count_attachments(&path);
-
     let body_text = body
         .plain
         .clone()
@@ -1092,7 +1087,7 @@ pub fn resume_selected_draft_if_drafts(app: &mut App, cfg: &Config) -> bool {
 
     let draft = Draft {
         account: row.account.clone(),
-        from: account.from.clone(),
+        from: headers.from.clone().unwrap_or_else(|| account.from.clone()),
         to: headers.to.clone(),
         cc: headers.cc.clone(),
         bcc: headers.bcc.clone(),
@@ -1105,13 +1100,15 @@ pub fn resume_selected_draft_if_drafts(app: &mut App, cfg: &Config) -> bool {
 
     match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
         Ok(mut screen) => {
-            screen.origin_draft_path = Some(path);
-            app.open_compose(screen);
-            if attachment_count > 0 {
-                app.status_error = Some(format!(
-                    "draft re-opened — {attachment_count} attachment(s) dropped, re-:attach as needed"
-                ));
+            screen.origin_draft = Some(mail_compose::SavedDraft {
+                msgid: headers.msgid,
+                path,
+            });
+            if let Err(e) = screen.restore_attachments(&body.attachments) {
+                app.status_error = Some(format!("resume attachments: {e}"));
+                return true;
             }
+            app.open_compose(screen);
         }
         Err(e) => {
             app.status_error = Some(format!("resume: {e}"));
@@ -1180,6 +1177,279 @@ pub fn open_reply(app: &mut App, cfg: &Config, kind: ReplyKind) {
         Err(e) => {
             app.status_error = Some(format!("{label}: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod send_recovery_tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    fn setup(exit: u8) -> (TempDir, App, Config) {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [accounts.test]
+            maildir = "/unused"
+            from = "Sender <sender@example.test>"
+            drafts = "Saved/Drafts"
+            sent = "Sent"
+            "#,
+        )
+        .unwrap();
+        cfg.accounts.get_mut("test").unwrap().maildir = tmp.path().to_path_buf();
+        cfg.compose.send_delay_secs = 0;
+        cfg.smtp.command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat > \"$1\"; exit \"$2\"".into(),
+            "epost-test".into(),
+            tmp.path().join("smtp.eml").to_str().unwrap().into(),
+            exit.to_string(),
+        ];
+        let mut app = App::new(&cfg, tmp.path().join("index.sqlite"), None, None);
+        let mut draft = Draft::new_blank("test", "Sender <sender@example.test>");
+        draft.to = vec!["to@example.test".into()];
+        draft.cc = vec!["cc@example.test".into()];
+        draft.bcc = vec!["bcc@example.test".into()];
+        draft.subject = "Keep this message".into();
+        draft.body = "The latest edits must survive.".into();
+        let attachment = tmp.path().join("attachment.txt");
+        fs::write(&attachment, "attachment contents").unwrap();
+        draft.attachments.push(attachment);
+        app.open_compose(ComposeScreen::from_draft(draft, cfg.compose.wrap).unwrap());
+        (tmp, app, cfg)
+    }
+
+    fn finish(app: &mut App, cfg: &Config) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.pending_sends.is_empty() {
+            app.poll_pending_sends(cfg);
+            assert!(Instant::now() < deadline, "send worker did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn drafts(root: &Path) -> Vec<PathBuf> {
+        ["cur", "new"]
+            .into_iter()
+            .flat_map(|sub| {
+                fs::read_dir(root.join("Saved/Drafts").join(sub))
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.unwrap().path())
+            })
+            .collect()
+    }
+
+    fn assert_saved(root: &Path) -> PathBuf {
+        let saved = drafts(root);
+        assert_eq!(saved.len(), 1, "exactly one recovery draft");
+        let headers = parse::read_headers(&saved[0]).unwrap().unwrap();
+        let body = parse::read_body(&saved[0]).unwrap();
+        assert_eq!(headers.subject.as_deref(), Some("Keep this message"));
+        assert_eq!(headers.bcc, ["bcc@example.test"]);
+        assert!(
+            body.plain
+                .unwrap()
+                .contains("The latest edits must survive.")
+        );
+        assert_eq!(body.attachments[0].bytes, b"attachment contents");
+        saved[0].clone()
+    }
+
+    #[test]
+    fn failed_send_restores_composer_and_saves_complete_draft() {
+        let (tmp, mut app, cfg) = setup(9);
+        dispatch("send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        let composer = app.active_compose().expect("failed message must reopen");
+        assert_eq!(composer.body.text(), "The latest edits must survive.");
+        assert_eq!(composer.attachments.len(), 1);
+        assert!(app.status_error.as_deref().unwrap().contains("send failed"));
+        assert_saved(tmp.path());
+    }
+
+    #[test]
+    fn cancelled_send_restores_composer_and_saves_complete_draft() {
+        let (tmp, mut app, mut cfg) = setup(0);
+        cfg.compose.send_delay_secs = 30;
+        dispatch("send", &mut app, &cfg);
+        dispatch("cancel-send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        assert!(
+            app.active_compose().is_some(),
+            "cancel must restore the composer"
+        );
+        assert!(
+            !tmp.path().join("smtp.eml").exists(),
+            "cancel must not invoke SMTP"
+        );
+        assert_saved(tmp.path());
+    }
+
+    #[test]
+    fn send_without_drafts_binding_keeps_composer_and_does_not_send() {
+        let (tmp, mut app, mut cfg) = setup(0);
+        cfg.accounts.get_mut("test").unwrap().drafts = None;
+        dispatch("send", &mut app, &cfg);
+        assert!(
+            app.pending_sends.is_empty(),
+            "sending requires a recovery folder"
+        );
+        assert!(app.active_compose().is_some());
+        assert!(app.status_error.as_deref().unwrap().contains("Drafts"));
+        assert!(!tmp.path().join("smtp.eml").exists());
+    }
+
+    #[test]
+    fn draft_write_failure_restores_composer_without_invoking_smtp() {
+        let (tmp, mut app, cfg) = setup(0);
+        fs::write(tmp.path().join("Saved"), "not a directory").unwrap();
+        dispatch("send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        assert!(app.active_compose().is_some());
+        assert!(!tmp.path().join("smtp.eml").exists());
+    }
+
+    #[test]
+    fn sent_copy_failure_keeps_draft_without_reopening_for_resend() {
+        let (tmp, mut app, cfg) = setup(0);
+        fs::write(tmp.path().join("Sent"), "not a directory").unwrap();
+        dispatch("send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        assert!(app.active_compose().is_none(), "message was already sent");
+        assert!(
+            app.status_error
+                .as_deref()
+                .unwrap()
+                .contains("no Sent copy")
+        );
+        assert_saved(tmp.path());
+    }
+
+    #[test]
+    fn successful_retry_cleans_recovery_drafts() {
+        let (tmp, mut app, mut cfg) = setup(9);
+        dispatch("send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        assert_saved(tmp.path());
+        *cfg.smtp.command.last_mut().unwrap() = "0".into();
+        dispatch("send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        assert!(app.active_compose().is_none());
+        assert!(drafts(tmp.path()).is_empty());
+        assert_eq!(
+            fs::read_dir(tmp.path().join("Sent/cur")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_draft_resumes_with_provider_folder_name_and_attachments() {
+        let (tmp, mut app, cfg) = setup(9);
+        dispatch("send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        let path = assert_saved(tmp.path());
+        let h = parse::read_headers(&path).unwrap().unwrap();
+        fs::remove_file(tmp.path().join("attachment.txt")).unwrap();
+        // A fresh app models recovery after restarting, with only the MIME file.
+        let mut fresh = App::new(&cfg, tmp.path().join("fresh.sqlite"), None, None);
+        fresh.inbox_mut().scan =
+            crate::ui::app::ScanState::Ready(crate::store::thread::build_threads(vec![
+                crate::store::index::MessageRow {
+                    msgid: h.msgid,
+                    account: "test".into(),
+                    folder: "Drafts".into(),
+                    path,
+                    date: h.date,
+                    from_addr: h.from,
+                    subject: h.subject,
+                    in_reply: h.in_reply,
+                    refs: h.refs,
+                    flags: "D".into(),
+                },
+            ]));
+        assert!(resume_selected_draft_if_drafts(&mut fresh, &cfg));
+        let draft = fresh.active_compose().unwrap().collect_draft().unwrap();
+        assert_eq!(draft.bcc, ["bcc@example.test"]);
+        let mime = mail_compose::serialize(&draft).unwrap();
+        let body = parse::parse_body(&mime);
+        assert_eq!(body.attachments[0].filename, "attachment.txt");
+        assert_eq!(body.attachments[0].bytes, b"attachment contents");
+    }
+
+    #[test]
+    fn failed_send_does_not_interrupt_another_composer() {
+        let (_tmp, mut app, cfg) = setup(9);
+        dispatch("send", &mut app, &cfg);
+        let mut other = Draft::new_blank("test", "sender@example.test");
+        other.body = "Keep typing here".into();
+        app.open_compose(ComposeScreen::from_draft(other, cfg.compose.wrap).unwrap());
+        finish(&mut app, &cfg);
+        assert_eq!(
+            app.active_compose().unwrap().body.text(),
+            "Keep typing here"
+        );
+        assert_eq!(app.screens.len(), 3, "failed composer is another tab");
+    }
+
+    #[test]
+    fn recovery_draft_is_indexed_without_a_watcher() {
+        let (tmp, mut app, mut cfg) = setup(9);
+        cfg.watch.enabled = false;
+        dispatch("send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.poll_watch(&cfg);
+            let index = crate::store::index::Index::open(&tmp.path().join("index.sqlite")).unwrap();
+            if index.list_folder(Some("test"), "Drafts").unwrap().len() == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "saved draft never reached the index"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn quit_waits_for_send_or_cancellation_to_finish() {
+        let (tmp, mut app, mut cfg) = setup(0);
+        cfg.compose.send_delay_secs = 30;
+        dispatch("send", &mut app, &cfg);
+        dispatch("q", &mut app, &cfg);
+        assert!(!app.quit);
+        dispatch("cancel-send", &mut app, &cfg);
+        finish(&mut app, &cfg);
+        assert_saved(tmp.path());
+        dispatch("q", &mut app, &cfg);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn disconnected_send_worker_restores_composer() {
+        let (_tmp, mut app, mut cfg) = setup(0);
+        cfg.compose.send_delay_secs = 30;
+        dispatch("send", &mut app, &cfg);
+        dispatch("cancel-send", &mut app, &cfg);
+        // Wait for the real worker before replacing its receiver with a dead
+        // channel, so this test never leaves background work touching its files.
+        app.pending_sends[0]
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        app.pending_sends[0].rx = rx;
+        app.poll_pending_sends(&cfg);
+        assert!(app.active_compose().is_some());
+        assert!(app.status_error.as_deref().unwrap().contains("worker died"));
     }
 }
 

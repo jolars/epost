@@ -10,7 +10,7 @@ use ratatui_image::picker::Picker;
 use crate::config::{Account, Config};
 use crate::mail::addressbook::{self, AddressBook, AddressBookResult};
 use crate::mail::addressbook_external::{self, ExtResult};
-use crate::mail::compose::{SendOutcome, SendResult};
+use crate::mail::compose::{SendOutcome, SendReport, SendResult};
 use crate::mail::flags::{self, FlagOp};
 use crate::mail::html::{self, Block};
 use crate::mail::parse;
@@ -385,19 +385,10 @@ pub enum Screen {
 /// window; firing it before `[compose].send_delay_secs` elapses aborts
 /// the send (worker returns `SendOutcome::Cancelled`).
 pub struct PendingSend {
-    pub rx: Receiver<SendResult>,
+    pub rx: Receiver<SendReport>,
     pub cancel_tx: Sender<()>,
     pub label: String,
-    /// File the composer was loaded from in `Drafts/cur/`, snapshotted
-    /// at `:send` time. Deleted on a successful send so the draft
-    /// doesn't linger after the message goes out. Left alone on
-    /// `SentNoCopy` and on send failure so the user has a recovery
-    /// copy. `None` for fresh-compose / reply / forward sends.
-    pub origin_draft_path: Option<PathBuf>,
-    /// Original message this send is a reply to (`:reply` / `:reply-all`).
-    /// On a successful send the maildir Replied (`R`) flag is set on it so
-    /// the list shows the ↩ indicator. `None` for fresh compose and forward.
-    pub reply_origin: Option<MsgRef>,
+    pub compose: Box<ComposeScreen>,
 }
 
 /// Per-screen state for the maildir reader: pane visibility/focus, scan
@@ -743,36 +734,16 @@ impl App {
         }
     }
 
-    /// Drain finished send workers from `pending_sends`. `:send` closes
-    /// the compose tab synchronously, so the worker's result has no tab
-    /// to land on — it surfaces in the cmdline status row instead.
-    /// Successful sends overwrite any in-flight "sending: …" message
-    /// the user might still be looking at.
-    pub fn poll_pending_sends(&mut self) {
+    /// Report completed sends and restore failed or canceled composers. A
+    /// successful transport with a failed Sent copy must not invite resending.
+    pub fn poll_pending_sends(&mut self, cfg: &Config) {
         let mut i = 0;
         while i < self.pending_sends.len() {
             match self.pending_sends[i].rx.try_recv() {
-                Ok(result) => {
-                    let pending = self.pending_sends.swap_remove(i);
-                    // Clean up the originating draft only on full send
-                    // success — `SentNoCopy` and `Err` both leave the
-                    // user with something they may want to revisit, so
-                    // the draft stays put.
-                    if let (Some(path), Ok(SendOutcome::Sent)) =
-                        (pending.origin_draft_path.as_ref(), &result)
-                    {
-                        self.self_writes.record(path);
-                        match std::fs::remove_file(path) {
-                            Ok(()) => {}
-                            Err(_) => {
-                                // The send went through; missing draft
-                                // file is best-effort cleanup. Drop the
-                                // self-write record so a future write
-                                // at the same path isn't suppressed.
-                                self.self_writes.forget(path);
-                            }
-                        }
-                    }
+                Ok(report) => {
+                    let mut pending = self.pending_sends.swap_remove(i);
+                    self.refresh_drafts(cfg, &pending.compose.account);
+                    let result = report.result;
                     // The mail went out for both `Sent` and `SentNoCopy`
                     // (the latter only failed the Sent-folder copy), so a
                     // reply marks its original Replied in both cases — but
@@ -781,20 +752,79 @@ impl App {
                     if matches!(
                         result,
                         Ok(SendOutcome::Sent) | Ok(SendOutcome::SentNoCopy(_))
-                    ) && let Some(origin) = pending.reply_origin.as_ref()
+                    ) && let Some(origin) = pending.compose.reply_origin.as_ref()
                     {
                         self.mark_replied(origin);
                     }
-                    self.status_error = Some(format_send_status(&pending.label, result));
+                    let restore = matches!(result, Err(_) | Ok(SendOutcome::Cancelled));
+                    let mut status = format_send_status(&pending.label, result);
+                    if let Some(saved) = report.recovery_draft {
+                        pending.compose.origin_draft = Some(saved);
+                        status.push_str("; saved in Drafts");
+                    }
+                    if let Some(error) = report.cleanup_error {
+                        status.push_str(&format!("; {error}"));
+                    }
+                    if restore {
+                        self.restore_failed_compose(pending.compose);
+                        status.push_str("; composer restored");
+                    }
+                    self.status_error = Some(status);
                 }
                 Err(TryRecvError::Empty) => {
                     i += 1;
                 }
                 Err(TryRecvError::Disconnected) => {
                     let pending = self.pending_sends.swap_remove(i);
-                    self.status_error = Some(format!("send ({}): worker died", pending.label));
+                    self.refresh_drafts(cfg, &pending.compose.account);
+                    self.restore_failed_compose(pending.compose);
+                    self.status_error = Some(format!(
+                        "send ({}): worker died; composer restored; check Sent before retrying",
+                        pending.label
+                    ));
                 }
             }
+        }
+    }
+
+    fn restore_failed_compose(&mut self, compose: Box<ComposeScreen>) {
+        // A background failure must not redirect input away from another editor
+        // or a command the user is typing.
+        let focus = self.active == 0 && self.mode == Mode::Normal;
+        self.screens.push(Screen::Compose(compose));
+        if focus {
+            self.active = self.screens.len() - 1;
+        }
+    }
+
+    pub fn refresh_drafts(&mut self, cfg: &Config, account: &str) {
+        let inbox = self.inbox_mut();
+        // Drafts may not have existed when the watcher started. Register the
+        // newly created maildir so later synchronization remains visible.
+        if let Some(watcher) = &inbox.watcher
+            && let Some(spec) = cfg.accounts.get(account)
+            && let Some(folder) = &spec.drafts
+        {
+            watcher.register_folder(
+                account,
+                "Drafts",
+                &spec.layout.folder_path(&spec.maildir, folder),
+                spec.layout,
+            );
+        }
+        inbox.optimistic_epoch = inbox.optimistic_epoch.wrapping_add(1);
+        inbox
+            .pending_dirty
+            .insert((account.to_string(), "Drafts".into()));
+    }
+
+    pub fn request_quit(&mut self) {
+        if self.pending_sends.is_empty() {
+            self.quit = true;
+        } else {
+            self.status_error = Some(
+                "send pending: wait for completion or use :cancel-send before quitting".into(),
+            );
         }
     }
 

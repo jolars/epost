@@ -444,49 +444,159 @@ pub enum SendOutcome {
 
 pub type SendResult = Result<SendOutcome, String>;
 
+/// The path is a lookup hint only: mail synchronization can rename a draft.
+#[derive(Debug, Clone)]
+pub struct SavedDraft {
+    pub msgid: String,
+    pub path: PathBuf,
+}
+
+impl SavedDraft {
+    pub fn resolve(&self) -> io::Result<Option<PathBuf>> {
+        let matches = |path: &Path| -> io::Result<bool> {
+            match crate::mail::parse::read_headers(path) {
+                Ok(h) => Ok(h.is_some_and(|h| h.msgid == self.msgid)),
+                Err(e)
+                    if e.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+                {
+                    Ok(false)
+                }
+                Err(e) => Err(io::Error::other(e)),
+            }
+        };
+        if matches(&self.path)? {
+            return Ok(Some(self.path.clone()));
+        }
+        let folder = self
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| io::Error::other("draft path has no maildir folder"))?;
+        for sub in ["cur", "new"] {
+            let entries = match fs::read_dir(folder.join(sub)) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_file() && matches(&entry.path())? {
+                    return Ok(Some(entry.path()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn remove(&self) -> io::Result<()> {
+        if let Some(path) = self.resolve()? {
+            match fs::remove_file(&path) {
+                Ok(()) => fs::File::open(path.parent().unwrap())?.sync_all()?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct SendRequest {
+    pub draft: Draft,
+    pub smtp_cmd: Vec<String>,
+    pub sent_cur_dir: Option<PathBuf>,
+    pub drafts_cur_dir: PathBuf,
+    pub origin_draft: Option<SavedDraft>,
+    pub delay: Duration,
+}
+
+#[derive(Debug)]
+pub struct SendReport {
+    pub result: SendResult,
+    pub recovery_draft: Option<SavedDraft>,
+    pub cleanup_error: Option<String>,
+}
+
 /// Handle to an in-flight send. The worker waits on `cancel_rx` for up
 /// to `[compose].send_delay_secs` before invoking msmtp; firing the
 /// matching `cancel_tx` during that window aborts the send. After the
 /// window closes the send is already with msmtp and `cancel_tx.send`
 /// becomes a no-op (the receiver has been dropped).
 pub struct SendHandle {
-    pub rx: Receiver<SendResult>,
+    pub rx: Receiver<SendReport>,
     pub cancel_tx: Sender<()>,
 }
 
-/// Spawn a worker thread that waits `delay` (or until `cancel_tx`
-/// fires), then pipes `bytes` to `smtp_cmd[0] smtp_cmd[1..]` over
-/// stdin and (on success) drops a copy in `sent_cur_dir` with the
-/// `:2,S` info suffix. Returns the result receiver paired with a
-/// cancel sender so the UI can abort during the delay window. Mirrors
-/// `store::scan::start_worker` for the polling pattern. When
-/// `event_tx` is plumbed in, the worker also pushes an `AppEvent::Wake`
-/// on completion so the main loop surfaces the result immediately
-/// rather than waiting for the next idle heartbeat.
+/// Save the complete MIME message before waiting through the cancellation
+/// window or invoking SMTP. Only a successful send and Sent copy permit
+/// deleting the recovery draft. All disk writes and SMTP run off the UI thread.
 pub fn start_send_worker(
-    bytes: Vec<u8>,
-    smtp_cmd: Vec<String>,
-    sent_cur_dir: Option<PathBuf>,
-    delay: Duration,
+    request: SendRequest,
     event_tx: Option<Sender<crate::ui::events::AppEvent>>,
 ) -> SendHandle {
     let (tx, rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
-        let result = match cancel_rx.recv_timeout(delay) {
-            // Cancellation arrived (or the sender was dropped before the
-            // delay elapsed). Either way: abort the send.
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => Ok(SendOutcome::Cancelled),
-            Err(RecvTimeoutError::Timeout) => {
-                send_blocking(&bytes, &smtp_cmd, sent_cur_dir.as_deref())
-            }
-        };
-        let _ = tx.send(result);
+        let report = send_with_recovery(request, cancel_rx);
+        let _ = tx.send(report);
         if let Some(wake) = event_tx {
             let _ = wake.send(crate::ui::events::AppEvent::Wake);
         }
     });
     SendHandle { rx, cancel_tx }
+}
+
+fn send_with_recovery(request: SendRequest, cancel_rx: Receiver<()>) -> SendReport {
+    let mut report = SendReport {
+        result: Err("send did not complete".into()),
+        recovery_draft: None,
+        cleanup_error: None,
+    };
+    let bytes = match serialize(&request.draft) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            report.result = Err(format!("serialize: {e}"));
+            return report;
+        }
+    };
+    let saved = match save_draft_bytes(&bytes, &request.drafts_cur_dir) {
+        Ok(saved) => saved,
+        Err(e) => {
+            report.result = Err(format!("save recovery draft: {e}"));
+            return report;
+        }
+    };
+    report.recovery_draft = Some(saved.clone());
+    // Replace an older saved version only after the new bytes are durable.
+    if let Some(origin) = &request.origin_draft
+        && let Err(e) = origin.remove()
+    {
+        report.result = Err(format!("replace previous draft: {e}"));
+        return report;
+    }
+    report.result = match cancel_rx.recv_timeout(request.delay) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => Ok(SendOutcome::Cancelled),
+        Err(RecvTimeoutError::Timeout) => {
+            send_blocking(&bytes, &request.smtp_cmd, request.sent_cur_dir.as_deref())
+        }
+    };
+    if matches!(report.result, Ok(SendOutcome::Sent)) {
+        match saved.remove() {
+            Ok(()) => report.recovery_draft = None,
+            Err(e) => report.cleanup_error = Some(format!("remove recovery draft: {e}")),
+        }
+    }
+    report
+}
+
+fn save_draft_bytes(bytes: &[u8], cur_dir: &Path) -> io::Result<SavedDraft> {
+    let headers = crate::mail::parse::parse_headers(bytes)
+        .ok_or_else(|| io::Error::other("draft has no Message-ID"))?;
+    let path = deliver_maildir_message(bytes, cur_dir, "D")?;
+    Ok(SavedDraft {
+        msgid: headers.msgid,
+        path,
+    })
 }
 
 fn send_blocking(bytes: &[u8], smtp_cmd: &[String], sent_cur_dir: Option<&Path>) -> SendResult {
@@ -554,16 +664,24 @@ pub fn deliver_maildir_message(bytes: &[u8], cur_dir: &Path, flags: &str) -> io:
     let tmp_dir = folder_root.join("tmp");
     fs::create_dir_all(&tmp_dir)?;
     fs::create_dir_all(cur_dir)?;
+    fs::create_dir_all(folder_root.join("new"))?;
 
     let unique = unique_filename();
     let tmp_path = tmp_dir.join(&unique);
     let final_path = cur_dir.join(format!("{unique}:2,{flags}"));
 
-    let mut f = fs::File::create(&tmp_path)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp_path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     drop(f);
     fs::rename(&tmp_path, &final_path)?;
+    fs::File::open(cur_dir)?.sync_all()?;
+    fs::File::open(folder_root)?.sync_all()?;
     Ok(final_path)
 }
 
@@ -912,8 +1030,9 @@ mod tests {
         use std::time::Instant;
         let cmd = vec!["/bin/sh".into(), "-c".into(), "cat > /dev/null".into()];
         let started = Instant::now();
-        let handle = start_send_worker(b"x".to_vec(), cmd, None, Duration::ZERO, None);
-        let result = handle.rx.recv().expect("worker reports back");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let handle = start_send_worker(test_send_request(tmp.path(), cmd, Duration::ZERO), None);
+        let result = handle.rx.recv().expect("worker reports back").result;
         assert!(matches!(result, Ok(SendOutcome::Sent)), "{result:?}");
         // No artificial wait — the worker should be done well under the
         // 250ms idle tick. A generous bound keeps the test stable on slow
@@ -927,12 +1046,17 @@ mod tests {
         // paired with an SMTP command that would otherwise succeed — so
         // a missed cancel surfaces as `Sent`, not as a timeout.
         let cmd = vec!["/bin/sh".into(), "-c".into(), "cat > /dev/null".into()];
-        let handle = start_send_worker(b"x".to_vec(), cmd, None, Duration::from_secs(30), None);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let handle = start_send_worker(
+            test_send_request(tmp.path(), cmd, Duration::from_secs(30)),
+            None,
+        );
         handle.cancel_tx.send(()).expect("cancel sender alive");
         let result = handle
             .rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("worker reports back");
+            .expect("worker reports back")
+            .result;
         assert!(matches!(result, Ok(SendOutcome::Cancelled)), "{result:?}");
     }
 
@@ -943,13 +1067,77 @@ mod tests {
         // "host went away while waiting" case (the host UI is gone), so
         // not sending is the right default.
         let cmd = vec!["/bin/sh".into(), "-c".into(), "cat > /dev/null".into()];
-        let handle = start_send_worker(b"x".to_vec(), cmd, None, Duration::from_secs(30), None);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let handle = start_send_worker(
+            test_send_request(tmp.path(), cmd, Duration::from_secs(30)),
+            None,
+        );
         let SendHandle { rx, cancel_tx } = handle;
         drop(cancel_tx);
         let result = rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("worker reports back");
+            .expect("worker reports back")
+            .result;
         assert!(matches!(result, Ok(SendOutcome::Cancelled)), "{result:?}");
+    }
+
+    fn test_send_request(root: &Path, smtp_cmd: Vec<String>, delay: Duration) -> SendRequest {
+        SendRequest {
+            draft: canned_draft(),
+            smtp_cmd,
+            sent_cur_dir: Some(root.join("Sent/cur")),
+            drafts_cur_dir: root.join("Drafts/cur"),
+            origin_draft: None,
+            delay,
+        }
+    }
+
+    #[test]
+    fn send_saves_exact_mime_before_invoking_transport() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let smtp = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat > \"$1\"; cmp \"$1\" \"$2\"/cur/*".into(),
+            "epost-test".into(),
+            tmp.path().join("sent.eml").to_str().unwrap().into(),
+            tmp.path().join("Drafts").to_str().unwrap().into(),
+        ];
+        let request = test_send_request(tmp.path(), smtp, Duration::ZERO);
+        let handle = start_send_worker(request, None);
+        let report = handle.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(report.result, Ok(SendOutcome::Sent)), "{report:?}");
+        assert!(report.recovery_draft.is_none());
+    }
+
+    #[test]
+    fn saved_draft_cleanup_follows_msgid_after_sync_rename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cur = tmp.path().join("Drafts/cur");
+        let saved = save_draft_bytes(&serialize(&canned_draft()).unwrap(), &cur).unwrap();
+        let renamed = tmp.path().join("Drafts/new/synced,U=12:2,DS");
+        fs::rename(&saved.path, &renamed).unwrap();
+        // A reused old path must never cause another message to be deleted.
+        let other = serialize(&canned_draft()).unwrap();
+        fs::write(&saved.path, &other).unwrap();
+        saved.remove().unwrap();
+        assert!(!renamed.exists());
+        assert_eq!(fs::read(&saved.path).unwrap(), other);
+    }
+
+    #[test]
+    fn cancelled_worker_preserves_draft_when_ui_receiver_is_gone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let request = test_send_request(tmp.path(), Vec::new(), Duration::from_secs(30));
+        let (wake, rx) = mpsc::channel();
+        let handle = start_send_worker(request, Some(wake));
+        drop(handle);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            fs::read_dir(tmp.path().join("Drafts/cur")).unwrap().count(),
+            1
+        );
+        assert!(!tmp.path().join("Sent").exists());
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub fn handle(app: &mut App, cfg: &Config, k: KeyEvent) {
     // so a long-running edit isn't an accidental ^C away from losing
     // the draft tempfile.
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-        app.quit = true;
+        app.request_quit();
         return;
     }
 
@@ -232,7 +232,7 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
         && !k.modifiers.contains(KeyModifiers::CONTROL)
         && !matches!(app.screens.get(app.active), Some(Screen::Compose(_)))
     {
-        app.quit = true;
+        app.request_quit();
         return;
     }
 
