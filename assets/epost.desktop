@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=epost
+GenericName=Email Client
+Comment=Read and compose mail in the terminal
+Exec=epost %u
+Terminal=true
+Icon=mail-client
+Categories=Network;Email;
+MimeType=x-scheme-handler/mailto;

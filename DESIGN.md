@@ -445,8 +445,9 @@ lists, tables, blockquotes, emphasis, links, images --- is preserved.
    placement across scroll redraws.
 5. **Interact.** Link picker: keypress `f` overlays each link's id (e.g. `12`)
    as a tiny inverse-video tag; typed digits select. `<Enter>` on a selected
-   link opens it via `[reader].browser` (a `<leader>` for `mailto:` links
-   that calls the compose flow with To: pre-filled --- TBD). `:open` writes
+   link opens it via `[reader].browser`, except `mailto:` links, which open
+   the composer with To, Cc, Bcc, subject, and body prefilled. `gx` uses the
+   same dispatch for the link under the cursor. `:open` writes
    the message's HTML to a temp file (with `cid:` references rewritten to
    point at extracted parts), spawns the browser command on a worker
    thread, doesn't wait.
@@ -481,6 +482,14 @@ it; the mail client never does).
   scroll tick (their protocols are placement-aware).
 
 ## Compose → send
+
+`mailto:` links and the optional command-line URI use the same parser and
+new-message compose flow. The sender follows the current account scope or
+the configured primary account in the unified view. Percent-encoded UTF-8
+fields are decoded once, `+` is literal, and body line endings become native
+editor newlines. Only To, Cc, Bcc, subject, and body are imported; other fields
+are ignored. Control characters in headers and malformed escapes in supported
+fields are rejected. Opening a URI never sends the draft automatically.
 
 The compose UI uses the native body editor, with `$EDITOR` available through
 `:edit`. On `:send`, retain the compose screen until the worker reports its
@@ -579,7 +588,14 @@ and the pkg-config build deps from the GUI era have been dropped.
 The binary accepts `--config <path>` to override the default config
 location. `task dev` and `task run` pass `--config dev/config.toml`; real
 users on NixOS leave it off and let the binary resolve
-`$XDG_CONFIG_HOME/epost/config.toml`. A planned `--open-to <msgid>` flag
+`$XDG_CONFIG_HOME/epost/config.toml`. An optional positional `mailto:` URI
+opens a compose tab at startup, for example
+`epost 'mailto:dev@example.com?subject=Hello%20there'`. Invalid URIs fail
+argument parsing before terminal setup. The Nix package installs
+`epost.desktop` with `Terminal=true` and `x-scheme-handler/mailto` support;
+the user selects it as the default handler through their desktop or Home
+Manager configuration. Each external invocation starts a new process.
+A planned `--open-to <msgid>` flag
 will deep-link back into a specific view, useful for getting back where you
 were after a bacon-driven restart --- not v1.
 

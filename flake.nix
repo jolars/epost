@@ -41,6 +41,12 @@
             # skip them at build time to keep nix builds hermetic.
             doCheck = false;
 
+            postInstall = ''
+              install -Dm644 assets/epost.desktop "$out/share/applications/epost.desktop"
+              substituteInPlace "$out/share/applications/epost.desktop" \
+                --replace-fail "Exec=epost" "Exec=$out/bin/epost"
+            '';
+
             meta = {
               description = "Linux maildir email reader/composer (TUI)";
               mainProgram = "epost";

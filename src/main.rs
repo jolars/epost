@@ -18,6 +18,7 @@ mod store;
 mod ui;
 
 use crate::config::Config;
+use crate::mail::mailto::Mailto;
 use crate::ui::app::App;
 use crate::ui::embed::EditorSession;
 use crate::ui::events::{self, AppEvent};
@@ -62,6 +63,10 @@ struct Args {
     /// configured maildirs, so deleting this file is safe.
     #[arg(long)]
     cache: Option<PathBuf>,
+
+    /// Open a compose tab with recipients and fields from a mailto: URI.
+    #[arg(value_name = "MAILTO")]
+    mailto: Option<Mailto>,
 }
 
 fn main() -> ExitCode {
@@ -95,7 +100,14 @@ fn main() -> ExitCode {
     // the event loop starts reading keypresses.
     let (picker, picker_warning) = ui::images::build_picker(&cfg.images);
 
-    let result = run(&mut terminal, &cfg, cache_path, picker, picker_warning);
+    let result = run(
+        &mut terminal,
+        &cfg,
+        cache_path,
+        picker,
+        picker_warning,
+        args.mailto,
+    );
     let restore = tty::leave(mouse);
 
     if let Err(e) = result {
@@ -115,6 +127,7 @@ fn run(
     cache_path: PathBuf,
     picker: Option<ratatui_image::picker::Picker>,
     picker_warning: Option<String>,
+    mailto: Option<Mailto>,
 ) -> Result<()> {
     // Single fan-in channel: crossterm input goes through one reader
     // thread, and subsystems (editor pty, scan/send workers, the
@@ -127,6 +140,9 @@ fn run(
     let mut app = App::new(cfg, cache_path, picker, Some(event_tx.clone()));
     if let Some(w) = picker_warning {
         app.status_error = Some(w);
+    }
+    if let Some(mailto) = mailto {
+        ui::cmdline::open_mailto_compose(&mut app, cfg, mailto);
     }
 
     // Draw once before blocking so the initial UI appears even before
@@ -437,6 +453,37 @@ fn install_panic_hook() {
         let _ = disable_raw_mode();
         original(info);
     }));
+}
+
+#[cfg(test)]
+mod mailto_tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_mailto_with_config_and_cache() {
+        assert!(
+            Args::try_parse_from([
+                "epost",
+                "--config",
+                "test.toml",
+                "--cache",
+                "test.sqlite",
+                "mailto:dev+list@example.com?subject=Hello%20there&body=Hi%0D%0Aagain",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cli_rejects_non_mailto_and_malformed_targets() {
+        for target in [
+            "https://example.com",
+            "dev@example.com",
+            "mailto:dev@example.com?subject=%ZZ",
+        ] {
+            assert!(Args::try_parse_from(["epost", target]).is_err(), "{target}");
+        }
+    }
 }
 
 #[cfg(test)]

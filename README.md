@@ -79,6 +79,44 @@ schema.
 CLI flags: `--config <path>` and `--cache <path>` override the config and index
 locations.
 
+## Mailto links
+
+Pass a `mailto:` URI to open a prefilled compose tab:
+
+```sh
+epost 'mailto:someone@example.com?subject=Hello%20there&body=First%20line%0D%0ASecond%20line'
+```
+
+The URI can supply To, Cc, Bcc, subject, and body. Percent-encoded UTF-8 is
+decoded, and `+` stays literal (use `%20` for spaces). Other fields, including
+attachment paths, are ignored. The draft opens for editing and sends only
+when you invoke `:send`.
+
+In the reader, follow an HTML `mailto:` link with `gx` or the `f` link picker
+to open a compose tab. The sender follows the current account scope, or the
+primary account in the unified view and on command-line launch.
+
+The Nix package includes `epost.desktop`, which launches epost in a terminal.
+To make it the default mail handler with Home Manager, install the package
+in `home.packages` and set:
+
+```nix
+xdg.mimeApps = {
+  enable = true;
+  defaultApplications."x-scheme-handler/mailto" = [ "epost.desktop" ];
+};
+```
+
+For a source installation, install the desktop entry and select it:
+
+```sh
+install -Dm644 assets/epost.desktop "${XDG_DATA_HOME:-$HOME/.local/share}/applications/epost.desktop"
+xdg-mime default epost.desktop x-scheme-handler/mailto
+```
+
+The desktop environment must be able to find `epost` and launch a terminal.
+External links start a new epost process.
+
 ## Sending and drafts
 
 Configure `drafts` for each sending account, using the folder name in its

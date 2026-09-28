@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::Config;
-use crate::mail::text;
+use crate::mail::{mailto, text};
 use crate::ui::app::{App, Mode, Pane, Screen};
 use crate::ui::clipboard::{self, YankOutcome};
 use crate::ui::motion::{self, Motion, Region};
@@ -120,7 +120,7 @@ fn normal(app: &mut App, cfg: &Config, k: KeyEvent) {
             }
             // `g`-prefixed verbs, Reader focus only: `gx` opens the link
             // under the cursor (falling back to the attachment under the
-            // cursor) in the external opener, `gs` saves the attachment,
+            // cursor), `gs` saves the attachment,
             // `gd` drags it, `gf` opens the numeric attachment picker.
             // Anything else falls through.
             if app.inbox().focus == Pane::Reader {
@@ -1248,7 +1248,7 @@ fn dispatch_yank(app: &mut App, cfg: &Config, text: String, ok_status: String) {
 }
 
 /// `gx` on the reader: open whatever sits under the cursor in the
-/// external opener. A link directly under the cursor wins (vim's `gx`
+/// composer or external opener. A link directly under the cursor wins (vim's `gx`
 /// semantics); otherwise we fall through to the attachment verb so a
 /// cursor parked on an attachment chip — or the lone-attachment
 /// fallback — still works. Returns `true` once a link was opened.
@@ -1271,9 +1271,7 @@ fn open_link_under_cursor(app: &mut App, cfg: &Config) -> bool {
     let Some(href) = laid.link_at(line, col).map(|s| s.href.clone()) else {
         return false;
     };
-    if let Err(e) = crate::ui::browser::open_url(&href, &cfg.reader.browser) {
-        app.status_error = Some(format!("open: {e:#}"));
-    }
+    open_link(app, cfg, &href);
     true
 }
 
@@ -1304,7 +1302,126 @@ fn follow_link(app: &mut App, cfg: &Config, buf: &str) {
         app.status_error = Some(format!("link: no such id: {id}"));
         return;
     };
-    if let Err(e) = crate::ui::browser::open_url(&slot.href, &cfg.reader.browser) {
+    open_link(app, cfg, &slot.href);
+}
+
+fn open_link(app: &mut App, cfg: &Config, href: &str) {
+    if mailto::has_scheme(href) {
+        match href.parse() {
+            Ok(mailto) => cmdline::open_mailto_compose(app, cfg, mailto),
+            Err(e) => app.status_error = Some(format!("mailto: {e:#}")),
+        }
+    } else if let Err(e) = crate::ui::browser::open_url(href, &cfg.reader.browser) {
         app.status_error = Some(format!("open: {e:#}"));
+    }
+}
+
+#[cfg(test)]
+mod mailto_tests {
+    use super::*;
+    use crate::mail::html;
+    use crate::ui::app::ParsedBody;
+
+    fn setup(href: &str) -> (App, Config, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [accounts.personal]
+            maildir = "/unused"
+            from = "Personal <me@example.com>"
+            [accounts.work]
+            maildir = "/unused"
+            from = "Work <me@work.example>"
+            primary = true
+        "#,
+        )
+        .unwrap();
+        for (name, account) in &mut cfg.accounts {
+            account.maildir = dir.path().join(name);
+        }
+        cfg.watch.enabled = false;
+        // An empty opener makes accidental external dispatch observable.
+        cfg.reader.browser.clear();
+        let mut app = App::new(&cfg, dir.path().join("index.sqlite"), None, None);
+        app.inbox_mut().focus = Pane::Reader;
+        app.inbox_mut().last_reader_inner_width = 80;
+        app.inbox_mut().parsed = Some(Box::new(ParsedBody {
+            msgid: "source@example.com".into(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            blocks: html::parse(&format!("<p><a href=\"{href}\">Email us</a></p>")),
+            raw_html: None,
+            plain_fallback: None,
+            cid_parts: Default::default(),
+            attachments: vec![],
+        }));
+        (app, cfg, dir)
+    }
+
+    fn press(app: &mut App, cfg: &Config, key: KeyCode) {
+        handle(app, cfg, KeyEvent::new(key, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn mailto_gx_opens_prefilled_compose_in_scoped_account() {
+        let (mut app, cfg, _dir) = setup(
+            "mailto:dev+list@example.com?cc=copy@example.com&amp;bcc=hidden@example.com&amp;subject=Hello%20there&amp;body=First%0D%0ASecond",
+        );
+        app.inbox_mut().current_account = Some("personal".into());
+        press(&mut app, &cfg, KeyCode::Char('g'));
+        press(&mut app, &cfg, KeyCode::Char('x'));
+        let draft = app
+            .active_compose()
+            .expect("mailto must open a compose tab")
+            .collect_draft()
+            .unwrap();
+        assert_eq!(draft.account, "personal");
+        assert_eq!(draft.from, "Personal <me@example.com>");
+        assert_eq!(draft.to, ["dev+list@example.com"]);
+        assert_eq!(draft.cc, ["copy@example.com"]);
+        assert_eq!(draft.bcc, ["hidden@example.com"]);
+        assert_eq!(draft.subject, "Hello there");
+        assert_eq!(draft.body, "First\nSecond");
+        assert!(app.pending_sends.is_empty());
+        assert!(app.status_error.is_none());
+    }
+
+    #[test]
+    fn mailto_picker_uses_primary_account_and_external_editor_setting() {
+        let (mut app, mut cfg, _dir) = setup("MAILTO:dev@example.com");
+        cfg.compose.mode = crate::config::ComposeMode::External;
+        for key in [KeyCode::Char('f'), KeyCode::Char('1'), KeyCode::Enter] {
+            press(&mut app, &cfg, key);
+        }
+        let screen = app
+            .active_compose()
+            .expect("mailto must open a compose tab");
+        assert_eq!(screen.account, "work");
+        assert_eq!(screen.to.as_str(), "dev@example.com");
+        assert!(screen.editor_pending);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.link_pick_buf.is_empty());
+        assert!(app.pending_sends.is_empty());
+    }
+
+    #[test]
+    fn mailto_bad_header_keeps_inbox_and_reports_error() {
+        let (mut app, cfg, _dir) =
+            setup("mailto:dev@example.com?subject=Hello%0D%0ABcc%3Ahidden@example.com");
+        follow_link(&mut app, &cfg, "1");
+        assert_eq!(app.screens.len(), 1);
+        assert!(app.status_error.as_deref().unwrap().contains("mailto:"));
+    }
+
+    #[test]
+    fn ordinary_links_still_use_configured_opener() {
+        let (mut app, cfg, _dir) = setup("https://example.com");
+        follow_link(&mut app, &cfg, "1");
+        assert_eq!(app.screens.len(), 1);
+        assert_eq!(
+            app.status_error.as_deref(),
+            Some("open: no browser command configured")
+        );
     }
 }

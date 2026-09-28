@@ -7,6 +7,7 @@ use ratatui::widgets::Paragraph;
 use crate::config;
 use crate::config::Config;
 use crate::mail::compose::{self as mail_compose, Draft};
+use crate::mail::mailto::Mailto;
 use crate::mail::parse;
 use crate::store::sync as store_sync;
 use crate::ui::app::{App, Mode, MsgRef, PendingSend, Screen, UndoAction};
@@ -1000,6 +1001,10 @@ fn escape_to_external_editor(app: &mut App) {
 }
 
 fn open_blank_compose(app: &mut App, cfg: &Config) {
+    open_mailto_compose(app, cfg, Mailto::default());
+}
+
+pub fn open_mailto_compose(app: &mut App, cfg: &Config, mailto: Mailto) {
     // Pre-select the From identity. From an account-scoped inbox the
     // pre-selection is "obvious" — the scope itself implies the sender.
     // From the unified `[all]` scope there is no implied account, so
@@ -1025,7 +1030,8 @@ fn open_blank_compose(app: &mut App, cfg: &Config) {
         app.status_error = Some(format!("compose: unknown account: {name}"));
         return;
     };
-    let draft = Draft::new_blank(&name, &account.from);
+    let mut draft = Draft::new_blank(&name, &account.from);
+    mailto.apply(&mut draft);
     match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
         Ok(mut screen) => {
             // `[compose].mode = "external"`: behave like the old
