@@ -115,7 +115,17 @@ xdg-mime default epost.desktop x-scheme-handler/mailto
 ```
 
 The desktop environment must be able to find `epost` and launch a terminal.
-External links start a new epost process.
+External links open a new compose tab in the first running instance using
+the same config path. If none is running, epost starts normally. Restart an
+older instance after upgrading to enable forwarding.
+
+For a desktop handler that avoids opening a terminal when epost is already
+running, call `epost --reuse "$uri"` first. Status 0 means the draft was handed
+off; status 3 means no instance is running, so the handler should launch
+`epost "$uri"` in a terminal. Other errors should be reported without launching
+another instance. Forwarding uses a private Unix socket under
+`$XDG_RUNTIME_DIR/epost/instances` (or the cache directory if unset), and
+preserves the running instance's account scope and existing drafts.
 
 ## Sending and drafts
 

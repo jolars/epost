@@ -13,6 +13,8 @@ use crossterm::event::{self, Event};
 
 #[derive(Debug)]
 pub enum AppEvent {
+    /// An external mailto request opens a draft in this instance.
+    Mailto(crate::mail::mailto::Mailto),
     /// A raw crossterm input event (key, resize, mouse, …).
     Input(Event),
     /// Something asked the UI to re-tick: poll workers, finalize

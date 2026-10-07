@@ -594,7 +594,13 @@ opens a compose tab at startup, for example
 argument parsing before terminal setup. The Nix package installs
 `epost.desktop` with `Terminal=true` and `x-scheme-handler/mailto` support;
 the user selects it as the default handler through their desktop or Home
-Manager configuration. Each external invocation starts a new process.
+Manager configuration. A mailto invocation first forwards the URI over a
+private Unix socket to the first running instance with the same config path,
+which opens a compose tab through the main event channel. With no listener,
+the invocation starts normally. `--reuse` only attempts forwarding and exits
+with status 3 when no instance is available, allowing desktop wrappers to
+launch a terminal only when needed. A worker thread receives and validates
+requests; a file lock elects one listener and protects stale-socket cleanup.
 A planned `--open-to <msgid>` flag
 will deep-link back into a specific view, useful for getting back where you
 were after a bacon-driven restart --- not v1.

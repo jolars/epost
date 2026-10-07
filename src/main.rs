@@ -13,6 +13,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 mod config;
+mod instance;
 mod mail;
 mod store;
 mod ui;
@@ -65,14 +66,42 @@ struct Args {
     cache: Option<PathBuf>,
 
     /// Open a compose tab with recipients and fields from a mailto: URI.
-    #[arg(value_name = "MAILTO")]
-    mailto: Option<Mailto>,
+    #[arg(value_name = "MAILTO", value_parser = validate_mailto)]
+    mailto: Option<String>,
+
+    /// Forward MAILTO to a running instance without opening a terminal.
+    /// Exit with status 3 if no instance is available.
+    #[arg(long, requires = "mailto")]
+    reuse: bool,
+}
+
+fn validate_mailto(uri: &str) -> Result<String> {
+    uri.parse::<Mailto>()?;
+    Ok(uri.to_owned())
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
     init_logging();
     let path = args.config.unwrap_or_else(config::default_path);
+    let socket_path = match instance::socket_path(&path) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("epost: failed to resolve instance socket: {e:#}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(uri) = args.mailto.as_deref() {
+        match instance::forward(&socket_path, uri) {
+            Ok(true) => return ExitCode::SUCCESS,
+            Ok(false) if args.reuse => return ExitCode::from(3),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("epost: failed to forward mailto: {e:#}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     let cfg = match config::load(&path) {
         Ok(cfg) => cfg,
@@ -106,7 +135,9 @@ fn main() -> ExitCode {
         cache_path,
         picker,
         picker_warning,
-        args.mailto,
+        args.mailto
+            .map(|uri| uri.parse().expect("validated by clap")),
+        socket_path,
     );
     let restore = tty::leave(mouse);
 
@@ -128,6 +159,7 @@ fn run(
     picker: Option<ratatui_image::picker::Picker>,
     picker_warning: Option<String>,
     mailto: Option<Mailto>,
+    socket_path: PathBuf,
 ) -> Result<()> {
     // Single fan-in channel: crossterm input goes through one reader
     // thread, and subsystems (editor pty, scan/send workers, the
@@ -144,6 +176,13 @@ fn run(
     if let Some(mailto) = mailto {
         ui::cmdline::open_mailto_compose(&mut app, cfg, mailto);
     }
+    let _instance = match instance::Instance::start(&socket_path, event_tx.clone()) {
+        Ok(instance) => instance,
+        Err(e) => {
+            app.status_error = Some(format!("mailto forwarding unavailable: {e:#}"));
+            None
+        }
+    };
 
     // Draw once before blocking so the initial UI appears even before
     // any event arrives.
@@ -251,6 +290,19 @@ fn process_event(app: &mut App, cfg: &Config, ev: AppEvent) {
             ui::paste::insert(app, cfg, &text, ui::paste::Placement::Cursor);
         }
         AppEvent::Input(_) => {}
+        AppEvent::Mailto(mailto) => {
+            app.exit_visual();
+            app.inbox_mut().list_visual = None;
+            app.inbox_mut().mouse_drag_anchor = None;
+            app.pending_g = false;
+            app.pending_y = None;
+            app.pending_count = None;
+            app.pending_z = false;
+            app.cmdline.clear();
+            app.link_pick_buf.clear();
+            app.attachment_pick_buf.clear();
+            ui::cmdline::open_mailto_compose(app, cfg, mailto);
+        }
         AppEvent::Wake => {}
     }
 }
@@ -460,6 +512,12 @@ mod mailto_tests {
     use super::*;
 
     #[test]
+    fn cli_reuse_requires_mailto() {
+        assert!(Args::try_parse_from(["epost", "--reuse", "mailto:dev@example.com"]).is_ok());
+        assert!(Args::try_parse_from(["epost", "--reuse"]).is_err());
+    }
+
+    #[test]
     fn cli_accepts_mailto_with_config_and_cache() {
         assert!(
             Args::try_parse_from([
@@ -483,6 +541,56 @@ mod mailto_tests {
         ] {
             assert!(Args::try_parse_from(["epost", target]).is_err(), "{target}");
         }
+    }
+
+    #[test]
+    fn external_mailto_opens_a_new_tab_and_preserves_an_existing_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(
+            r#"
+            [accounts.personal]
+            maildir = "/nonexistent"
+            from = "Me <me@example.com>"
+            sent = "Sent"
+        "#,
+        )
+        .unwrap();
+        let mut app = App::new(&cfg, dir.path().join("index.sqlite"), None, None);
+        app.inbox_mut().current_account = Some("personal".into());
+        ui::cmdline::open_mailto_compose(
+            &mut app,
+            &cfg,
+            "mailto:original@example.com?body=Keep%20this"
+                .parse()
+                .unwrap(),
+        );
+        app.mode = ui::app::Mode::Command;
+        app.cmdline = ui::text_input::TextInput::from_string("send");
+        app.pending_g = true;
+        process_event(
+            &mut app,
+            &cfg,
+            AppEvent::Mailto(
+                "mailto:new@example.com?subject=Hello&body=New%20draft"
+                    .parse()
+                    .unwrap(),
+            ),
+        );
+        assert_eq!(app.screens.len(), 3);
+        let ui::app::Screen::Compose(original) = &app.screens[1] else {
+            panic!("expected original draft")
+        };
+        assert_eq!(original.to.as_str(), "original@example.com");
+        assert_eq!(original.body.text(), "Keep this");
+        let new = app.active_compose().unwrap();
+        assert_eq!(new.to.as_str(), "new@example.com");
+        assert_eq!(new.subject.as_str(), "Hello");
+        assert_eq!(new.body.text(), "New draft");
+        assert_eq!(new.account, "personal");
+        assert_eq!(app.mode, ui::app::Mode::Normal);
+        assert!(app.cmdline.is_empty());
+        assert!(!app.pending_g);
+        assert!(app.pending_sends.is_empty());
     }
 }
 
