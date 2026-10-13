@@ -1,7 +1,7 @@
 //! Compose screen: aerc-style form for one in-flight draft. Lives in
 //! its own tab so the user can `Ctrl-PgDn` away to other work and come
 //! back. Header fields (From / To / Cc / Bcc / Subject) store their text
-//! in `TextInput`s but edit modally (Normal / Insert) via
+//! in `TextInput`s but edit modally (Normal / Insert / Visual) via
 //! [`crate::ui::compose_header`], symmetric with the body's vim editor;
 //! the body is owned by the native vim editor
 //! ([`crate::ui::compose_body::BodyEditor`]). `:edit` materialises the
@@ -85,14 +85,12 @@ pub struct ComposeScreen {
     pub last_header_focused: ComposeField,
     /// Modal state shared by all header fields (From / To / Cc / Bcc /
     /// Subject). Only one header field is focused at a time, so a single
-    /// mode suffices; it persists across field switches (you navigate in
-    /// Normal, stay in Insert while Tab-ing) and reuses the body editor's
-    /// Normal-default convention. See [`crate::ui::compose_header`].
+    /// mode suffices. Field switches cancel Visual and preserve Insert,
+    /// so tabbing while typing keeps the form ready for text entry.
+    /// See [`crate::ui::compose_header`].
     pub header_mode: HeaderMode,
-    /// Pending two-key / capture latch for header Normal mode: `Some('d')`
-    /// after `d` (awaiting the second `d`), `Some('c')` after `c`,
-    /// `Some('r')` after `r` (awaiting the replacement char). Cleared on
-    /// any focus change via [`ComposeScreen::set_focus`].
+    /// Pending header operator or text-object capture. Focus changes
+    /// clear it so a partial chord cannot act on another field.
     pub header_pending: Option<char>,
     /// Vim-style body editor. Always present; holds the canonical body
     /// text. When the user invokes `:edit`, the contents are flushed to
@@ -365,9 +363,11 @@ impl ComposeScreen {
         if field != ComposeField::Body {
             self.last_header_focused = field;
         }
-        // Any focus change cancels a half-typed header operator (a pending
-        // `d`/`c`/`r`) so it can't fire against the field we land on.
+        // A partial operator or selection must not act on another field.
         self.header_pending = None;
+        if matches!(self.header_mode, HeaderMode::Visual { .. }) {
+            self.header_mode = HeaderMode::Normal;
+        }
         self.focused = field;
     }
 
@@ -753,6 +753,10 @@ pub fn open_from_picker(screen: &mut ComposeScreen, cfg: &Config) {
         .iter()
         .position(|o| o.account == screen.account)
         .unwrap_or(0);
+    screen.header_pending = None;
+    if matches!(screen.header_mode, HeaderMode::Visual { .. }) {
+        screen.header_mode = HeaderMode::Normal;
+    }
     screen.from_picker = Some(FromPicker { options, selected });
 }
 
@@ -1222,26 +1226,46 @@ fn render_field(
             spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
             spans.push(Span::raw(after.to_string()));
         }
-        // Normal: a solid block sits *on* the char under the cursor
-        // (reverse-video), matching the body editor's block cursor.
-        HeaderMode::Normal => {
-            spans.push(Span::raw(before.to_string()));
+        HeaderMode::Normal | HeaderMode::Visual { .. } => {
+            let selected = compose_header::selection_range(mode, input);
+            let cursor_col = input.cursor_char();
             let block = Style::default().add_modifier(Modifier::REVERSED);
-            match input.char_under_cursor() {
-                Some(c) => {
-                    let mut s = String::new();
-                    s.push(c);
-                    spans.push(Span::styled(s, block));
-                    // Skip the now-covered char in the trailing run.
-                    let rest = &after[c.len_utf8()..];
-                    spans.push(Span::raw(rest.to_string()));
-                }
-                // End of an (empty or fully-traversed) line: block a space.
-                None => spans.push(Span::styled(" ", block)),
+            for (col, c) in buf.chars().enumerate() {
+                let style =
+                    if col == cursor_col || selected.as_ref().is_some_and(|r| r.contains(&col)) {
+                        block
+                    } else {
+                        Style::default()
+                    };
+                spans.push(Span::styled(c.to_string(), style));
+            }
+            if input.char_under_cursor().is_none() {
+                spans.push(Span::styled(" ", block));
             }
         }
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let label_width = disp_w(label).min(usize::from(area.width)) as u16;
+    let text_area = Rect::new(
+        area.x + label_width,
+        area.y,
+        area.width - label_width,
+        area.height,
+    );
+    let cursor_width = input
+        .char_under_cursor()
+        .map(|c| disp_w(&c.to_string()))
+        .unwrap_or(1);
+    let scroll =
+        disp_w(before).saturating_sub(usize::from(text_area.width).saturating_sub(cursor_width));
+    let label_span = spans.remove(0);
+    f.render_widget(
+        Paragraph::new(Line::from(label_span)),
+        Rect::new(area.x, area.y, label_width, area.height),
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).scroll((0, scroll.min(usize::from(u16::MAX)) as u16)),
+        text_area,
+    );
 }
 
 /// Unfocused single-line view. Empty shows a dim `(none)`; non-empty
@@ -1407,6 +1431,107 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn header_visual_dispatch_does_not_close_and_focus_switch_cancels() {
+        let mut s = blank();
+        s.to = TextInput::from_string("alice@example.com");
+        s.to.move_home();
+        let cfg = Config::default();
+        for ch in "v$qy".chars() {
+            let out = handle_key(&mut s, key(KeyCode::Char(ch), KeyModifiers::NONE), &cfg);
+            assert!(matches!(out, KeyOutcome::Consumed));
+        }
+        assert!(s.confirm_close.is_none());
+        assert_eq!(
+            s.body.take_clipboard_yank().as_deref(),
+            Some("alice@example.com")
+        );
+        handle_key(&mut s, key(KeyCode::Char('v'), KeyModifiers::NONE), &cfg);
+        handle_key(&mut s, key(KeyCode::Tab, KeyModifiers::NONE), &cfg);
+        assert_eq!(s.focused, ComposeField::Cc);
+        assert_eq!(s.header_mode, HeaderMode::Normal);
+    }
+
+    #[test]
+    fn visual_clipboard_shortcut_preserves_selection_until_paste() {
+        let mut s = blank();
+        s.to = TextInput::from_string("abc");
+        s.to.move_home();
+        let cfg = Config::default();
+        for ch in "vl\"+".chars() {
+            assert!(matches!(
+                handle_key(&mut s, key(KeyCode::Char(ch), KeyModifiers::NONE), &cfg),
+                KeyOutcome::Consumed
+            ));
+        }
+        let out = handle_key(&mut s, key(KeyCode::Char('p'), KeyModifiers::NONE), &cfg);
+        assert!(matches!(
+            out,
+            KeyOutcome::ClipboardPaste(crate::ui::paste::Placement::After)
+        ));
+        assert!(matches!(s.header_mode, HeaderMode::Visual { .. }));
+        compose_header::paste(&mut s, "é", crate::ui::paste::Placement::After);
+        assert_eq!(s.to.as_str(), "éc");
+    }
+
+    #[test]
+    fn header_selection_renders_unicode_with_label_unselected() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(20, 1)).unwrap();
+        let mut input = TextInput::from_string("é中x");
+        input.set_cursor_char(1);
+        terminal
+            .draw(|f| {
+                render_field(
+                    f,
+                    f.area(),
+                    "To: ",
+                    &input,
+                    true,
+                    HeaderMode::Visual {
+                        anchor: 0,
+                        linewise: false,
+                    },
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(4, 0)].symbol(), "é");
+        assert!(buf[(4, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(5, 0)].symbol(), "中");
+        assert!(buf[(5, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(7, 0)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn long_header_scroll_keeps_cursor_visible_and_label_pinned() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(12, 1)).unwrap();
+        let mut input = TextInput::from_string("alice@example.com");
+        input.clamp_normal();
+        terminal
+            .draw(|f| {
+                render_field(
+                    f,
+                    f.area(),
+                    "To: ",
+                    &input,
+                    true,
+                    HeaderMode::Visual {
+                        anchor: 0,
+                        linewise: false,
+                    },
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(0, 0)].symbol(), "T");
+        assert_eq!(buf[(1, 0)].symbol(), "o");
+        assert_eq!(buf[(11, 0)].symbol(), "m");
+        assert!(buf[(11, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

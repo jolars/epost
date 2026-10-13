@@ -74,7 +74,7 @@ pub fn normalize(text: &str, single_line: bool) -> String {
         .collect()
 }
 
-fn insert_single(input: &mut TextInput, text: &str, placement: Placement, normal: bool) {
+pub(crate) fn insert_single(input: &mut TextInput, text: &str, placement: Placement, normal: bool) {
     let text = normalize(text, true);
     input.paste_prefix = Prefix::None;
     if text.is_empty() {
@@ -162,15 +162,9 @@ pub fn insert(app: &mut App, cfg: &Config, text: &str, placement: Placement) {
                 app.status_error = Some(e.into());
             }
         }
-        TargetKind::Header(_, mode) => {
+        TargetKind::Header(_, _) => {
             let c = app.active_compose_mut().expect("checked target");
-            c.header_pending = None;
-            insert_single(
-                c.focused_input_mut().expect("header"),
-                text,
-                placement,
-                mode == HeaderMode::Normal,
-            );
+            crate::ui::compose_header::paste(c, text, placement);
             app.refresh_address_complete(cfg);
         }
         TargetKind::Attachment => {

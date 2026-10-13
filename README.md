@@ -168,7 +168,18 @@ fuzzy-filter the current directory. The same drop-down appears while typing
 Directory reads and fuzzy matching run in the background. Files are read when
 you send the message, so you can still edit an attachment after adding it.
 
-## Clipboard paste
+## Copy and paste
+
+The composer's From, To, Cc, Bcc, and Subject fields support Vim selection
+and yanking. Press `v` to select characters, move with `h`/`l`, word
+motions, `0`, or `$`, and press `y` to copy. `V` selects the whole field.
+You can also use `yy` for the whole field, `y$` or `Y` for its remaining
+text, and text objects such as `yiw` or `yi<` (the email inside angle
+brackets). Selection stays in one field; Escape or switching fields
+cancels it. Use `p`/`P` to paste after/before the cursor, or replace a
+visual selection. Headers and the native body editor share a yank buffer,
+and explicit yanks also use the clipboard configured by `[reader].clipboard`
+(OSC 52 by default).
 
 Use your terminal's paste shortcut (often `Ctrl-Shift-V`) in the composer
 body, headers, attachment path input, command line, or search. Pasted text
@@ -188,7 +199,7 @@ paste_command = ["wl-paste", "--no-newline", "--type", "text"]
 Install the chosen command separately (for example, `wl-clipboard` on
 NixOS). Use `"+p` or `"+P` in composer Normal mode to paste after or before
 the cursor. In Insert/Replace mode, the attachment path input, command line,
-or search, use `Ctrl-R` followed by `+`. Ordinary body `p`/`P` keep using
+or search, use `Ctrl-R` followed by `+`. Ordinary composer `p`/`P` keep using
 epost's internal yank buffer, and Normal-mode `Ctrl-R` remains redo.
 
 Body paste preserves indentation and trailing newlines. Visual Char/Line

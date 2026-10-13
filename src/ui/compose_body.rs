@@ -531,7 +531,11 @@ impl BodyEditor {
         Ok(())
     }
 
-    fn record_yank(&mut self, text: String, line_wise: bool) {
+    pub(crate) fn yank_register(&self) -> Option<(&str, bool)> {
+        self.yank.as_ref().map(|y| (y.text.as_str(), y.line_wise))
+    }
+
+    pub(crate) fn record_yank(&mut self, text: String, line_wise: bool) {
         self.clipboard_yank = Some(text.clone());
         self.yank = Some(Yank { text, line_wise });
     }
