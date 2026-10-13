@@ -865,8 +865,37 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     } else {
         1
     };
-    // 5 fixed rows + 2 border lines = 7; plus the attach row(s).
-    let header_height: u16 = 7u16.saturating_add(attach_rows);
+    let recipient_width = area.width.saturating_sub(2 + 9);
+    let recipients = [
+        (ComposeField::To, &screen.to),
+        (ComposeField::Cc, &screen.cc),
+        (ComposeField::Bcc, &screen.bcc),
+    ]
+    .map(|(field, input)| {
+        wrap_recipient(
+            input,
+            recipient_width,
+            screen.focused == field,
+            screen.header_mode,
+        )
+    });
+    let mut recipient_heights = recipients
+        .each_ref()
+        .map(|field| field.lines.len().min(usize::from(u16::MAX)) as u16);
+    // Reserve the other fields, borders, body, and hint. Oversized recipient
+    // lists scroll within their field instead of consuming the whole form.
+    let recipient_budget = area
+        .height
+        .saturating_sub(8u16.saturating_add(attach_rows))
+        .max(3);
+    while recipient_heights.iter().map(|&h| u32::from(h)).sum::<u32>() > u32::from(recipient_budget)
+    {
+        let tallest = (0..3).max_by_key(|&i| recipient_heights[i]).unwrap();
+        recipient_heights[tallest] -= 1;
+    }
+    let header_height = 4u16
+        .saturating_add(attach_rows)
+        .saturating_add(recipient_heights.iter().sum::<u16>());
     let outer = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(3),
@@ -899,7 +928,9 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
     let header_inner = header_block.inner(header_area);
     f.render_widget(header_block, header_area);
 
-    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1); 5];
+    let mut constraints = vec![Constraint::Length(1)];
+    constraints.extend(recipient_heights.map(Constraint::Length));
+    constraints.push(Constraint::Length(1));
     for _ in 0..attach_rows {
         constraints.push(Constraint::Length(1));
     }
@@ -913,39 +944,20 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         screen.focused == ComposeField::From,
         screen.header_mode,
     );
-    render_field(
-        f,
-        rows[1],
-        "To:      ",
-        &screen.to,
-        screen.focused == ComposeField::To,
-        screen.header_mode,
-    );
-    render_field(
-        f,
-        rows[2],
-        "Cc:      ",
-        &screen.cc,
-        screen.focused == ComposeField::Cc,
-        screen.header_mode,
-    );
-    render_field(
-        f,
-        rows[3],
-        "Bcc:     ",
-        &screen.bcc,
-        screen.focused == ComposeField::Bcc,
-        screen.header_mode,
-    );
-    // Stash the focused-recipient row so the address-completion
-    // popup can hang off it. Refreshed every frame; cleared whenever
-    // focus isn't on a recipient field.
-    screen.last_complete_anchor = match screen.focused {
-        ComposeField::To => Some(rows[1]),
-        ComposeField::Cc => Some(rows[2]),
-        ComposeField::Bcc => Some(rows[3]),
-        _ => None,
-    };
+    screen.last_complete_anchor = None;
+    for (i, (label, field)) in [
+        ("To:      ", ComposeField::To),
+        ("Cc:      ", ComposeField::Cc),
+        ("Bcc:     ", ComposeField::Bcc),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let anchor = render_recipient(f, rows[i + 1], label, &recipients[i]);
+        if screen.focused == field {
+            screen.last_complete_anchor = anchor;
+        }
+    }
     render_field(
         f,
         rows[4],
@@ -1196,6 +1208,118 @@ fn draw_from_picker(f: &mut Frame, from_row: Rect, picker: &FromPicker, bounds: 
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+struct WrappedRecipient {
+    lines: Vec<Line<'static>>,
+    cursor_row: Option<usize>,
+}
+
+fn wrap_recipient(
+    input: &TextInput,
+    width: u16,
+    focused: bool,
+    mode: HeaderMode,
+) -> WrappedRecipient {
+    let selected = focused
+        .then(|| compose_header::selection_range(mode, input))
+        .flatten();
+    let cursor = input.cursor_char();
+    let char_count = input.as_str().chars().count();
+    let block = Style::default().add_modifier(Modifier::REVERSED);
+    let mut glyphs = Vec::new();
+    for (col, ch) in input
+        .as_str()
+        .chars()
+        .chain(std::iter::once(' '))
+        .enumerate()
+    {
+        let at_end = col == char_count;
+        let at_cursor = focused && col == cursor;
+        if at_cursor && mode == HeaderMode::Insert {
+            glyphs.push((Span::styled("│", Style::default().fg(Color::Yellow)), true));
+        }
+        if at_end && (!at_cursor || mode == HeaderMode::Insert) {
+            break;
+        }
+        let style = if selected.as_ref().is_some_and(|r| r.contains(&col))
+            || (at_cursor && mode != HeaderMode::Insert)
+        {
+            block
+        } else {
+            Style::default()
+        };
+        glyphs.push((
+            Span::styled(ch.to_string(), style),
+            at_cursor && mode != HeaderMode::Insert,
+        ));
+    }
+    let width = usize::from(width.max(1));
+    let mut pieces = Vec::new();
+    let mut current: Vec<(Span<'static>, bool)> = Vec::new();
+    let mut cells = 0;
+    for glyph in glyphs {
+        let glyph_width = glyph.0.width();
+        while cells + glyph_width > width && !current.is_empty() {
+            // Keep words together when they fit, but split long addresses so
+            // every character remains visible even in a narrow terminal.
+            let split = current
+                .iter()
+                .rposition(|(span, _)| span.content == " ")
+                .map_or(current.len(), |i| i + 1);
+            let rest = current.split_off(split);
+            pieces.push(std::mem::replace(&mut current, rest));
+            cells = current.iter().map(|(span, _)| span.width()).sum();
+        }
+        cells += glyph_width;
+        current.push(glyph);
+    }
+    if !current.is_empty() || pieces.is_empty() {
+        pieces.push(current);
+    }
+    let cursor_row = pieces
+        .iter()
+        .position(|piece| piece.iter().any(|(_, cursor)| *cursor));
+    let lines = pieces
+        .into_iter()
+        .map(|piece| Line::from(piece.into_iter().map(|(span, _)| span).collect::<Vec<_>>()))
+        .collect();
+    WrappedRecipient { lines, cursor_row }
+}
+
+fn render_recipient(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    field: &WrappedRecipient,
+) -> Option<Rect> {
+    if area.is_empty() {
+        return None;
+    }
+    let label_width = disp_w(label).min(usize::from(area.width)) as u16;
+    let label_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    f.render_widget(
+        Paragraph::new(Span::styled(label, label_style)),
+        Rect::new(area.x, area.y, label_width, 1),
+    );
+    let scroll = field
+        .cursor_row
+        .unwrap_or(0)
+        .saturating_sub(usize::from(area.height - 1));
+    f.render_widget(
+        Paragraph::new(field.lines.clone()).scroll((scroll.min(usize::from(u16::MAX)) as u16, 0)),
+        Rect::new(
+            area.x + label_width,
+            area.y,
+            area.width - label_width,
+            area.height,
+        ),
+    );
+    field
+        .cursor_row
+        .map(|row| Rect::new(area.x, area.y + (row - scroll) as u16, area.width, 1))
 }
 
 fn render_field(
@@ -1532,6 +1656,119 @@ mod tests {
         assert_eq!(buf[(1, 0)].symbol(), "o");
         assert_eq!(buf[(11, 0)].symbol(), "m");
         assert!(buf[(11, 0)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn recipient_fields_wrap_long_addresses_when_focused_or_unfocused() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let address = "an.address.much.longer.than.the.pane@example.com";
+        for width in [18, 30, 52] {
+            for focused in [
+                ComposeField::To,
+                ComposeField::Cc,
+                ComposeField::Bcc,
+                ComposeField::Body,
+            ] {
+                let mut screen = blank();
+                screen.to = TextInput::from_string(address);
+                screen.cc = TextInput::from_string(address);
+                screen.bcc = TextInput::from_string(address);
+                screen.to.clamp_normal();
+                screen.cc.clamp_normal();
+                screen.bcc.clamp_normal();
+                screen.set_focus(focused);
+                let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                terminal.draw(|f| draw(f, f.area(), &mut screen)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let row_for = |initial| {
+                    (1..39)
+                        .find(|&y| buffer[(1, y)].symbol() == initial)
+                        .unwrap()
+                };
+                let starts = [row_for("T"), row_for("C"), row_for("B"), row_for("S")];
+                for i in 0..3 {
+                    let rendered: String = (starts[i]..starts[i + 1])
+                        .map(|y| {
+                            (10..width - 1)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                                .trim_end()
+                                .to_string()
+                        })
+                        .collect();
+                    assert_eq!(
+                        rendered, address,
+                        "width {width}, field {i}, focus {focused:?}"
+                    );
+                }
+                assert_eq!(screen.to.as_str(), address);
+                assert!(screen.last_body_inner.unwrap().0 > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_recipients_preserve_unicode_selection_and_insert_caret() {
+        let mut input =
+            TextInput::from_string("José <long.address@example.com>, 中 <other@example.com>");
+        input.clamp_normal();
+        let wrapped = wrap_recipient(
+            &input,
+            10,
+            true,
+            HeaderMode::Visual {
+                anchor: 0,
+                linewise: false,
+            },
+        );
+        assert_eq!(
+            wrapped
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>(),
+            input.as_str()
+        );
+        assert!(wrapped.lines.iter().all(|line| line.width() <= 10));
+        assert!(
+            wrapped
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+        );
+
+        let input = TextInput::from_string("01234567890123456789");
+        let wrapped = wrap_recipient(&input, 10, true, HeaderMode::Insert);
+        assert_eq!(wrapped.cursor_row, Some(2));
+        assert_eq!(wrapped.lines[2].to_string(), "│");
+    }
+
+    #[test]
+    fn oversized_recipient_field_scrolls_to_cursor_and_anchors_completion() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut screen = blank();
+        screen.to = TextInput::from_string(format!("{}@example.com", "a".repeat(500)));
+        screen.to.clamp_normal();
+        let mut terminal = Terminal::new(TestBackend::new(30, 16)).unwrap();
+        for at_start in [false, true] {
+            if at_start {
+                screen.to.move_home();
+            }
+            terminal.draw(|f| draw(f, f.area(), &mut screen)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let anchor = screen.last_complete_anchor.unwrap();
+            assert_eq!(anchor.height, 1);
+            assert!((10..29).any(|x| {
+                let cell = &buffer[(x, anchor.y)];
+                cell.modifier.contains(Modifier::REVERSED)
+                    && cell.symbol() == if at_start { "a" } else { "m" }
+            }));
+            assert_eq!(buffer[(1, 2)].symbol(), "T");
+            assert!(screen.last_body_inner.unwrap().0 > 0);
+        }
     }
 
     #[test]
