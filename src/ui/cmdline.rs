@@ -1032,7 +1032,7 @@ pub fn open_mailto_compose(app: &mut App, cfg: &Config, mailto: Mailto) {
     };
     let mut draft = Draft::new_blank(&name, &account.from);
     mailto.apply(&mut draft);
-    match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
+    match ComposeScreen::from_draft(draft, cfg.compose.wrap, cfg.compose.wrap_width) {
         Ok(mut screen) => {
             // `[compose].mode = "external"`: behave like the old
             // pty-only path and spawn `$EDITOR` as soon as the tab
@@ -1104,7 +1104,7 @@ pub fn resume_selected_draft_if_drafts(app: &mut App, cfg: &Config) -> bool {
         attachments: Vec::new(),
     };
 
-    match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
+    match ComposeScreen::from_draft(draft, cfg.compose.wrap, cfg.compose.wrap_width) {
         Ok(mut screen) => {
             screen.origin_draft = Some(mail_compose::SavedDraft {
                 msgid: headers.msgid,
@@ -1172,7 +1172,7 @@ pub fn open_reply(app: &mut App, cfg: &Config, kind: ReplyKind) {
         ReplyKind::ReplyAll => Draft::reply_to(&headers, &body, &row.account, &from, true),
         ReplyKind::Forward => Draft::forward(&headers, &body, &row.account, &from),
     };
-    match ComposeScreen::from_draft(draft, cfg.compose.wrap) {
+    match ComposeScreen::from_draft(draft, cfg.compose.wrap, cfg.compose.wrap_width) {
         Ok(mut screen) => {
             screen.reply_origin = reply_origin;
             if matches!(cfg.compose.mode, config::ComposeMode::External) {
@@ -1226,7 +1226,9 @@ mod send_recovery_tests {
         let attachment = tmp.path().join("attachment.txt");
         fs::write(&attachment, "attachment contents").unwrap();
         draft.attachments.push(attachment);
-        app.open_compose(ComposeScreen::from_draft(draft, cfg.compose.wrap).unwrap());
+        app.open_compose(
+            ComposeScreen::from_draft(draft, cfg.compose.wrap, cfg.compose.wrap_width).unwrap(),
+        );
         (tmp, app, cfg)
     }
 
@@ -1394,7 +1396,9 @@ mod send_recovery_tests {
         dispatch("send", &mut app, &cfg);
         let mut other = Draft::new_blank("test", "sender@example.test");
         other.body = "Keep typing here".into();
-        app.open_compose(ComposeScreen::from_draft(other, cfg.compose.wrap).unwrap());
+        app.open_compose(
+            ComposeScreen::from_draft(other, cfg.compose.wrap, cfg.compose.wrap_width).unwrap(),
+        );
         finish(&mut app, &cfg);
         assert_eq!(
             app.active_compose().unwrap().body.text(),

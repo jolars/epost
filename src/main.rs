@@ -606,9 +606,12 @@ mod paste_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
         let mut app = App::new(&cfg, dir.path().join("index.sqlite"), None, None);
-        let screen =
-            ComposeScreen::from_draft(Draft::new_blank("test", "me@example.com"), cfg.compose.wrap)
-                .unwrap();
+        let screen = ComposeScreen::from_draft(
+            Draft::new_blank("test", "me@example.com"),
+            cfg.compose.wrap,
+            cfg.compose.wrap_width,
+        )
+        .unwrap();
         app.open_compose(screen);
         (app, cfg, dir)
     }

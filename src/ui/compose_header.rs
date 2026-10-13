@@ -531,6 +531,7 @@ pub fn hint(mode: HeaderMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::mail::compose::Draft;
 
     fn key(c: char) -> KeyEvent {
@@ -550,8 +551,12 @@ mod tests {
             references: Vec::new(),
             attachments: Vec::new(),
         };
-        let mut s =
-            ComposeScreen::from_draft(draft, crate::config::ComposeWrap::default()).unwrap();
+        let mut s = ComposeScreen::from_draft(
+            draft,
+            crate::config::ComposeWrap::default(),
+            Config::default().compose.wrap_width,
+        )
+        .unwrap();
         s.set_focus(ComposeField::To);
         // from_draft seeds the To row from the joined draft addresses; for
         // these tests park the cursor on the first char (Normal default).

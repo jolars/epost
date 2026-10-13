@@ -228,6 +228,13 @@ browser = ["xdg-open"]
 protocol = "auto"
 max_height_cells = 24   # cap image height; preserves aspect ratio
 
+[compose]
+# Native body soft-wrap: visual-only, without inserting newlines.
+wrap = "word-or-glyph"        # "word" | "glyph" | "word-or-glyph" | "off"
+wrap_width = 72               # terminal columns, capped by pane width; 0 = full width
+text_width = 72               # independent width for gq / gw paragraph reformatting
+# These wrapping settings do not configure the embedded external editor.
+
 [clipboard]
 # Optional command for explicit Vim clipboard paste. Its stdout must be UTF-8
 # text; arguments are passed directly, without a shell. Unset = use the

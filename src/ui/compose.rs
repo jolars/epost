@@ -97,6 +97,7 @@ pub struct ComposeScreen {
     /// `body_tempfile` and `$EDITOR` runs against that path; on exit we
     /// read the tempfile back into here and drop it.
     pub body: BodyEditor,
+    pub wrap_width: u16,
     /// Set by `:edit` (or by the `mode = "external"` config branch at
     /// tab open) to ask the main loop to spawn an `$EDITOR` session
     /// against the body. Cleared once the session is live.
@@ -198,7 +199,7 @@ impl ComposeScreen {
     /// starts false. Callers that want `$EDITOR` to auto-spawn on tab
     /// open (the `mode = "external"` config branch) flip
     /// `editor_pending = true` after constructing.
-    pub fn from_draft(draft: Draft, wrap: ComposeWrap) -> std::io::Result<Self> {
+    pub fn from_draft(draft: Draft, wrap: ComposeWrap, wrap_width: u16) -> std::io::Result<Self> {
         let title = title_for(&draft);
         let mut body = BodyEditor::new(&draft.body);
         body.set_wrap(wrap);
@@ -222,6 +223,7 @@ impl ComposeScreen {
             header_mode: HeaderMode::Normal,
             header_pending: None,
             body,
+            wrap_width,
             editor_pending: false,
             editor: None,
             body_tempfile: None,
@@ -1015,7 +1017,12 @@ pub fn draw(f: &mut Frame, area: Rect, screen: &mut ComposeScreen) {
         // are registered as data-coordinate `custom_highlight`s by
         // `apply_overlays` *before* the immutable render borrow.
         screen.body.apply_overlays();
-        f.render_widget(&screen.body.textarea, body_inner);
+        let mut text_area = body_inner;
+        if screen.wrap_width > 0 && screen.body.textarea.wrap_mode() != tui_textarea::WrapMode::None
+        {
+            text_area.width = text_area.width.min(screen.wrap_width);
+        }
+        f.render_widget(&screen.body.textarea, text_area);
         // Scrollbar driven by logical row / line count. v1 drift: under
         // wrap a long line spans several visual rows, so the thumb tracks
         // logical position, not visual — the crate exposes no public
@@ -1549,12 +1556,136 @@ mod tests {
         ComposeScreen::from_draft(
             Draft::new_blank("acct", "me <me@example.com>"),
             ComposeWrap::default(),
+            Config::default().compose.wrap_width,
         )
         .expect("compose screen")
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    fn render_body(screen: &mut ComposeScreen, width: u16) -> (ratatui::buffer::Buffer, u16) {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+        terminal.draw(|f| draw(f, f.area(), screen)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let body_row = (0..40)
+            .find(|&y| buffer[(1, y)].symbol() == "x")
+            .expect("first body row");
+        (buffer, body_row)
+    }
+
+    #[test]
+    fn body_wraps_at_configured_width_capped_by_pane() {
+        let text = "x".repeat(100);
+        for (pane_width, wrap_width, mode, expected_width) in [
+            (120, 72, ComposeWrap::WordOrGlyph, 72),
+            (120, 40, ComposeWrap::WordOrGlyph, 40),
+            (50, 72, ComposeWrap::WordOrGlyph, 48),
+            (120, 0, ComposeWrap::WordOrGlyph, 100),
+            (120, 72, ComposeWrap::Off, 100),
+        ] {
+            let mut draft = Draft::new_blank("acct", "me@example.com");
+            draft.body = text.clone();
+            let mut screen = ComposeScreen::from_draft(draft, mode, wrap_width).unwrap();
+            let (buffer, top) = render_body(&mut screen, pane_width);
+            let row_text = |y| {
+                (1..pane_width - 1)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            };
+            assert_eq!(row_text(top), "x".repeat(expected_width));
+            assert_eq!(
+                row_text(top + 1),
+                "x".repeat((100 - expected_width).min(expected_width))
+            );
+            assert_eq!(screen.body.text(), text);
+            assert_eq!(screen.last_body_inner.unwrap().1, pane_width - 2);
+        }
+    }
+
+    #[test]
+    fn body_cursor_follows_wrap_width_and_resize() {
+        let mut screen = blank();
+        screen.body.set_text(&"x".repeat(100));
+        screen.set_focus(ComposeField::Body);
+        screen
+            .body
+            .textarea
+            .move_cursor(tui_textarea::CursorMove::Jump(0, 80));
+        for (width, cursor_col) in [(120, 8), (50, 32), (120, 8)] {
+            let (buffer, top) = render_body(&mut screen, width);
+            let cell = &buffer[(1 + cursor_col, top + 1)];
+            assert_eq!(cell.symbol(), "x");
+            assert!(cell.modifier.contains(Modifier::REVERSED));
+            assert_eq!(screen.body.textarea.cursor(), (0, 80));
+        }
+    }
+
+    #[test]
+    fn body_selections_and_yank_highlights_cross_wrap_boundary() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            let mut screen = blank();
+            screen.body.set_text(&"x".repeat(100));
+            screen.set_focus(ComposeField::Body);
+            screen
+                .body
+                .textarea
+                .set_selection_style(Style::default().add_modifier(Modifier::REVERSED));
+            screen
+                .body
+                .textarea
+                .move_cursor(tui_textarea::CursorMove::Jump(0, 70));
+            render_body(&mut screen, 120);
+            screen
+                .body
+                .handle_key(key(KeyCode::Char('v'), modifiers), 72);
+            for _ in 0..5 {
+                screen
+                    .body
+                    .handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE), 72);
+            }
+            for yank in [false, true] {
+                if yank {
+                    screen
+                        .body
+                        .handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), 72);
+                    assert_eq!(screen.body.take_clipboard_yank().as_deref(), Some("xxxxxx"));
+                }
+                let (buffer, top) = render_body(&mut screen, 120);
+                let cursor_col = screen.body.textarea.cursor().1 as u16;
+                let cursor_cell = (1 + cursor_col % 72, top + cursor_col / 72);
+                for (row, cols) in [(top, 71..73), (top + 1, 1..5)] {
+                    for col in cols {
+                        let cell = &buffer[(col, row)];
+                        if yank && (col, row) != cursor_cell {
+                            assert_eq!(cell.bg, Color::Yellow);
+                            assert_eq!(cell.fg, Color::Black);
+                        } else {
+                            assert!(cell.modifier.contains(Modifier::REVERSED));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn body_wrap_width_counts_terminal_columns_for_unicode() {
+        let mut screen = blank();
+        let text = format!("{}{}", "x".repeat(70), "界".repeat(4));
+        screen.body.set_text(&text);
+        let (buffer, top) = render_body(&mut screen, 120);
+        assert_eq!(buffer[(71, top)].symbol(), "界");
+        assert_eq!(buffer[(73, top)].symbol(), " ");
+        for col in [1, 3, 5] {
+            assert_eq!(buffer[(col, top + 1)].symbol(), "界");
+        }
+        assert_eq!(screen.body.text(), text);
     }
 
     #[test]

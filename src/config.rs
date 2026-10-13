@@ -284,6 +284,10 @@ pub struct Compose {
     /// inserted); default `word-or-glyph`. See [`ComposeWrap`].
     #[serde(default)]
     pub wrap: ComposeWrap,
+    /// Maximum soft-wrap width in terminal columns for the native body
+    /// editor. Default 72; `0` uses the full pane width.
+    #[serde(default = "default_text_width")]
+    pub wrap_width: u16,
 }
 
 impl Default for Compose {
@@ -295,6 +299,7 @@ impl Default for Compose {
             address_book: AddressBook::default(),
             text_width: default_text_width(),
             wrap: ComposeWrap::default(),
+            wrap_width: default_text_width(),
         }
     }
 }
@@ -361,9 +366,10 @@ pub enum ComposeMode {
 }
 
 /// Soft-wrap mode for the native compose body editor. Visual-only: long
-/// logical lines wrap to the body pane width at render time, no newlines
-/// are inserted, so the sent message keeps its long lines. `word-or-glyph`
-/// (default) wraps at word boundaries and falls back to per-glyph wrapping
+/// logical lines wrap to `wrap_width`, capped by the body pane width, at
+/// render time. No newlines are inserted, so the sent message keeps its
+/// long lines. `word-or-glyph` (default) wraps at word boundaries and
+/// falls back to per-glyph wrapping
 /// for words wider than the pane (e.g. long URLs); `off` keeps the old
 /// horizontal-scroll behaviour.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -633,6 +639,26 @@ mod tests {
     fn compose_wrap_defaults_to_word_or_glyph() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.compose.wrap, ComposeWrap::WordOrGlyph);
+    }
+
+    #[test]
+    fn compose_wrap_width_defaults_to_72() {
+        assert_eq!(Config::default().compose.wrap_width, 72);
+        for input in ["", "[compose]"] {
+            let cfg: Config = toml::from_str(input).unwrap();
+            assert_eq!(cfg.compose.wrap_width, 72);
+        }
+    }
+
+    #[test]
+    fn compose_wrap_width_is_independent_of_text_width() {
+        for width in [0, 40, 100] {
+            let cfg: Config =
+                toml::from_str(&format!("[compose]\nwrap_width = {width}\ntext_width = 60"))
+                    .unwrap();
+            assert_eq!(cfg.compose.wrap_width, width);
+            assert_eq!(cfg.compose.text_width, 60);
+        }
     }
 
     #[test]

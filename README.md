@@ -79,6 +79,19 @@ schema.
 CLI flags: `--config <path>` and `--cache <path>` override the config and index
 locations.
 
+The native composer body soft-wraps at 72 terminal columns by default,
+or at the available width when the pane is narrower. To change the width:
+
+```toml
+[compose]
+wrap_width = 72
+```
+
+Set `wrap_width = 0` to wrap at the full pane width, or `wrap = "off"` to
+disable soft wrapping. Wrapping changes only the display; it leaves the
+draft's text unchanged. `text_width` separately controls paragraph
+reformatting with `gq` and `gw`. External editors use their own settings.
+
 ## Mailto links
 
 Pass a `mailto:` URI to open a prefilled compose tab:

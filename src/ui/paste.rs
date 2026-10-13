@@ -269,8 +269,12 @@ mod tests {
         let cfg = Config::default();
         let mut app = App::new(&cfg, dir.path().join("index.sqlite"), None, None);
         app.open_compose(
-            ComposeScreen::from_draft(Draft::new_blank("test", "me@example.com"), cfg.compose.wrap)
-                .unwrap(),
+            ComposeScreen::from_draft(
+                Draft::new_blank("test", "me@example.com"),
+                cfg.compose.wrap,
+                cfg.compose.wrap_width,
+            )
+            .unwrap(),
         );
         (app, cfg, dir)
     }
@@ -360,8 +364,12 @@ mod tests {
         let tx = pending(&mut app);
         app.close_active_tab().unwrap();
         app.open_compose(
-            ComposeScreen::from_draft(Draft::new_blank("test", "me@example.com"), cfg.compose.wrap)
-                .unwrap(),
+            ComposeScreen::from_draft(
+                Draft::new_blank("test", "me@example.com"),
+                cfg.compose.wrap,
+                cfg.compose.wrap_width,
+            )
+            .unwrap(),
         );
         tx.send(Ok("wrong draft".into())).unwrap();
         poll(&mut app, &cfg);

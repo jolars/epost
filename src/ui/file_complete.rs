@@ -707,6 +707,7 @@ mod tests {
         let screen = ComposeScreen::from_draft(
             Draft::new_blank("test", "a@example.org"),
             ComposeWrap::default(),
+            cfg.compose.wrap_width,
         )
         .unwrap();
         app.screens.push(Screen::Compose(Box::new(screen)));
