@@ -35,3 +35,7 @@ env_logger = "0.11.10"
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }
+
+# Keep the wrapped end-of-line caret visible until the fix is released upstream.
+[patch.crates-io]
+tui-textarea-2 = { path = "vendor/tui-textarea-2" }

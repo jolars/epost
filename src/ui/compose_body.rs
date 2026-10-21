@@ -3329,6 +3329,62 @@ mod tests {
     }
 
     #[test]
+    fn full_width_lines_keep_spacing_when_cursor_leaves_eol() {
+        let mut ed = BodyEditor::new("abcdefgh\nnext");
+        assert_eq!(render_rows(&ed, 8, 3), ["abcdefgh", "next", ""]);
+        feed(&mut ed, &[k('A')]);
+        assert_eq!(render_rows(&ed, 8, 3), ["abcdefgh", "", "next"]);
+        feed(&mut ed, &[esc()]);
+        assert_eq!(render_rows(&ed, 8, 3), ["abcdefgh", "next", ""]);
+        assert_eq!(ed.text(), "abcdefgh\nnext");
+    }
+
+    #[test]
+    fn insert_cursor_stays_visible_when_moving_to_full_width_line_end() {
+        for wrap in [
+            ComposeWrap::Word,
+            ComposeWrap::Glyph,
+            ComposeWrap::WordOrGlyph,
+        ] {
+            for text in [
+                "abcdefgh",
+                "abcdefghijklmnop",
+                "éééééééé",
+                "界界界界",
+                "abcd\t",
+            ] {
+                let mut ed = BodyEditor::new(&format!("start\n{text}\nlast"));
+                ed.set_wrap(wrap);
+                let mut term = Terminal::new(TestBackend::new(8, 2)).unwrap();
+                feed(&mut ed, &[k('A')]);
+                // Draw between keys so movement uses the actual wrapped viewport.
+                for key in [
+                    KeyCode::End,
+                    KeyCode::Down,
+                    KeyCode::End,
+                    KeyCode::Down,
+                    KeyCode::Up,
+                    KeyCode::End,
+                ] {
+                    ed.handle_key(KeyEvent::new(key, KeyModifiers::NONE), 72);
+                    term.draw(|f| f.render_widget(&ed.textarea, f.area()))
+                        .unwrap();
+                    assert!(
+                        term.backend()
+                            .buffer()
+                            .content
+                            .iter()
+                            .any(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
+                        "cursor {:?} disappeared with {wrap:?} in {text:?}",
+                        ed.textarea.cursor(),
+                    );
+                }
+                assert_eq!(ed.text(), format!("start\n{text}\nlast"));
+            }
+        }
+    }
+
+    #[test]
     fn long_line_soft_wraps_onto_multiple_rows() {
         // Default wrap (WordOrGlyph): a line wider than the pane spills onto
         // the next visual row instead of scrolling off the right edge.
