@@ -3385,6 +3385,51 @@ mod tests {
     }
 
     #[test]
+    fn word_wrap_does_not_start_continuations_with_separator_spaces() {
+        for wrap in [ComposeWrap::Word, ComposeWrap::WordOrGlyph] {
+            for (text, expected) in [
+                ("abcdefgh ijklmnop", vec!["abcdefgh", "ijklmnop", ""]),
+                ("abcdefgh   ijklmnop", vec!["abcdefgh", "ijklmnop", ""]),
+                ("éééééééé next", vec!["éééééééé", "next", ""]),
+                ("界界界界 next", vec!["界 界 界 界", "next", ""]),
+                ("  one two three", vec!["  one", "two", "three"]),
+            ] {
+                let mut ed = BodyEditor::new(text);
+                ed.set_wrap(wrap);
+                assert_eq!(render_rows(&ed, 8, 3), expected, "{wrap:?}: {text:?}");
+                assert_eq!(ed.text(), text);
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_separator_keeps_logical_cursor_and_selection_offsets() {
+        let mut ed = BodyEditor::new("abcdefgh   ijklmnop");
+        let mut term = Terminal::new(TestBackend::new(8, 3)).unwrap();
+        for col in 8..=12 {
+            ed.textarea.move_cursor(CursorMove::Jump(0, col));
+            term.draw(|f| f.render_widget(&ed.textarea, f.area()))
+                .unwrap();
+            let screen_col = col.saturating_sub(11);
+            assert!(
+                term.backend().buffer()[(screen_col, 1)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+            assert_eq!(ed.textarea.cursor(), (0, usize::from(col)));
+        }
+        ed.textarea.move_cursor(CursorMove::Jump(0, 11));
+        for col in (7..=10).rev() {
+            feed(&mut ed, &[k('h')]);
+            assert_eq!(ed.textarea.cursor(), (0, col));
+        }
+        ed.textarea.move_cursor(CursorMove::Jump(0, 11));
+        feed(&mut ed, &[k('v'), k('l'), k('l'), k('y')]);
+        assert_eq!(ed.yank.as_ref().unwrap().text, "ijk");
+        assert_eq!(ed.text(), "abcdefgh   ijklmnop");
+    }
+
+    #[test]
     fn long_line_soft_wraps_onto_multiple_rows() {
         // Default wrap (WordOrGlyph): a line wider than the pane spills onto
         // the next visual row instead of scrolling off the right edge.

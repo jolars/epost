@@ -324,6 +324,14 @@ impl CursorMove {
                     dc: None,
                 }),
             Forward => Some(ta.increment_screen_cursor(cursor)),
+            Back if col == 0
+                && ta.screen_line(row).wrapped.hidden_cols > 0
+                && dc.1
+                    > ta.screen_line(row).wrapped.start_col
+                        - ta.screen_line(row).wrapped.hidden_cols =>
+            {
+                Some(DataCursor(dc.0, dc.1 - 1).to_screen_cursor(ta))
+            }
             Back if col == 0 => {
                 let row = row.checked_sub(1)?;
                 Some(ScreenCursor {

@@ -75,6 +75,7 @@ impl TextArea<'_> {
                 start_byte: 0,
                 end_byte: line.len(),
                 start_col: 0,
+                hidden_cols: 0,
                 end_col: line.chars().count(),
                 first_in_row: true,
                 last_in_row: true,
@@ -121,6 +122,7 @@ impl TextArea<'_> {
                 rows_with_cursor.push(WrappedLine {
                     start_byte: wrapped.end_byte,
                     start_col: wrapped.end_col,
+                    hidden_cols: 0,
                     first_in_row: false,
                     last_in_row: true,
                     ..wrapped
@@ -200,9 +202,11 @@ impl TextArea<'_> {
         {
             let line = screen_lines[idx];
             let contains = if line.wrapped.last_in_row {
-                line.wrapped.start_col <= data.1 && data.1 <= line.wrapped.end_col
+                line.wrapped.start_col - line.wrapped.hidden_cols <= data.1
+                    && data.1 <= line.wrapped.end_col
             } else {
-                line.wrapped.start_col <= data.1 && data.1 < line.wrapped.end_col
+                line.wrapped.start_col - line.wrapped.hidden_cols <= data.1
+                    && data.1 < line.wrapped.end_col
             };
             if contains {
                 screen_idx = idx;
@@ -260,11 +264,13 @@ mod tests {
                 assert_eq!(textarea.screen_to_data_cursor(sc), dc);
 
                 let detached = ScreenCursor { dc: None, ..sc };
-                assert_eq!(textarea.screen_to_data_cursor(detached), dc);
-                assert_eq!(
-                    textarea.data_to_screen_cursor(textarea.screen_to_data_cursor(detached)),
-                    sc
-                );
+                let wrapped = textarea.screen_line(sc.row).wrapped;
+                let visible_dc = DataCursor(row, col.max(wrapped.start_col));
+                // A detached screen position cannot distinguish hidden separator
+                // columns from the first visible character of the continuation.
+                assert_eq!(textarea.screen_to_data_cursor(detached), visible_dc);
+                let restored = textarea.data_to_screen_cursor(visible_dc);
+                assert_eq!((restored.row, restored.col), (sc.row, sc.col));
             }
         }
     }

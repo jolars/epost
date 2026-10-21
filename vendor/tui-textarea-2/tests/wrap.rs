@@ -148,7 +148,7 @@ fn word_and_word_or_glyph_differ_for_long_words() {
         vec![
             "alpha     ".to_string(),
             "supercalif".to_string(),
-            " omega    ".to_string(),
+            "omega     ".to_string(),
             "          ".to_string(),
         ]
     );
@@ -164,7 +164,7 @@ fn word_and_word_or_glyph_differ_for_long_words() {
             "ragilistic".to_string(),
             "expialidoc".to_string(),
             "ious      ".to_string(),
-            " omega    ".to_string(),
+            "omega     ".to_string(),
         ]
     );
 }

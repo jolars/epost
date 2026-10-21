@@ -26,6 +26,8 @@ pub(crate) struct WrappedLine {
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_col: usize,
+    // Hidden separators still occupy logical columns for cursor movement.
+    pub hidden_cols: usize,
     pub end_col: usize,
     pub first_in_row: bool,
     pub last_in_row: bool,
@@ -57,19 +59,24 @@ pub(crate) fn wrapped_rows(
 
     for (row, line) in lines.iter().enumerate() {
         let ranges = line_ranges(line, mode, width, tab_len);
-        let mut start_col = 0usize;
+        let mut previous_byte = 0;
+        let mut previous_col = 0;
         for (i, (start_byte, end_byte)) in ranges.iter().copied().enumerate() {
+            let hidden_cols = line[previous_byte..start_byte].chars().count();
+            let start_col = previous_col + hidden_cols;
             let end_col = start_col + line[start_byte..end_byte].chars().count();
             rows.push(WrappedLine {
                 row,
                 start_byte,
                 end_byte,
                 start_col,
+                hidden_cols,
                 end_col,
                 first_in_row: i == 0,
                 last_in_row: i + 1 == ranges.len(),
             });
-            start_col = end_col;
+            previous_byte = end_byte;
+            previous_col = end_col;
         }
     }
 
@@ -130,6 +137,20 @@ fn wrap_word_chunks(
     while i < chunks.len() {
         let chunk = chunks[i];
         if seg_end == seg_start {
+            // A separator that overflowed the preceding row is a soft break,
+            // not indentation. Keep it in the source but start the next row
+            // at the following word. Preserve initial and trailing whitespace.
+            if !out.is_empty()
+                && i + 1 < chunks.len()
+                && chunk_text(line, chunk)
+                    .chars()
+                    .all(|c| c == ' ' || c == '\t')
+            {
+                i += 1;
+                seg_start = chunk.end;
+                seg_end = chunk.end;
+                continue;
+            }
             seg_start = chunk.start;
         }
 

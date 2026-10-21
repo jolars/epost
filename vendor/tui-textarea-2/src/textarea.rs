@@ -1743,12 +1743,17 @@ impl<'a> TextArea<'a> {
             hl.set_line_style(self.cursor_line_style);
             let cursor_col = self.cursor.1;
             let in_segment = if wrapped.last_in_row {
-                wrapped.start_col <= cursor_col && cursor_col <= wrapped.end_col
+                wrapped.start_col - wrapped.hidden_cols <= cursor_col
+                    && cursor_col <= wrapped.end_col
             } else {
-                wrapped.start_col <= cursor_col && cursor_col < wrapped.end_col
+                wrapped.start_col - wrapped.hidden_cols <= cursor_col
+                    && cursor_col < wrapped.end_col
             };
             if in_segment {
-                hl.cursor_line(cursor_col - wrapped.start_col, self.cursor_line_style);
+                hl.cursor_line(
+                    cursor_col.saturating_sub(wrapped.start_col),
+                    self.cursor_line_style,
+                );
             }
         }
 
