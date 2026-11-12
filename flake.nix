@@ -37,6 +37,9 @@
               lockFile = ./Cargo.lock;
             };
 
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.sqlite ];
+
             # Tests touch stdio / tmp maildirs and are exercised in devenv;
             # skip them at build time to keep nix builds hermetic.
             doCheck = false;
